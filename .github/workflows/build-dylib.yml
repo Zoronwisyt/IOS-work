@@ -1,0 +1,39 @@
+name: Build AlightMotionMods ARM64 Dylib
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-ios-dylib:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile ARM64 iOS dylib
+        run: |
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang++ \
+            -arch arm64 \
+            -isysroot "$SDK_PATH" \
+            -miphoneos-version-min=14.4 \
+            -std=c++17 \
+            -fobjc-arc \
+            -dynamiclib \
+            -install_name @rpath/AlightMotionMods.dylib \
+            -O2 -Wall -Wextra \
+            -framework Foundation \
+            -framework UIKit \
+            -framework QuartzCore \
+            -o AlightMotionMods.dylib \
+            AlightMotionMods.mm
+          codesign -f -s - AlightMotionMods.dylib
+          file AlightMotionMods.dylib
+          otool -L AlightMotionMods.dylib
+
+      - name: Upload ARM64 dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AlightMotionMods-arm64
+          path: AlightMotionMods.dylib
