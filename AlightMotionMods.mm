@@ -149,6 +149,7 @@ static const void *kAMQualityButtonAssocKey = &kAMQualityButtonAssocKey;
                                                 image:nil
                                            identifier:nil
                                               handler:^(__kindof UIAction * _Nonnull action) {
+                (void)action;
                 UIButton *b = weakBtn;
                 if (b) [AMPreviewQualityHelper setDivisor:d forButton:b];
             }];
