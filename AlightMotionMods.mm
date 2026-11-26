@@ -31,7 +31,7 @@ static NSInteger gPreviewDivisor = 1; // 1=Full, 2=Half, 3=Third, 4=Quarter
 static __weak AVPlayer *gActivePreviewPlayer = nil;
 static IMP gOrigReplaceCurrentItem = NULL;
 static IMP gOrigInitWithPlayerItem = NULL;
-static IMP gOrigDataTaskWithRequestCompletion = NULL;
+static IMP gOrigGTMBeginFetch = NULL;
 
 // ============================================================================
 // Theme Helpers
@@ -267,47 +267,67 @@ static void AMHook_previewControlBarViewDidLoad(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// Module 2A: Fix `getProjectMetadata` INTERNAL / sub-required-size on Sideloaded IPA
+// Module 2A: Fix `getProjectMetadata` INTERNAL / sub-required-size via GTMSessionFetcher
 // ============================================================================
-// Sideloaded IPAs send invalid Firebase AppCheck / Auth headers to `getProjectMetadata`,
-// causing Firebase Functions to return `INTERNAL`. Stripping those headers yields a clean
-// HTTP 200 JSON response, and normalizing `download` -> "allowed" lets Alight Motion's
-// native PackageImporter download `projectfiles.zip` directly from Firebase Storage.
+// FirebaseFunctions & FirebaseStorage use GTMSessionFetcher (`beginFetchWithCompletionHandler:`),
+// not `NSURLSession dataTaskWithRequest:completionHandler:`. On sideloaded IPAs, invalid
+// AppCheck / Auth headers cause `getProjectMetadata` to fail with `INTERNAL`.
 
-static id AMHook_dataTaskWithRequestCompletion(id self, SEL _cmd, NSURLRequest *request, void (^completionHandler)(NSData * _Nullable, NSURLResponse * _Nullable, NSError * _Nullable)) {
-    NSString *urlStr = request.URL.absoluteString;
-    if (urlStr && [urlStr containsString:@"/getProjectMetadata"] && completionHandler != nil) {
-        NSMutableURLRequest *cleanReq = [request mutableCopy];
-        [cleanReq setValue:nil forHTTPHeaderField:@"Authorization"];
-        [cleanReq setValue:nil forHTTPHeaderField:@"X-Firebase-AppCheck"];
-        [cleanReq setValue:nil forHTTPHeaderField:@"Firebase-Instance-ID-Token"];
-        if (![cleanReq valueForHTTPHeaderField:@"Content-Type"]) {
-            [cleanReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+static NSData *AMRewriteProjectMetadataJSON(NSData *data) {
+    if (data.length == 0) return data;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+    if ([obj isKindOfClass:[NSMutableDictionary class]]) {
+        NSMutableDictionary *root = (NSMutableDictionary *)obj;
+        NSMutableDictionary *res = [root[@"result"] isKindOfClass:[NSMutableDictionary class]] ? root[@"result"] : nil;
+        if (res && [res[@"result"] isEqualToString:@"success"]) {
+            res[@"download"] = @"allowed";
+            res[@"message"] = [NSNull null];
+            NSData *reencoded = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
+            if (reencoded) return reencoded;
         }
+    }
+    return data;
+}
 
-        void (^wrapped)(NSData * _Nullable, NSURLResponse * _Nullable, NSError * _Nullable) =
-            ^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
-                NSData *outData = data;
-                if (!error && data.length > 0) {
-                    id obj = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
-                    if ([obj isKindOfClass:[NSMutableDictionary class]]) {
-                        NSMutableDictionary *root = (NSMutableDictionary *)obj;
-                        NSMutableDictionary *res = [root[@"result"] isKindOfClass:[NSMutableDictionary class]] ? root[@"result"] : nil;
-                        if (res && [res[@"result"] isEqualToString:@"success"]) {
-                            res[@"download"] = @"allowed";
-                            res[@"message"] = [NSNull null];
-                            NSData *reencoded = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
-                            if (reencoded) outData = reencoded;
-                        }
-                    }
-                }
-                completionHandler(outData, response, error);
-            };
+static void AMHook_gtmBeginFetchWithCompletionHandler(id self, SEL _cmd, void (^handler)(NSData * _Nullable, NSError * _Nullable)) {
+    NSMutableURLRequest *req = nil;
+    SEL mutReqSel = NSSelectorFromString(@"mutableRequest");
+    if ([self respondsToSelector:mutReqSel]) {
+        req = ((NSMutableURLRequest *(*)(id, SEL))objc_msgSend)(self, mutReqSel);
+    }
+    NSString *urlStr = req.URL.absoluteString ?: @"";
 
-        return ((id (*)(id, SEL, NSURLRequest *, id))gOrigDataTaskWithRequestCompletion)(self, _cmd, cleanReq, wrapped);
+    if ([urlStr containsString:@"/getProjectMetadata"] && handler != nil) {
+        // Perform a clean header-free POST directly via NSURLSession so invalid sideloaded
+        // Firebase AppCheck / Auth tokens can never trigger `INTERNAL`, then rewrite
+        // `download` -> `"allowed"` and invoke GTMSessionFetcher's completion handler.
+        NSMutableURLRequest *clean = [NSMutableURLRequest requestWithURL:req.URL
+                                                             cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                         timeoutInterval:30.0];
+        clean.HTTPMethod = @"POST";
+        clean.HTTPBody = req.HTTPBody;
+        [clean setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        [clean setValue:@"AlightMotion/6.2.60" forHTTPHeaderField:@"User-Agent"];
+
+        [[[NSURLSession sharedSession] dataTaskWithRequest:clean completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable resp, NSError * _Nullable err) {
+            (void)resp;
+            NSData *patched = (!err && data.length > 0) ? AMRewriteProjectMetadataJSON(data) : data;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                handler(patched, err);
+            });
+        }] resume];
+        return;
     }
 
-    return ((id (*)(id, SEL, NSURLRequest *, id))gOrigDataTaskWithRequestCompletion)(self, _cmd, request, completionHandler);
+    // Also strip invalid sideloaded Auth / AppCheck headers when downloading shared projectfiles.zip from Firebase Storage
+    if ([urlStr containsString:@"firebasestorage.googleapis.com"] && [urlStr containsString:@"projectfiles.zip"]) {
+        [req setValue:nil forHTTPHeaderField:@"Authorization"];
+        [req setValue:nil forHTTPHeaderField:@"X-Firebase-AppCheck"];
+    }
+
+    if (gOrigGTMBeginFetch) {
+        ((void (*)(id, SEL, id))gOrigGTMBeginFetch)(self, _cmd, handler);
+    }
 }
 
 // ============================================================================
@@ -1455,10 +1475,10 @@ static void AlightMotionModsInit(void) {
         gPreviewDivisor = saved;
     }
 
-    AMSwizzleMethod(@"NSURLSession",
-                    @"dataTaskWithRequest:completionHandler:",
-                    (IMP)AMHook_dataTaskWithRequestCompletion,
-                    &gOrigDataTaskWithRequestCompletion);
+    AMSwizzleMethod(@"GTMSessionFetcher",
+                    @"beginFetchWithCompletionHandler:",
+                    (IMP)AMHook_gtmBeginFetchWithCompletionHandler,
+                    &gOrigGTMBeginFetch);
 
     AMSwizzleMethod(@"AVPlayer",
                     @"replaceCurrentItemWithPlayerItem:",
