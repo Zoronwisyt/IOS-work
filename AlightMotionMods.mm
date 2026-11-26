@@ -24,6 +24,7 @@
 #import <math.h>
 #import <stdint.h>
 #import <stdlib.h>
+#import <dlfcn.h>
 
 static NSString *const kAMPreviewQualityKey = @"AMModPreviewQualityDivisor";
 static NSInteger gPreviewDivisor = 1; // 1=Full, 2=Half, 3=Third, 4=Quarter
@@ -1611,8 +1612,131 @@ static NSString *AMExtractXMLAttr(NSString *tag, NSString *attrName) {
     return [val stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 }
 
+// Read-only SQLite3 loader via dlopen (no extra linker flags needed)
+typedef struct sqlite3 sqlite3;
+typedef struct sqlite3_stmt sqlite3_stmt;
+typedef int (*am_sqlite3_open_v2_fn)(const char *, sqlite3 **, int, const char *);
+typedef int (*am_sqlite3_prepare_v2_fn)(sqlite3 *, const char *, int, sqlite3_stmt **, const char **);
+typedef int (*am_sqlite3_step_fn)(sqlite3_stmt *);
+typedef const unsigned char *(*am_sqlite3_column_text_fn)(sqlite3_stmt *, int);
+typedef int (*am_sqlite3_finalize_fn)(sqlite3_stmt *);
+typedef int (*am_sqlite3_close_fn)(sqlite3 *);
+
+static void AMScanSQLiteForProjects(NSString *dbPath,
+                                    NSMutableArray<NSDictionary<NSString *, NSString *> *> *results,
+                                    NSMutableSet<NSString *> *seenTitles) {
+    static void *lib = NULL;
+    static am_sqlite3_open_v2_fn p_open = NULL;
+    static am_sqlite3_prepare_v2_fn p_prep = NULL;
+    static am_sqlite3_step_fn p_step = NULL;
+    static am_sqlite3_column_text_fn p_text = NULL;
+    static am_sqlite3_finalize_fn p_fin = NULL;
+    static am_sqlite3_close_fn p_close = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        lib = dlopen("/usr/lib/libsqlite3.dylib", RTLD_LAZY);
+        if (lib) {
+            p_open  = (am_sqlite3_open_v2_fn)dlsym(lib, "sqlite3_open_v2");
+            p_prep  = (am_sqlite3_prepare_v2_fn)dlsym(lib, "sqlite3_prepare_v2");
+            p_step  = (am_sqlite3_step_fn)dlsym(lib, "sqlite3_step");
+            p_text  = (am_sqlite3_column_text_fn)dlsym(lib, "sqlite3_column_text");
+            p_fin   = (am_sqlite3_finalize_fn)dlsym(lib, "sqlite3_finalize");
+            p_close = (am_sqlite3_close_fn)dlsym(lib, "sqlite3_close");
+        }
+    });
+    if (!p_open || !p_prep || !p_step || !p_text || !p_fin || !p_close) return;
+
+    sqlite3 *db = NULL;
+    // SQLITE_OPEN_READONLY = 1
+    if (p_open(dbPath.UTF8String, &db, 1, NULL) != 0 || !db) {
+        if (db) p_close(db);
+        return;
+    }
+
+    // 1. Enumerate tables
+    NSMutableArray<NSString *> *tables = [NSMutableArray array];
+    sqlite3_stmt *st = NULL;
+    if (p_prep(db, "SELECT name FROM sqlite_master WHERE type='table';", -1, &st, NULL) == 0 && st) {
+        while (p_step(st) == 100) { // SQLITE_ROW = 100
+            const unsigned char *tn = p_text(st, 0);
+            if (tn) {
+                NSString *tname = [NSString stringWithUTF8String:(const char *)tn];
+                NSString *low = tname.lowercaseString;
+                if ([low containsString:@"project"] || [low containsString:@"scene"]) {
+                    [tables addObject:tname];
+                }
+            }
+        }
+        p_fin(st);
+    }
+
+    // 2. For each candidate table, find title/name + optional width/height/fps columns
+    for (NSString *table in tables) {
+        NSString *pragma = [NSString stringWithFormat:@"PRAGMA table_info(\"%@\");", table];
+        sqlite3_stmt *pst = NULL;
+        NSString *titleCol = nil;
+        NSString *wCol = nil;
+        NSString *hCol = nil;
+        NSString *fpsCol = nil;
+        if (p_prep(db, pragma.UTF8String, -1, &pst, NULL) == 0 && pst) {
+            while (p_step(pst) == 100) {
+                const unsigned char *cn = p_text(pst, 1);
+                if (!cn) continue;
+                NSString *col = [NSString stringWithUTF8String:(const char *)cn];
+                NSString *low = col.lowercaseString;
+                if (!titleCol && ([low isEqualToString:@"title"] || [low isEqualToString:@"ztitle"] ||
+                                  [low isEqualToString:@"name"] || [low isEqualToString:@"zname"] ||
+                                  [low isEqualToString:@"projectname"] || [low isEqualToString:@"zprojectname"])) {
+                    titleCol = col;
+                } else if (!wCol && ([low isEqualToString:@"width"] || [low isEqualToString:@"zwidth"])) {
+                    wCol = col;
+                } else if (!hCol && ([low isEqualToString:@"height"] || [low isEqualToString:@"zheight"])) {
+                    hCol = col;
+                } else if (!fpsCol && ([low isEqualToString:@"fps"] || [low isEqualToString:@"zfps"] || [low isEqualToString:@"framerate"])) {
+                    fpsCol = col;
+                }
+            }
+            p_fin(pst);
+        }
+        if (!titleCol) continue;
+
+        NSMutableArray<NSString *> *selCols = [NSMutableArray arrayWithObject:[NSString stringWithFormat:@"\"%@\"", titleCol]];
+        if (wCol) [selCols addObject:[NSString stringWithFormat:@"\"%@\"", wCol]];
+        if (hCol) [selCols addObject:[NSString stringWithFormat:@"\"%@\"", hCol]];
+        if (fpsCol) [selCols addObject:[NSString stringWithFormat:@"\"%@\"", fpsCol]];
+
+        NSString *q = [NSString stringWithFormat:@"SELECT %@ FROM \"%@\" LIMIT 500;", [selCols componentsJoinedByString:@", "], table];
+        sqlite3_stmt *qst = NULL;
+        if (p_prep(db, q.UTF8String, -1, &qst, NULL) == 0 && qst) {
+            while (p_step(qst) == 100) {
+                const unsigned char *tv = p_text(qst, 0);
+                if (!tv) continue;
+                NSString *title = [[NSString stringWithUTF8String:(const char *)tv]
+                                   stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (title.length == 0 || [seenTitles containsObject:title]) continue;
+                [seenTitles addObject:title];
+
+                int idx = 1;
+                NSString *wv = nil, *hv = nil, *fv = nil;
+                if (wCol) { const unsigned char *c = p_text(qst, idx++); if (c) wv = [NSString stringWithUTF8String:(const char *)c]; }
+                if (hCol) { const unsigned char *c = p_text(qst, idx++); if (c) hv = [NSString stringWithUTF8String:(const char *)c]; }
+                if (fpsCol) { const unsigned char *c = p_text(qst, idx++); if (c) fv = [NSString stringWithUTF8String:(const char *)c]; }
+                NSMutableArray<NSString *> *parts = [NSMutableArray array];
+                if (wv.length > 0 && hv.length > 0) [parts addObject:[NSString stringWithFormat:@"%@x%@", wv, hv]];
+                if (fv.length > 0) [parts addObject:[NSString stringWithFormat:@"%@fps", fv]];
+                NSString *meta = parts.count > 0 ? [parts componentsJoinedByString:@"  •  "] : @"Alight Motion Project";
+                [results addObject:@{@"title": title, @"meta": meta, @"path": dbPath}];
+            }
+            p_fin(qst);
+        }
+    }
+
+    p_close(db);
+}
+
 // Scans Alight Motion's real local project storage (Documents & Application Support)
-// for <scene title="..."> XMLs, project metadata JSON/plists, and .amproj files.
+// for SQLite/CoreData project databases, <scene title="..."> XMLs (with or without .xml),
+// project metadata JSONs, and .amproj files.
 static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDisk(void) {
     NSMutableArray<NSDictionary<NSString *, NSString *> *> *results = [NSMutableArray array];
     NSMutableSet<NSString *> *seenTitles = [NSMutableSet set];
@@ -1633,7 +1757,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
         NSDirectoryEnumerator<NSString *> *en = [fm enumeratorAtPath:root];
         NSString *rel = nil;
         NSInteger scanned = 0;
-        while ((rel = [en nextObject]) != nil && scanned < 2500) {
+        while ((rel = [en nextObject]) != nil && scanned < 3000) {
             scanned++;
             NSString *firstComp = rel.pathComponents.firstObject ?: @"";
             if ([skipDirs containsObject:firstComp]) {
@@ -1642,12 +1766,27 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
             }
             NSString *full = [root stringByAppendingPathComponent:rel];
             NSString *ext = rel.pathExtension.lowercaseString;
+            NSString *fnameLow = rel.lastPathComponent.lowercaseString;
 
-            if ([ext isEqualToString:@"xml"]) {
+            if ([ext isEqualToString:@"sqlite"] || [ext isEqualToString:@"sqlite3"] || [ext isEqualToString:@"db"]) {
+                if ([fnameLow containsString:@"remoteconfig"] || [fnameLow containsString:@"vng_vision"] ||
+                    [fnameLow containsString:@"google"] || [fnameLow containsString:@"firebase"] ||
+                    [fnameLow containsString:@"amplitude"] || [fnameLow containsString:@"cache"]) {
+                    continue;
+                }
+                AMScanSQLiteForProjects(full, results, seenTitles);
+            } else if ([ext isEqualToString:@"xml"] || ext.length == 0) {
+                BOOL isDir = NO;
+                if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
                 NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:full];
                 NSData *head = [fh readDataOfLength:2048];
                 [fh closeFile];
-                if (head.length == 0) continue;
+                if (head.length < 16) continue;
+                // Check for SQLite header even on extensionless DB files ("SQLite format 3\0")
+                if (head.length >= 16 && memcmp(head.bytes, "SQLite format 3", 15) == 0) {
+                    AMScanSQLiteForProjects(full, results, seenTitles);
+                    continue;
+                }
                 NSString *txt = [[NSString alloc] initWithData:head encoding:NSUTF8StringEncoding];
                 if (!txt || ![txt containsString:@"<scene"]) continue;
                 NSRange sStart = [txt rangeOfString:@"<scene"];
@@ -1655,8 +1794,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
                 if (sEnd.location == NSNotFound) continue;
                 NSString *tag = [txt substringWithRange:NSMakeRange(sStart.location, (sEnd.location - sStart.location) + 1)];
                 NSString *title = AMExtractXMLAttr(tag, @"title");
-                if (title.length == 0) continue;
-                if ([seenTitles containsObject:title]) continue;
+                if (title.length == 0 || [seenTitles containsObject:title]) continue;
                 [seenTitles addObject:title];
 
                 NSString *w = AMExtractXMLAttr(tag, @"width");
@@ -1676,7 +1814,6 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
                 id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
                 if (![obj isKindOfClass:[NSDictionary class]]) continue;
                 NSDictionary *dict = (NSDictionary *)obj;
-                // Only accept JSON that looks like a project metadata record
                 BOOL looksLikeProj = (dict[@"fps"] != nil || dict[@"width"] != nil || dict[@"scene"] != nil || dict[@"projectId"] != nil || dict[@"duration"] != nil);
                 if (!looksLikeProj) continue;
                 NSString *title = [dict[@"title"] isKindOfClass:[NSString class]] ? dict[@"title"] :
