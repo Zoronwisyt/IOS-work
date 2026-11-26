@@ -999,8 +999,10 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
 // struct/array constructors, stpq swizzles, uniform/varying, not()) to MSL.
 // ============================================================================
 
-static id<MTLLibrary> (*gOrigNewLibraryWithSource)(id, SEL, NSString *, MTLCompileOptions *, NSError **) = NULL;
+typedef void *(*AMNewLibOrigFn)(id, SEL, NSString *, MTLCompileOptions *, NSError * __autoreleasing *);
+static AMNewLibOrigFn gOrigNewLibraryWithSource = NULL;
 
+// AM_METAL_COMPAT_BEGIN
 static NSString *AMGLSLGlobalCompatPreamble(void) {
     return @"\n"
     "// --- AMMod GLSL-ES-to-MSL Compatibility Preamble ---\n"
@@ -1325,6 +1327,27 @@ static NSString *AMTranspileGLSLWrapperToMSL(NSString *source) {
     return out;
 }
 
+static NSString *AMBuildSafePassthroughMSL(NSString *source) {
+    if (!source || ![source containsString:@"AC_ShaderWrapper"]) return nil;
+    NSRange discardDef = [source rangeOfString:@"#define discard"];
+    NSRange undefStart = [source rangeOfString:@"#undef acScreenToLayer"];
+    if (discardDef.location == NSNotFound || undefStart.location == NSNotFound || undefStart.location <= discardDef.location) {
+        return nil;
+    }
+    NSRange nl = [source rangeOfString:@"\n" options:0 range:NSMakeRange(discardDef.location, undefStart.location - discardDef.location)];
+    if (nl.location == NSNotFound || nl.location + 1 >= undefStart.location) return nil;
+
+    NSRange bodyRange = NSMakeRange(nl.location + 1, undefStart.location - (nl.location + 1));
+    BOOL hasInputImg = ([source rangeOfString:@"AC_ImageInfo inputImg"].location != NSNotFound);
+    NSString *safeBody = hasInputImg
+        ? @"\n    void main() { gl_FragColor = texture2DCv(ac__img.inputImg.texture, acScreenNorm); }\n"
+        : @"\n    void main() { gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0); }\n";
+    NSMutableString *out = [source mutableCopy];
+    [out replaceCharactersInRange:bodyRange withString:safeBody];
+    return out;
+}
+// AM_METAL_COMPAT_END
+
 static void AMLogShaderCompileFailure(NSError *err, NSString *mslSource) {
     @try {
         NSString *logPath = [AMCustomEffectsDir() stringByAppendingPathComponent:@"last_shader_error.txt"];
@@ -1334,33 +1357,45 @@ static void AMLogShaderCompileFailure(NSError *err, NSString *mslSource) {
     } @catch (NSException *ignored) {}
 }
 
-static id<MTLLibrary> AMHook_newLibraryWithSource(id self, SEL _cmd, NSString *source, MTLCompileOptions *options, NSError **error) {
-    if (!gOrigNewLibraryWithSource) return nil;
+// IMPORTANT: -newLibraryWithSource:options:error: begins with "new" so Objective-C/Swift callers
+// expect a +1 retained object (NS_RETURNS_RETAINED). Using raw void* avoids ARC autoreleasing it
+// and causing a double-free EXC_BAD_ACCESS when Swift releases its +1 reference.
+static void *AMHook_newLibraryWithSource(id self, SEL _cmd, NSString *source, MTLCompileOptions *options, NSError * __autoreleasing *error) {
+    if (!gOrigNewLibraryWithSource) return NULL;
 
     NSError *firstErr = nil;
-    id<MTLLibrary> lib = gOrigNewLibraryWithSource(self, _cmd, source, options, &firstErr);
-    if (lib != nil) {
+    void *rawLib = gOrigNewLibraryWithSource(self, _cmd, source, options, &firstErr);
+    if (rawLib != NULL) {
         if (error) *error = firstErr;
-        return lib;
+        return rawLib;
     }
 
     if (source && [source containsString:@"AC_ShaderWrapper"]) {
         NSString *transpiled = AMTranspileGLSLWrapperToMSL(source);
         if (transpiled && ![transpiled isEqualToString:source]) {
             NSError *retryErr = nil;
-            id<MTLLibrary> retryLib = gOrigNewLibraryWithSource(self, _cmd, transpiled, options, &retryErr);
-            if (retryLib != nil) {
+            void *retryLib = gOrigNewLibraryWithSource(self, _cmd, transpiled, options, &retryErr);
+            if (retryLib != NULL) {
                 if (error) *error = nil;
                 return retryLib;
             }
             AMLogShaderCompileFailure(retryErr ?: firstErr, transpiled);
-            if (error) *error = retryErr ?: firstErr;
-            return nil;
+        }
+
+        // Guaranteed crash-proof passthrough fallback so AlightEffectShader.init never fails with nil
+        NSString *fallback = AMBuildSafePassthroughMSL(source);
+        if (fallback) {
+            NSError *fbErr = nil;
+            void *fbLib = gOrigNewLibraryWithSource(self, _cmd, fallback, options, &fbErr);
+            if (fbLib != NULL) {
+                if (error) *error = nil;
+                return fbLib;
+            }
         }
     }
 
     if (error) *error = firstErr;
-    return nil;
+    return NULL;
 }
 
 static void AMInstallMetalShaderCompatHook(void) {
@@ -1373,8 +1408,7 @@ static void AMInstallMetalShaderCompatHook(void) {
         SEL sel = @selector(newLibraryWithSource:options:error:);
         Method m = class_getInstanceMethod(devCls, sel);
         if (!m) return;
-        gOrigNewLibraryWithSource = (id<MTLLibrary> (*)(id, SEL, NSString *, MTLCompileOptions *, NSError **))
-            method_setImplementation(m, (IMP)AMHook_newLibraryWithSource);
+        gOrigNewLibraryWithSource = (AMNewLibOrigFn)method_setImplementation(m, (IMP)AMHook_newLibraryWithSource);
     });
 }
 

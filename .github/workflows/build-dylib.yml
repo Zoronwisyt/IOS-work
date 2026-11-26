@@ -37,6 +37,10 @@ jobs:
           file AlightMotionMods.dylib
           otool -L AlightMotionMods.dylib
 
+      - name: Verify Gold Motion shaders with Apple Metal compiler
+        if: hashFiles('test_metal_compat.py') != ''
+        run: python3 test_metal_compat.py
+
       - name: Upload ARM64 dylib artifact
         uses: actions/upload-artifact@v4
         with:
