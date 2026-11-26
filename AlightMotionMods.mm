@@ -1170,12 +1170,14 @@ static NSString *AMGLSLGlobalCompatPreamble(void) {
 
 static NSString *AMGLSLWrapperExtraMethods(void) {
     return @"\n"
-    "    vec4 texture2D(texture2d<half> t, vec2 p, float bias) { return vec4(t.sample(textureSampler, p)); }\n"
-    "    vec4 texture2DCv(texture2d<half> t, vec2 p, float bias) { return texture2DCv(t, p); }\n"
+    "    vec2 am_texSize(AC_ImageInfo info) { return info.size; }\n"
+    "    template<typename T, typename U> inline T am_mix(T a, T b, U t) { return mix(a, b, t); }\n"
+    "    vec4 texture2D(texture2d<half> t, vec2 p, float bias) { (void)bias; return vec4(t.sample(textureSampler, p)); }\n"
+    "    vec4 texture2DCv(texture2d<half> t, vec2 p, float bias) { (void)bias; return texture2DCv(t, p); }\n"
     "    vec4 texture2D(AC_ImageInfo info, vec2 p) { return texture2D(info.texture, p); }\n"
     "    vec4 texture2DCv(AC_ImageInfo info, vec2 p) { return texture2DCv(info.texture, p); }\n"
     "    vec4 texture(texture2d<half> t, vec2 p) { return texture2D(t, p); }\n"
-    "    vec4 texture(texture2d<half> t, vec2 p, float bias) { return texture2D(t, p); }\n"
+    "    vec4 texture(texture2d<half> t, vec2 p, float bias) { (void)bias; return texture2D(t, p); }\n"
     "    vec4 texture(AC_ImageInfo info, vec2 p) { return texture2D(info.texture, p); }\n";
 }
 
@@ -1206,12 +1208,26 @@ static NSString *AMSanitizeUserGLSLBody(NSString *body) {
         [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@""];
     }
 
-    // 4. Preserve compile-time `const int NAME = INT_EXPR;` (avoid `#define const` breaking array bounds)
+    // 4. Preserve compile-time `const int NAME = INT_EXPR;` (valid at both struct & function scope in Metal)
     {
         NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\bconst\\s+int\\s+([A-Za-z_]\\w*)\\s*=\\s*([0-9+\\-*/()\\s]+);"
                                                                             options:0
                                                                               error:nil];
-        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"static constexpr int $1 = $2;"];
+        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"enum { $1 = $2 };"];
+    }
+
+    // 4b. Avoid `#define size (ac__p.size)` breaking `inputImg.size` and `#define mix (ac__p.mix)` breaking `mix(...)`
+    if ([s containsString:@"#define size (ac__p.size)"]) {
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\b(?!ac__p\\b)([A-Za-z_]\\w*)\\.size\\b"
+                                                                            options:0
+                                                                              error:nil];
+        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"am_texSize($1)"];
+    }
+    if ([s containsString:@"#define mix (ac__p.mix)"]) {
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\bmix\\s*\\("
+                                                                            options:0
+                                                                              error:nil];
+        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"am_mix("];
     }
 
     // 5. Rewrite GLSL `out` / `inout` function parameters to MSL `thread T&`
