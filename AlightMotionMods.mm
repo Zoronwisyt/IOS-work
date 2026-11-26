@@ -282,6 +282,10 @@ static NSData *AMRewriteProjectMetadataJSON(NSData *data) {
         if (res && [res[@"result"] isEqualToString:@"success"]) {
             res[@"download"] = @"allowed";
             res[@"message"] = [NSNull null];
+            NSMutableDictionary *info = [res[@"info"] isKindOfClass:[NSMutableDictionary class]] ? res[@"info"] : nil;
+            if (info) {
+                info[@"size"] = @(1000000);
+            }
             NSData *reencoded = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
             if (reencoded) return reencoded;
         }
@@ -289,40 +293,36 @@ static NSData *AMRewriteProjectMetadataJSON(NSData *data) {
     return data;
 }
 
+static void AMClearFetcherAuthHeaders(id fetcher) {
+    SEL setHdrSel = NSSelectorFromString(@"setRequestValue:forHTTPHeaderField:");
+    if (![fetcher respondsToSelector:setHdrSel]) return;
+    ((void (*)(id, SEL, NSString *, NSString *))objc_msgSend)(fetcher, setHdrSel, nil, @"Authorization");
+    ((void (*)(id, SEL, NSString *, NSString *))objc_msgSend)(fetcher, setHdrSel, nil, @"X-Firebase-AppCheck");
+    ((void (*)(id, SEL, NSString *, NSString *))objc_msgSend)(fetcher, setHdrSel, nil, @"Firebase-Instance-ID-Token");
+}
+
 static void AMHook_gtmBeginFetchWithCompletionHandler(id self, SEL _cmd, void (^handler)(NSData * _Nullable, NSError * _Nullable)) {
-    NSMutableURLRequest *req = nil;
-    SEL mutReqSel = NSSelectorFromString(@"mutableRequest");
-    if ([self respondsToSelector:mutReqSel]) {
-        req = ((NSMutableURLRequest *(*)(id, SEL))objc_msgSend)(self, mutReqSel);
+    NSURLRequest *req = nil;
+    SEL reqSel = NSSelectorFromString(@"request");
+    if ([self respondsToSelector:reqSel]) {
+        req = ((NSURLRequest *(*)(id, SEL))objc_msgSend)(self, reqSel);
     }
     NSString *urlStr = req.URL.absoluteString ?: @"";
 
     if ([urlStr containsString:@"/getProjectMetadata"] && handler != nil) {
-        // Perform a clean header-free POST directly via NSURLSession so invalid sideloaded
-        // Firebase AppCheck / Auth tokens can never trigger `INTERNAL`, then rewrite
-        // `download` -> `"allowed"` and invoke GTMSessionFetcher's completion handler.
-        NSMutableURLRequest *clean = [NSMutableURLRequest requestWithURL:req.URL
-                                                             cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                                         timeoutInterval:30.0];
-        clean.HTTPMethod = @"POST";
-        clean.HTTPBody = req.HTTPBody;
-        [clean setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-        [clean setValue:@"AlightMotion/6.2.60" forHTTPHeaderField:@"User-Agent"];
-
-        [[[NSURLSession sharedSession] dataTaskWithRequest:clean completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable resp, NSError * _Nullable err) {
-            (void)resp;
+        AMClearFetcherAuthHeaders(self);
+        void (^wrapped)(NSData * _Nullable, NSError * _Nullable) = ^(NSData * _Nullable data, NSError * _Nullable err) {
             NSData *patched = (!err && data.length > 0) ? AMRewriteProjectMetadataJSON(data) : data;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                handler(patched, err);
-            });
-        }] resume];
+            handler(patched, err);
+        };
+        if (gOrigGTMBeginFetch) {
+            ((void (*)(id, SEL, id))gOrigGTMBeginFetch)(self, _cmd, wrapped);
+        }
         return;
     }
 
-    // Also strip invalid sideloaded Auth / AppCheck headers when downloading shared projectfiles.zip from Firebase Storage
     if ([urlStr containsString:@"firebasestorage.googleapis.com"] && [urlStr containsString:@"projectfiles.zip"]) {
-        [req setValue:nil forHTTPHeaderField:@"Authorization"];
-        [req setValue:nil forHTTPHeaderField:@"X-Firebase-AppCheck"];
+        AMClearFetcherAuthHeaders(self);
     }
 
     if (gOrigGTMBeginFetch) {
