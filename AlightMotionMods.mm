@@ -2618,26 +2618,31 @@ static const NSInteger kAMStepPresetCount = sizeof(kAMStepPresets) / sizeof(kAMS
 static AMSpeedBezierCurve gCopiedSpeedCurve = {0.42, 0.00, 0.58, 1.00};
 static BOOL gHasCopiedSpeedCurve = NO;
 
-static id AMGetIvarObject(id obj, const char *ivarName) {
-    if (!obj || !ivarName) return nil;
+static void *AMGetRawIvarPtr(id obj, const char *ivarName) {
+    if (!obj || !ivarName) return NULL;
     Class cls = object_getClass(obj);
     while (cls) {
         Ivar iv = class_getInstanceVariable(cls, ivarName);
         if (iv) {
             ptrdiff_t off = ivar_getOffset(iv);
-            void *ptr = *(void **)((uint8_t *)(__bridge void *)obj + off);
-            return (__bridge id)ptr;
+            return *(void **)((uint8_t *)(__bridge void *)obj + off);
         }
         cls = class_getSuperclass(cls);
     }
-    return nil;
+    return NULL;
 }
 
-static void AMCallEditSpeedVMSetSpeed(id vm, int64_t milliSpeed) {
-    if (!vm) return;
+static id AMCallObjCGetter(id obj, NSString *selName) {
+    if (!obj || !selName.length) return nil;
+    SEL sel = NSSelectorFromString(selName);
+    if (![obj respondsToSelector:sel]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+}
+
+static void AMCallEditSpeedVMSetSpeed(void *vmPtr, int64_t milliSpeed) {
+    if (!vmPtr) return;
     intptr_t slide = _dyld_get_image_vmaddr_slide(0);
     uintptr_t fnAddr = (uintptr_t)slide + 0x1006d3bc0ULL;
-    void *vmPtr = (__bridge void *)vm;
     register int64_t x0_arg __asm__("x0") = milliSpeed;
     register void *x20_self __asm__("x20") = vmPtr;
     register uintptr_t x16_fn __asm__("x16") = fnAddr;
@@ -2647,16 +2652,16 @@ static void AMCallEditSpeedVMSetSpeed(id vm, int64_t milliSpeed) {
         : "r"(x16_fn)
         : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
           "x12", "x13", "x14", "x15", "x17", "lr", "cc", "memory",
-          "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7",
-          "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15"
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+          "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+          "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31"
     );
 }
 
-static void AMCallEditSpeedVMRefreshUI(id vm) {
-    if (!vm) return;
+static void AMCallEditSpeedVMRefreshUI(void *vmPtr) {
+    if (!vmPtr) return;
     intptr_t slide = _dyld_get_image_vmaddr_slide(0);
     uintptr_t fnAddr = (uintptr_t)slide + 0x1006d4120ULL;
-    void *vmPtr = (__bridge void *)vm;
     register void *x20_self __asm__("x20") = vmPtr;
     register uintptr_t x16_fn __asm__("x16") = fnAddr;
     __asm__ volatile(
@@ -2665,9 +2670,20 @@ static void AMCallEditSpeedVMRefreshUI(id vm) {
         : "r"(x16_fn)
         : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
           "x12", "x13", "x14", "x15", "x17", "lr", "cc", "memory",
-          "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7",
-          "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15"
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+          "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+          "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31"
     );
+}
+
+static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColor *strokeColor, UIColor *dotColor, BOOL drawBox);
+
+static UIImage *AMNativeEasingIcon(NSString *preferredName, AMSpeedBezierCurve fallbackCurve, CGSize size, UIColor *tint) {
+    UIImage *img = preferredName.length ? [UIImage imageNamed:preferredName] : nil;
+    if (img) {
+        return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    }
+    return [AMBezierCurveIconImage(fallbackCurve, size, tint, tint, YES) imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
 }
 
 static NSString *AMSpeedGraphsFilePath(void) {
@@ -3169,17 +3185,30 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
 - (void)refreshPresetAndCategoryIcons {
     NSInteger count = 0;
     const AMSpeedPreset *presets = [self currentPresetsArray:&count];
+    NSArray<NSString *> *cubicPresetNames = @[
+        @"ic_easingcurve_linear",
+        @"ic_easingcurve_easein",
+        @"ic_easingcurve_easeout",
+        @"ic_easingcurve_easeinout",
+    ];
     for (NSInteger i = 0; i < (NSInteger)self.presetButtons.count; i++) {
         UIButton *pb = self.presetButtons[i];
         if (i < count) {
             pb.hidden = NO;
-            UIImage *img = AMBezierCurveIconImage(presets[i].curve, CGSizeMake(36.0, 36.0), [UIColor whiteColor], [UIColor whiteColor], YES);
+            pb.tintColor = [UIColor whiteColor];
+            NSString *asset = (self.categoryIndex == 0 && i < (NSInteger)cubicPresetNames.count) ? cubicPresetNames[i] : nil;
+            UIImage *img = AMNativeEasingIcon(asset, presets[i].curve, CGSizeMake(34.0, 34.0), [UIColor whiteColor]);
             [pb setImage:img forState:UIControlStateNormal];
         } else {
             pb.hidden = YES;
         }
     }
 
+    NSArray<NSString *> *catAssetNames = @[
+        @"ic_easingcurve_category_cubic",
+        @"ic_easingcurve_category_physical",
+        @"ic_easingcurve_category_step",
+    ];
     AMSpeedBezierCurve catCurves[3] = {
         {0.42, 0.00, 0.58, 1.00},
         {0.90, 0.05, 0.10, 0.95},
@@ -3190,7 +3219,8 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
         BOOL active = (i == self.categoryIndex);
         cb.backgroundColor = active ? [UIColor colorWithRed:0.075 green:0.082 blue:0.122 alpha:1.0] : [UIColor clearColor];
         UIColor *col = active ? AMAccentGreenColor() : [UIColor colorWithWhite:1.0 alpha:0.75];
-        UIImage *img = AMBezierCurveIconImage(catCurves[i], CGSizeMake(34.0, 34.0), col, col, YES);
+        cb.tintColor = col;
+        UIImage *img = AMNativeEasingIcon(catAssetNames[i], catCurves[i], CGSizeMake(32.0, 32.0), col);
         [cb setImage:img forState:UIControlStateNormal];
     }
 }
@@ -3208,15 +3238,15 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
     AMSaveSpeedGraphForKey(self.layerKey, curve, self.canvasView.baseSpeed, self.presetTitleLabel.text);
     if (!commit) return;
 
-    id vm = AMGetIvarObject(self.speedVC, "vm");
-    if (vm) {
+    void *vmPtr = AMGetRawIvarPtr(self.speedVC, "vm");
+    if (vmPtr) {
         CGFloat mult = AMComputeSpeedMultiplierAtProgress(curve, 0.5);
         CGFloat targetSpeed = self.canvasView.baseSpeed * mult;
         if (targetSpeed < 0.10) targetSpeed = 0.10;
         if (targetSpeed > 8.00) targetSpeed = 8.00;
         int64_t milli = (int64_t)llround(targetSpeed * 1000.0);
-        AMCallEditSpeedVMSetSpeed(vm, milli);
-        AMCallEditSpeedVMRefreshUI(vm);
+        AMCallEditSpeedVMSetSpeed(vmPtr, milli);
+        AMCallEditSpeedVMRefreshUI(vmPtr);
         AMForceImmediatePreviewRedraw();
     }
 }
@@ -3342,7 +3372,8 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
     AMSpeedGraphPanelVC *graphVC = [[AMSpeedGraphPanelVC alloc] init];
     graphVC.speedVC = speedVC;
     graphVC.panelVC = hostVC;
-    graphVC.layerKey = [NSString stringWithFormat:@"speed_%p", (__bridge void *)AMGetIvarObject(speedVC, "holder")];
+    void *holderPtr = AMGetRawIvarPtr(speedVC, "holder");
+    graphVC.layerKey = [NSString stringWithFormat:@"speed_%p", holderPtr];
 
     [hostVC addChildViewController:graphVC];
     graphVC.view.frame = hostVC.view.bounds;
@@ -3355,39 +3386,78 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
 
 static void AMEnsureSpeedGraphButton(UIViewController *speedVC) {
     if (!speedVC || !speedVC.view) return;
+
+    // Find parent EditSpeedControlPanelVC so we can place the button cleanly in its top header bar
+    // (aligned across from the green speedometer icon, never overlapping the 4 retime buttons).
+    UIViewController *panelVC = speedVC.parentViewController;
+    while (panelVC && ![NSStringFromClass([panelVC class]) containsString:@"EditSpeedControlPanelVC"]) {
+        panelVC = panelVC.parentViewController;
+    }
+
     UIButton *btn = objc_getAssociatedObject(speedVC, kAMSpeedGraphBtnAssocKey);
     if (!btn) {
-        btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        btn = [UIButton buttonWithType:UIButtonTypeSystem];
         btn.translatesAutoresizingMaskIntoConstraints = NO;
         btn.accessibilityLabel = @"Speed Graph Editor";
-        btn.backgroundColor = AMCircleBtnColor();
-        btn.layer.cornerRadius = 8.0;
-        btn.layer.borderWidth = 1.0;
-        btn.layer.borderColor = AMBorderColor().CGColor;
-        UIImage *icon = AMBezierCurveIconImage((AMSpeedBezierCurve){0.42, 0.00, 0.58, 1.00},
-                                               CGSizeMake(24.0, 24.0),
-                                               AMAccentGreenColor(),
-                                               [UIColor whiteColor],
-                                               YES);
-        [btn setImage:icon forState:UIControlStateNormal];
+        btn.backgroundColor = [UIColor clearColor];
+        btn.tintColor = [UIColor whiteColor];
+        btn.imageView.contentMode = UIViewContentModeScaleAspectFit;
+
+        UIImage *nativeIcon = [UIImage imageNamed:@"ic_easing"]
+                           ?: [UIImage imageNamed:@"icon_easing"]
+                           ?: [UIImage imageNamed:@"ic_easingcurve_category_cubic"];
+        if (nativeIcon) {
+            nativeIcon = [nativeIcon imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        } else {
+            nativeIcon = AMBezierCurveIconImage((AMSpeedBezierCurve){0.42, 0.00, 0.58, 1.00},
+                                                CGSizeMake(24.0, 24.0),
+                                                [UIColor whiteColor],
+                                                [UIColor whiteColor],
+                                                YES);
+        }
+        [btn setImage:nativeIcon forState:UIControlStateNormal];
+
+        __weak UIViewController *weakSpeedVC = speedVC;
         [btn addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull action) {
-            [AMSpeedGraphButtonHelper openGraphForSpeedVC:speedVC];
+            (void)action;
+            [AMSpeedGraphButtonHelper openGraphForSpeedVC:weakSpeedVC];
         }] forControlEvents:UIControlEventTouchUpInside];
 
-        [speedVC.view addSubview:btn];
-        [NSLayoutConstraint activateConstraints:@[
-            [btn.trailingAnchor constraintEqualToAnchor:speedVC.view.trailingAnchor constant:-12.0],
-            [btn.topAnchor constraintEqualToAnchor:speedVC.view.topAnchor constant:8.0],
-            [btn.widthAnchor constraintEqualToConstant:36.0],
-            [btn.heightAnchor constraintEqualToConstant:36.0],
-        ]];
+        UIView *cueView = panelVC ? (UIView *)AMCallObjCGetter(panelVC, @"cueView") : nil;
+        UIView *speedValLabel = (UIView *)AMCallObjCGetter(speedVC, @"speedValueLabel");
+
+        if (cueView && cueView.superview) {
+            [cueView.superview addSubview:btn];
+            [NSLayoutConstraint activateConstraints:@[
+                [btn.trailingAnchor constraintEqualToAnchor:cueView.superview.trailingAnchor constant:-12.0],
+                [btn.centerYAnchor constraintEqualToAnchor:cueView.centerYAnchor],
+                [btn.widthAnchor constraintEqualToConstant:36.0],
+                [btn.heightAnchor constraintEqualToConstant:36.0],
+            ]];
+        } else if (speedValLabel && speedValLabel.superview) {
+            [speedVC.view addSubview:btn];
+            [NSLayoutConstraint activateConstraints:@[
+                [btn.trailingAnchor constraintEqualToAnchor:speedVC.view.trailingAnchor constant:-16.0],
+                [btn.centerYAnchor constraintEqualToAnchor:speedValLabel.centerYAnchor],
+                [btn.widthAnchor constraintEqualToConstant:36.0],
+                [btn.heightAnchor constraintEqualToConstant:36.0],
+            ]];
+        } else {
+            [speedVC.view addSubview:btn];
+            [NSLayoutConstraint activateConstraints:@[
+                [btn.trailingAnchor constraintEqualToAnchor:speedVC.view.trailingAnchor constant:-16.0],
+                [btn.centerYAnchor constraintEqualToAnchor:speedVC.view.centerYAnchor],
+                [btn.widthAnchor constraintEqualToConstant:36.0],
+                [btn.heightAnchor constraintEqualToConstant:36.0],
+            ]];
+        }
         objc_setAssociatedObject(speedVC, kAMSpeedGraphBtnAssocKey, btn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
-    UIView *cover = AMGetIvarObject(speedVC, "speedControlCover");
+    UIView *cover = (UIView *)AMCallObjCGetter(speedVC, @"speedControlCover");
     BOOL disabled = (cover && !cover.hidden && cover.alpha > 0.01);
     btn.hidden = disabled;
-    [speedVC.view bringSubviewToFront:btn];
+    if (btn.superview) [btn.superview bringSubviewToFront:btn];
 }
 
 static void AMHook_editSpeedVCViewDidLoad(id self, SEL _cmd) {
