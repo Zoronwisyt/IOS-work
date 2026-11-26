@@ -322,6 +322,36 @@ static void AMClearFetcherAuthHeaders(id fetcher) {
     ((void (*)(id, SEL, NSString *, NSString *))objc_msgSend)(fetcher, setHdrSel, nil, @"Firebase-Instance-ID-Token");
 }
 
+static NSData *AMSynthesizeProjectDownloadJSON(NSData *reqBody) {
+    if (reqBody.length == 0) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:reqBody options:0 error:nil];
+    if (![obj isKindOfClass:[NSDictionary class]]) return nil;
+    NSDictionary *root = (NSDictionary *)obj;
+    NSDictionary *d = [root[@"data"] isKindOfClass:[NSDictionary class]] ? root[@"data"] : root;
+    NSString *uid = [d[@"uid"] isKindOfClass:[NSString class]] ? d[@"uid"] : nil;
+    NSString *pid = [d[@"pid"] isKindOfClass:[NSString class]] ? d[@"pid"] : nil;
+    if (uid.length == 0 || pid.length == 0) return nil;
+    BOOL lite = [d[@"liteVersion"] respondsToSelector:@selector(boolValue)] ? [d[@"liteVersion"] boolValue] : NO;
+    NSString *fileName = lite ? @"projectfiles-lite.zip" : @"projectfiles.zip";
+    NSString *gsUri = [NSString stringWithFormat:@"gs://alight-creative.appspot.com/share/u/%@/p/%@/%@", uid, pid, fileName];
+    NSDictionary *synth = @{
+        @"result": @{
+            @"result": @"success",
+            @"downloadUri": gsUri
+        }
+    };
+    return [NSJSONSerialization dataWithJSONObject:synth options:0 error:nil];
+}
+
+static BOOL AMResponseHasValidDownloadUri(NSData *data) {
+    if (data.length == 0) return NO;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![obj isKindOfClass:[NSDictionary class]]) return NO;
+    NSDictionary *res = [obj[@"result"] isKindOfClass:[NSDictionary class]] ? obj[@"result"] : nil;
+    NSString *uri = [res[@"downloadUri"] isKindOfClass:[NSString class]] ? res[@"downloadUri"] : nil;
+    return uri.length > 0;
+}
+
 static void AMHook_gtmBeginFetchWithCompletionHandler(id self, SEL _cmd, void (^handler)(NSData * _Nullable, NSError * _Nullable)) {
     NSURLRequest *req = nil;
     SEL reqSel = NSSelectorFromString(@"request");
@@ -342,7 +372,35 @@ static void AMHook_gtmBeginFetchWithCompletionHandler(id self, SEL _cmd, void (^
         return;
     }
 
-    if ([urlStr containsString:@"firebasestorage.googleapis.com"] && [urlStr containsString:@"projectfiles.zip"]) {
+    if ([urlStr containsString:@"/requestProjectDownload"] && handler != nil) {
+        NSData *reqBody = nil;
+        SEL bodySel = NSSelectorFromString(@"bodyData");
+        if ([self respondsToSelector:bodySel]) {
+            reqBody = ((NSData *(*)(id, SEL))objc_msgSend)(self, bodySel);
+        }
+        if (reqBody.length == 0) {
+            reqBody = req.HTTPBody;
+        }
+        NSData *fallbackData = AMSynthesizeProjectDownloadJSON(reqBody);
+        AMClearFetcherAuthHeaders(self);
+        void (^wrapped)(NSData * _Nullable, NSError * _Nullable) = ^(NSData * _Nullable data, NSError * _Nullable err) {
+            if (!err && AMResponseHasValidDownloadUri(data)) {
+                handler(data, nil);
+                return;
+            }
+            if (fallbackData.length > 0) {
+                handler(fallbackData, nil);
+                return;
+            }
+            handler(data, err);
+        };
+        if (gOrigGTMBeginFetch) {
+            ((void (*)(id, SEL, id))gOrigGTMBeginFetch)(self, _cmd, wrapped);
+        }
+        return;
+    }
+
+    if ([urlStr containsString:@"firebasestorage.googleapis.com"] && [urlStr containsString:@"projectfiles"]) {
         AMClearFetcherAuthHeaders(self);
     }
 
