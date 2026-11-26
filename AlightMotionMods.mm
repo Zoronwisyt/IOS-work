@@ -4,11 +4,14 @@
 //    Single-tap ladder cycle: Full -> 1/2 -> 1/3 -> 1/4 -> Full.
 //    Immediately re-renders paused frame via AVPlayer without pressing Play.
 //    Wired to AMCompositor -> AMCompositorMetal (preview only; exports stay Full).
-// 2. Open Alight Motion Link: Native pill row inside SettingsVC to paste/open
-//    alight.link / alightmotion:// links directly inside this sideloaded app.
+// 2. Open Alight Motion Link: Light compact pill in SettingsVC.
+//    Supports direct sign-in-free Firebase Storage `projectfiles.zip` download for
+//    any alightcreative.com/am/share/u/<uid>/p/<pid> or alight.link URL (even >100MB),
+//    plus native dispatch (with client sign-in/size gates bypassed).
 // 3. Custom XML Effects Importer: `+` button in Effects -> Other category.
-//    Import XML code (paste or Files picker), custom name, optional thumbnail.
-//    Hooked into NSBundle BuiltinEffects & BuiltinThumb.
+//    Creates each custom effect with a unique `com.alightcreative.effects.custom_*`
+//    ID and its own selectable box in `Other` (auto-wraps raw GLSL or normalizes
+//    `<effect>` XML, strips hidden flags, and renders custom PNG thumbnails).
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -20,17 +23,17 @@
 #import <objc/message.h>
 #import <math.h>
 #import <stdint.h>
+#import <stdlib.h>
 
 static NSString *const kAMPreviewQualityKey = @"AMModPreviewQualityDivisor";
 static NSInteger gPreviewDivisor = 1; // 1=Full, 2=Half, 3=Third, 4=Quarter
 
-// Track active editor AVPlayer for immediate paused-frame redraw on quality change
 static __weak AVPlayer *gActivePreviewPlayer = nil;
 static IMP gOrigReplaceCurrentItem = NULL;
 static IMP gOrigInitWithPlayerItem = NULL;
 
 // ============================================================================
-// Theme Helpers (Matches Alight Motion UI)
+// Theme Helpers
 // ============================================================================
 
 static UIColor *AMBgColor(void) {
@@ -54,12 +57,11 @@ static UIColor *AMBorderColor(void) {
 }
 
 static UIColor *AMAccentGreenColor(void) {
-    return [UIColor colorWithRed:0.204 green:0.827 blue:0.600 alpha:1.0]; // #34D399
+    return [UIColor colorWithRed:0.204 green:0.827 blue:0.600 alpha:1.0];
 }
 
 static UIColor *AMSettingsPillColor(void) {
-    // Matches Alight Motion's light Settings drawer pills (#EAEBF0)
-    return [UIColor colorWithRed:0.918 green:0.922 blue:0.933 alpha:1.0];
+    return [UIColor colorWithRed:0.918 green:0.922 blue:0.933 alpha:1.0]; // #EAEBF0
 }
 
 static UIColor *AMSettingsTextColor(void) {
@@ -102,7 +104,6 @@ static void AMTrackPlayerIfPreview(AVPlayer *player, AVPlayerItem *item) {
     if (AMItemUsesAMCompositor(item) || AMItemUsesAMCompositor(player.currentItem)) {
         gActivePreviewPlayer = player;
     } else if (item && gActivePreviewPlayer == nil) {
-        // VideoComposition may be assigned right after replaceCurrentItem; track tentatively
         gActivePreviewPlayer = player;
     }
 }
@@ -131,8 +132,6 @@ static void AMForceImmediatePreviewRedraw(void) {
     AVPlayerItem *item = player.currentItem;
     if (!item) return;
 
-    // Re-assigning a copy of videoComposition forces AVFoundation to immediately
-    // re-invoke AMCompositor.startVideoCompositionRequest: on the current paused frame.
     AVVideoComposition *vc = item.videoComposition;
     if (vc) {
         AVVideoComposition *copied = [vc copy];
@@ -158,9 +157,7 @@ static void AMResolveCompositorOffsets(Class compClass) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         Ivar compImplIvar = class_getInstanceVariable(compClass, "compImpl");
-        if (compImplIvar) {
-            gCompImplOffset = ivar_getOffset(compImplIvar);
-        }
+        if (compImplIvar) gCompImplOffset = ivar_getOffset(compImplIvar);
         gCompositorMetalClass = NSClassFromString(@"_TtC12AlightMotion17AMCompositorMetal");
         if (gCompositorMetalClass) {
             Ivar dynaIvar = class_getInstanceVariable(gCompositorMetalClass, "dynaResMode");
@@ -191,10 +188,6 @@ static void AMHook_startVideoCompositionRequest(id self, SEL _cmd, id request) {
     }
 }
 
-// ============================================================================
-// Module 1: Preview Quality UI (Seamless White Flat One-Tap Ladder Button)
-// ============================================================================
-
 static IMP gOrigPreviewControlBarViewDidLoad = NULL;
 static const void *kAMQualityButtonAssocKey = &kAMQualityButtonAssocKey;
 
@@ -221,7 +214,6 @@ static const void *kAMQualityButtonAssocKey = &kAMQualityButtonAssocKey;
 }
 
 + (void)cycleQuality:(UIButton *)btn {
-    // Ladder: Full (1) -> Half (2) -> Third (3) -> Quarter (4) -> Full (1)
     gPreviewDivisor = (gPreviewDivisor % 4) + 1;
     [[NSUserDefaults standardUserDefaults] setInteger:gPreviewDivisor forKey:kAMPreviewQualityKey];
     [self styleQualityButton:btn];
@@ -236,21 +228,14 @@ static void AMHook_previewControlBarViewDidLoad(id self, SEL _cmd) {
     if (gOrigPreviewControlBarViewDidLoad) {
         ((void (*)(id, SEL))gOrigPreviewControlBarViewDidLoad)(self, _cmd);
     }
-
-    if (objc_getAssociatedObject(self, kAMQualityButtonAssocKey) != nil) {
-        return;
-    }
+    if (objc_getAssociatedObject(self, kAMQualityButtonAssocKey) != nil) return;
 
     UIButton *playBtn = nil;
     UIStackView *stack = nil;
     SEL playSel = NSSelectorFromString(@"playButton");
     SEL stackSel = NSSelectorFromString(@"stackView");
-    if ([self respondsToSelector:playSel]) {
-        playBtn = ((UIButton *(*)(id, SEL))objc_msgSend)(self, playSel);
-    }
-    if ([self respondsToSelector:stackSel]) {
-        stack = ((UIStackView *(*)(id, SEL))objc_msgSend)(self, stackSel);
-    }
+    if ([self respondsToSelector:playSel]) playBtn = ((UIButton *(*)(id, SEL))objc_msgSend)(self, playSel);
+    if ([self respondsToSelector:stackSel]) stack = ((UIStackView *(*)(id, SEL))objc_msgSend)(self, stackSel);
     if (!playBtn) return;
 
     UIButton *qBtn = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -281,7 +266,7 @@ static void AMHook_previewControlBarViewDidLoad(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// Module 2: Open Alight Motion Link inside SettingsVC
+// Module 2: Open Alight Link inside SettingsVC (Sign-in-Free Share Download)
 // ============================================================================
 
 static IMP gOrigSettingsVCViewDidLoad = NULL;
@@ -296,7 +281,6 @@ static void AMDispatchAlightLink(NSURL *url) {
     NSString *scheme = url.scheme.lowercaseString;
     BOOL handled = NO;
 
-    // Universal Links (https://alight.link/... or https://alightcreative.com/...)
     if ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]) {
         SEL uaSel = @selector(application:continueUserActivity:restorationHandler:);
         if ([del respondsToSelector:uaSel]) {
@@ -310,23 +294,12 @@ static void AMDispatchAlightLink(NSURL *url) {
         }
     }
 
-    // Custom scheme (alightmotion://...) or fallback
     if (!handled) {
         SEL openSel = @selector(application:openURL:options:);
         if ([del respondsToSelector:openSel]) {
             [del application:app openURL:url options:@{}];
         }
     }
-}
-
-static NSURL *AMNormalizeAlightLink(NSString *raw) {
-    if (!raw) return nil;
-    NSString *s = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (s.length == 0) return nil;
-    if (![s containsString:@"://"]) {
-        s = [@"https://" stringByAppendingString:s];
-    }
-    return [NSURL URLWithString:s];
 }
 
 static void AMOpenLocalFileInApp(NSURL *fileURL) {
@@ -340,25 +313,32 @@ static void AMOpenLocalFileInApp(NSURL *fileURL) {
     });
 }
 
-static NSString *AMExtractPackageURLFromText(NSString *text) {
-    if (text.length == 0) return nil;
-    NSArray<NSString *> *patterns = @[
-        @"https://firebasestorage\\.googleapis\\.com/[^\"'\\s<>]+",
-        @"https://storage\\.googleapis\\.com/[^\"'\\s<>]+",
-        @"https://[^\"'\\s<>]+\\.amproj(?:\\?[^\"'\\s<>]*)?",
-        @"https://[^\"'\\s<>]+\\.xml(?:\\?[^\"'\\s<>]*)?",
-    ];
-    for (NSString *pat in patterns) {
-        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:pat options:NSRegularExpressionCaseInsensitive error:nil];
-        NSTextCheckingResult *m = [rx firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
-        if (m && m.range.location != NSNotFound) {
-            NSString *found = [text substringWithRange:m.range];
-            found = [found stringByReplacingOccurrencesOfString:@"\\u0026" withString:@"&"];
-            found = [found stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
-            return found;
-        }
+static NSURL *AMNormalizeAlightLink(NSString *raw) {
+    if (!raw) return nil;
+    NSString *s = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (s.length == 0) return nil;
+    if (![s containsString:@"://"]) {
+        s = [@"https://" stringByAppendingString:s];
     }
-    return nil;
+    return [NSURL URLWithString:s];
+}
+
+// Extracts direct public Firebase Storage projectfiles.zip URL from an Alight Motion share URL:
+//   https://alightcreative.com/am/share/u/<UID>/p/<PID>
+// -> https://firebasestorage.googleapis.com/v0/b/alight-creative.appspot.com/o/share%2Fu%2F<UID>%2Fp%2F<PID>%2Fprojectfiles.zip?alt=media
+static NSURL *AMFirebasePackageURLFromShareString(NSString *urlString) {
+    if (urlString.length == 0) return nil;
+    NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"/share/u/([^/?#&]+)/p/([^/?#&]+)"
+                                                                        options:NSRegularExpressionCaseInsensitive
+                                                                          error:nil];
+    NSTextCheckingResult *m = [rx firstMatchInString:urlString options:0 range:NSMakeRange(0, urlString.length)];
+    if (!m || m.numberOfRanges < 3) return nil;
+    NSString *uid = [urlString substringWithRange:[m rangeAtIndex:1]];
+    NSString *pid = [urlString substringWithRange:[m rangeAtIndex:2]];
+    NSString *fb = [NSString stringWithFormat:
+        @"https://firebasestorage.googleapis.com/v0/b/alight-creative.appspot.com/o/share%%2Fu%%2F%@%%2Fp%%2F%@%%2Fprojectfiles.zip?alt=media",
+        uid, pid];
+    return [NSURL URLWithString:fb];
 }
 
 static NSURL *AMProxyURLForTarget(NSString *targetURLString) {
@@ -368,91 +348,123 @@ static NSURL *AMProxyURLForTarget(NSString *targetURLString) {
     return [NSURL URLWithString:[@"https://am-proxy.zoronwisyt.workers.dev/?url=" stringByAppendingString:enc]];
 }
 
-static void AMFetchAndImportViaProxy(NSURL *origURL, NSInteger depth, void (^completion)(NSURL * _Nullable localFile, NSError * _Nullable err)) {
-    if (!origURL || depth > 2) {
-        completion(nil, [NSError errorWithDomain:@"AMLinkImport" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Could not resolve project file."}]);
+static void AMDownloadProjectFileDirect(NSURL *downloadURL, void (^completion)(NSURL * _Nullable localFile, NSError * _Nullable err)) {
+    if (!downloadURL) {
+        completion(nil, [NSError errorWithDomain:@"AMLinkImport" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Invalid download URL."}]);
         return;
     }
-    NSURL *proxyURL = AMProxyURLForTarget(origURL.absoluteString);
-    if (!proxyURL) {
-        completion(nil, [NSError errorWithDomain:@"AMLinkImport" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Invalid URL."}]);
-        return;
-    }
-
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:proxyURL cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:20.0];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:downloadURL cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:120.0];
     [req setValue:@"AlightMotion/6.2.60" forHTTPHeaderField:@"User-Agent"];
 
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable resp, NSError * _Nullable error) {
-        (void)resp;
-        if (error || data.length < 4) {
-            completion(nil, error ?: [NSError errorWithDomain:@"AMLinkImport" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Empty response from proxy."}]);
-            return;
-        }
-        const uint8_t *bytes = (const uint8_t *)data.bytes;
-        BOOL isZip = (bytes[0] == 'P' && bytes[1] == 'K' && bytes[2] == 0x03 && bytes[3] == 0x04);
-        NSString *prefix = [[NSString alloc] initWithData:[data subdataWithRange:NSMakeRange(0, MIN((NSUInteger)256, data.length))]
-                                                 encoding:NSUTF8StringEncoding];
-        BOOL isXML = (prefix && ([prefix containsString:@"<scene"] || [prefix containsString:@"<effect"] || [prefix containsString:@"<?xml"]));
-
-        if (isZip || isXML) {
-            NSString *ext = isZip ? @"amproj" : @"xml";
-            NSString *fname = [NSString stringWithFormat:@"AMImport_%lld.%@", (long long)[[NSDate date] timeIntervalSince1970], ext];
-            NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:fname];
-            NSError *werr = nil;
-            if ([data writeToFile:path options:NSDataWritingAtomic error:&werr]) {
-                completion([NSURL fileURLWithPath:path], nil);
-            } else {
-                completion(nil, werr);
+    NSURLSessionDownloadTask *task = [[NSURLSession sharedSession] downloadTaskWithRequest:req
+        completionHandler:^(NSURL * _Nullable location, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+            NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+            if (error || !location || (http && http.statusCode >= 400)) {
+                completion(nil, error ?: [NSError errorWithDomain:@"AMLinkImport" code:(http ? http.statusCode : 500)
+                                                         userInfo:@{NSLocalizedDescriptionKey: @"Download failed."}]);
+                return;
             }
+            // Peek first 4 bytes to verify ZIP (.amproj) or XML
+            NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:location.path];
+            NSData *head = [fh readDataOfLength:256];
+            [fh closeFile];
+            if (head.length < 4) {
+                completion(nil, [NSError errorWithDomain:@"AMLinkImport" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Empty file."}]);
+                return;
+            }
+            const uint8_t *b = (const uint8_t *)head.bytes;
+            BOOL isZip = (b[0] == 'P' && b[1] == 'K' && b[2] == 0x03 && b[3] == 0x04);
+            NSString *prefix = [[NSString alloc] initWithData:head encoding:NSUTF8StringEncoding];
+            BOOL isXML = (prefix && ([prefix containsString:@"<scene"] || [prefix containsString:@"<effect"] || [prefix containsString:@"<?xml"]));
+            if (!isZip && !isXML) {
+                completion(nil, [NSError errorWithDomain:@"AMLinkImport" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Not a valid .amproj or .xml file."}]);
+                return;
+            }
+            NSString *ext = isZip ? @"amproj" : @"xml";
+            NSString *dest = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                              [NSString stringWithFormat:@"AMImport_%lld.%@", (long long)[[NSDate date] timeIntervalSince1970], ext]];
+            [[NSFileManager defaultManager] removeItemAtPath:dest error:nil];
+            NSError *merr = nil;
+            if ([[NSFileManager defaultManager] moveItemAtURL:location toURL:[NSURL fileURLWithPath:dest] error:&merr]) {
+                completion([NSURL fileURLWithPath:dest], nil);
+            } else {
+                completion(nil, merr);
+            }
+        }];
+    [task resume];
+}
+
+static void AMResolveAndDirectDownload(NSURL *origURL, void (^completion)(NSURL * _Nullable localFile, NSError * _Nullable err)) {
+    // 1. Direct alightcreative.com/am/share/u/<uid>/p/<pid> link -> Firebase Storage projectfiles.zip (no auth!)
+    NSURL *fbDirect = AMFirebasePackageURLFromShareString(origURL.absoluteString);
+    if (fbDirect) {
+        AMDownloadProjectFileDirect(fbDirect, completion);
+        return;
+    }
+
+    // 2. Short link (alight.link) or direct .amproj/.xml -> resolve via Cloudflare proxy first
+    NSURL *proxyURL = AMProxyURLForTarget(origURL.absoluteString);
+    if (!proxyURL) {
+        completion(nil, [NSError errorWithDomain:@"AMLinkImport" code:4 userInfo:@{NSLocalizedDescriptionKey: @"Invalid URL."}]);
+        return;
+    }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:proxyURL cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:25.0];
+    [req setValue:@"AlightMotion/6.2.60" forHTTPHeaderField:@"User-Agent"];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable resp, NSError * _Nullable err) {
+        if (err || data.length < 4) {
+            completion(nil, err ?: [NSError errorWithDomain:@"AMLinkImport" code:5 userInfo:@{NSLocalizedDescriptionKey: @"Proxy failed."}]);
             return;
         }
-
-        // Otherwise inspect HTML/JSON response for embedded .amproj / Firebase Storage URL
+        // Check if proxy redirected to share/u/.../p/...
+        if (resp.URL) {
+            NSURL *fb = AMFirebasePackageURLFromShareString(resp.URL.absoluteString);
+            if (fb) { AMDownloadProjectFileDirect(fb, completion); return; }
+        }
+        const uint8_t *b = (const uint8_t *)data.bytes;
+        BOOL isZip = (b[0] == 'P' && b[1] == 'K' && b[2] == 0x03 && b[3] == 0x04);
         NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-        NSString *nested = AMExtractPackageURLFromText(body);
-        if (nested.length > 0 && ![nested isEqualToString:origURL.absoluteString]) {
-            NSURL *nextURL = [NSURL URLWithString:nested];
-            if (nextURL) {
-                AMFetchAndImportViaProxy(nextURL, depth + 1, completion);
+        if (isZip || (body && ([body containsString:@"<scene"] || [body containsString:@"<effect"]))) {
+            NSString *ext = isZip ? @"amproj" : @"xml";
+            NSString *dest = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                              [NSString stringWithFormat:@"AMImport_%lld.%@", (long long)[[NSDate date] timeIntervalSince1970], ext]];
+            if ([data writeToFile:dest atomically:YES]) {
+                completion([NSURL fileURLWithPath:dest], nil);
                 return;
             }
         }
-        completion(nil, [NSError errorWithDomain:@"AMLinkImport" code:4 userInfo:@{NSLocalizedDescriptionKey: @"No .amproj or .xml package found at link."}]);
+        // Look for share/u/<uid>/p/<pid> embedded inside HTML/redirect page
+        if (body) {
+            NSURL *fb = AMFirebasePackageURLFromShareString(body);
+            if (fb) { AMDownloadProjectFileDirect(fb, completion); return; }
+        }
+        completion(nil, [NSError errorWithDomain:@"AMLinkImport" code:6 userInfo:@{NSLocalizedDescriptionKey: @"Could not resolve project package."}]);
     }] resume];
 }
 
-static void AMHandleUserLinkFromVC(UIViewController *vc, NSURL *u) {
+static void AMHandleUserLinkFromVC(UIViewController *vc, NSURL *u, BOOL directBypass) {
     if (!u) return;
-    NSString *scheme = u.scheme.lowercaseString;
-    if ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]) {
-        // Download via Cloudflare proxy so no Alight Motion sign-in is required
-        UIAlertController *loading = [UIAlertController alertControllerWithTitle:@"Importing Link..."
-                                                                         message:@"Downloading project package via proxy..."
+    if (directBypass && ([u.scheme.lowercaseString isEqualToString:@"http"] || [u.scheme.lowercaseString isEqualToString:@"https"])) {
+        UIAlertController *loading = [UIAlertController alertControllerWithTitle:@"Downloading Project..."
+                                                                         message:@"Downloading project package directly (no sign-in required). Large projects may take a moment."
                                                                   preferredStyle:UIAlertControllerStyleAlert];
         [vc presentViewController:loading animated:YES completion:^{
-            AMFetchAndImportViaProxy(u, 0, ^(NSURL * _Nullable localFile, NSError * _Nullable err) {
+            AMResolveAndDirectDownload(u, ^(NSURL * _Nullable localFile, NSError * _Nullable err) {
                 (void)err;
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [loading dismissViewControllerAnimated:YES completion:^{
-                        if (localFile) {
-                            UIViewController *presenter = vc.presentingViewController;
-                            if (presenter) {
-                                [vc dismissViewControllerAnimated:YES completion:^{
-                                    AMOpenLocalFileInApp(localFile);
-                                }];
-                            } else {
+                        UIViewController *presenter = vc.presentingViewController;
+                        void (^finishBlock)(void) = ^{
+                            if (localFile) {
                                 AMOpenLocalFileInApp(localFile);
-                            }
-                        } else {
-                            // Fallback to native handler if proxy couldn't extract a direct package
-                            UIViewController *presenter = vc.presentingViewController;
-                            if (presenter) {
-                                [vc dismissViewControllerAnimated:YES completion:^{
-                                    AMDispatchAlightLink(u);
-                                }];
                             } else {
+                                // Fallback to patched native importer
                                 AMDispatchAlightLink(u);
                             }
+                        };
+                        if (presenter) {
+                            [vc dismissViewControllerAnimated:YES completion:finishBlock];
+                        } else {
+                            finishBlock();
                         }
                     }];
                 });
@@ -461,9 +473,7 @@ static void AMHandleUserLinkFromVC(UIViewController *vc, NSURL *u) {
     } else {
         UIViewController *presenter = vc.presentingViewController;
         if (presenter) {
-            [vc dismissViewControllerAnimated:YES completion:^{
-                AMDispatchAlightLink(u);
-            }];
+            [vc dismissViewControllerAnimated:YES completion:^{ AMDispatchAlightLink(u); }];
         } else {
             AMDispatchAlightLink(u);
         }
@@ -486,11 +496,11 @@ static void AMHandleUserLinkFromVC(UIViewController *vc, NSURL *u) {
                               [trimmedClip localizedCaseInsensitiveContainsString:@"alightmotion"] ||
                               [trimmedClip localizedCaseInsensitiveContainsString:@"alightcreative"]);
 
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Open Alight Motion Link"
-                                                                message:@"Paste an alight.link or project URL. Downloads via proxy without requiring sign-in."
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Open Alight Link"
+                                                                message:@"Paste an alightcreative.com or alight.link URL. Imports directly without sign-in."
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ac addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull tf) {
-        tf.placeholder = @"https://alight.link/...";
+        tf.placeholder = @"https://alightcreative.com/am/share/...";
         tf.keyboardType = UIKeyboardTypeURL;
         tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
         tf.autocorrectionType = UITextAutocorrectionTypeNo;
@@ -501,15 +511,15 @@ static void AMHandleUserLinkFromVC(UIViewController *vc, NSURL *u) {
     }];
 
     [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Paste Clipboard" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+    [ac addAction:[UIAlertAction actionWithTitle:@"Paste & Import" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
         (void)a;
         NSURL *u = AMNormalizeAlightLink([UIPasteboard generalPasteboard].string);
-        AMHandleUserLinkFromVC(vc, u);
+        AMHandleUserLinkFromVC(vc, u, YES);
     }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Open Link" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+    [ac addAction:[UIAlertAction actionWithTitle:@"Import Link" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
         (void)a;
         NSURL *u = AMNormalizeAlightLink(ac.textFields.firstObject.text);
-        AMHandleUserLinkFromVC(vc, u);
+        AMHandleUserLinkFromVC(vc, u, YES);
     }]];
 
     [vc presentViewController:ac animated:YES completion:nil];
@@ -532,8 +542,6 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     }
     if (!tv) return;
 
-    // Compact light-gray pill matching Alight Motion Settings rows (42pt tall), placed in tableFooterView
-    // or below existing tableHeaderView so the "Settings" title stays intact.
     CGFloat w = tv.bounds.size.width > 0 ? tv.bounds.size.width : 280.0;
     UIView *existingHdr = tv.tableHeaderView;
     CGFloat existingH = existingHdr ? existingHdr.frame.size.height : 0.0;
@@ -596,7 +604,7 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// Module 3: Custom XML Effects Storage & NSBundle Loader Hooks
+// Module 3: Custom XML Effects Storage, NSBundle Loader Hooks, & Custom Boxes
 // ============================================================================
 
 static NSString *AMCustomEffectsDir(void) {
@@ -639,21 +647,36 @@ static NSString *AMXmlEscapeAttr(NSString *s) {
     return r;
 }
 
-static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSString *slug, BOOL hasCustomThumb, NSError **outError) {
+// Prepares valid Alight Motion <effect> XML so VisualEffectParser always registers
+// it as its own standalone box inside category="other" (usable on any layer).
+static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSString *slug, NSError **outError) {
     NSString *trimmed = [rawXML stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) {
         if (outError) {
             *outError = [NSError errorWithDomain:@"AMCustomEffects" code:1
-                                        userInfo:@{NSLocalizedDescriptionKey: @"XML code is empty."}];
+                                        userInfo:@{NSLocalizedDescriptionKey: @"XML or GLSL code is empty."}];
         }
         return nil;
     }
 
+    // If user pasted raw GLSL fragment code (void main()) without <effect> wrapper, auto-wrap it!
     NSRange openStart = [trimmed rangeOfString:@"<effect" options:NSCaseInsensitiveSearch];
     if (openStart.location == NSNotFound) {
+        if ([trimmed containsString:@"void main"] || [trimmed containsString:@"gl_FragColor"]) {
+            NSString *wrapped = [NSString stringWithFormat:
+                @"<?xml version='1.0' encoding='UTF-8' ?>\n"
+                @"<effect id=\"com.alightcreative.effects.custom_%@\" compat=\"acScreenNorm-y\" name=\"%@\" desc=\"Custom Effect\" category=\"other\" tags=\"custom\" thumb=\"thumb/copy-bg.webp\">\n"
+                @"    <params>\n"
+                @"        <texture id=\"inputImg\" srcType=\"content\" />\n"
+                @"    </params>\n"
+                @"    <shader type=\"fragment\" precision=\"high\"><![CDATA[\n%@\n    ]]></shader>\n"
+                @"</effect>\n",
+                slug, AMXmlEscapeAttr(displayName), trimmed];
+            return wrapped;
+        }
         if (outError) {
             *outError = [NSError errorWithDomain:@"AMCustomEffects" code:2
-                                        userInfo:@{NSLocalizedDescriptionKey: @"Missing <effect ...> root tag in XML."}];
+                                        userInfo:@{NSLocalizedDescriptionKey: @"Paste a valid <effect>...</effect> XML or GLSL void main() shader."}];
         }
         return nil;
     }
@@ -671,6 +694,12 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
     NSRange tagRange = NSMakeRange(openStart.location, (openEnd.location - openStart.location) + 1);
     NSMutableString *openTag = [[trimmed substringWithRange:tagRange] mutableCopy];
 
+    void (^removeAttr)(NSString *) = ^(NSString *attrName) {
+        NSString *pattern = [NSString stringWithFormat:@"\\s*\\b%@\\s*=\\s*\"[^\"]*\"", attrName];
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:nil];
+        [rx replaceMatchesInString:openTag options:0 range:NSMakeRange(0, openTag.length) withTemplate:@""];
+    };
+
     void (^setAttr)(NSString *, NSString *) = ^(NSString *attrName, NSString *attrVal) {
         NSString *escaped = AMXmlEscapeAttr(attrVal);
         NSString *pattern = [NSString stringWithFormat:@"\\b%@\\s*=\\s*\"[^\"]*\"", attrName];
@@ -685,22 +714,21 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
         }
     };
 
-    NSRegularExpression *idRx = [NSRegularExpression regularExpressionWithPattern:@"\\bid\\s*=\\s*\"[^\"]+\"" options:0 error:nil];
-    if ([idRx rangeOfFirstMatchInString:openTag options:0 range:NSMakeRange(0, openTag.length)].location == NSNotFound) {
-        setAttr(@"id", [NSString stringWithFormat:@"com.custom.effects.%@", slug]);
-    }
+    // Strip flags that hide an effect from the picker grid
+    removeAttr(@"internal");
+    removeAttr(@"deprecated");
+    removeAttr(@"experimental");
 
+    // Always assign a unique com.alightcreative.effects.custom_<slug> ID so it gets its own box
+    // and never collides with a built-in effect
+    setAttr(@"id", [NSString stringWithFormat:@"com.alightcreative.effects.custom_%@", slug]);
     setAttr(@"category", @"other");
     setAttr(@"name", displayName);
-
-    if (hasCustomThumb) {
-        setAttr(@"thumb", [NSString stringWithFormat:@"thumb/custom_%@.webp", slug]);
-    } else {
-        NSRegularExpression *thumbRx = [NSRegularExpression regularExpressionWithPattern:@"\\bthumb\\s*=\\s*\"[^\"]+\"" options:0 error:nil];
-        if ([thumbRx rangeOfFirstMatchInString:openTag options:0 range:NSMakeRange(0, openTag.length)].location == NSNotFound) {
-            setAttr(@"thumb", @"thumb/copy-bg.webp");
-        }
-    }
+    setAttr(@"desc", @"Custom Effect");
+    setAttr(@"tags", @"custom");
+    // Use a guaranteed-valid built-in WebP thumb for Alight Motion's WebP loader;
+    // our cell willDisplayCell hook overlays any custom user PNG thumbnail cleanly!
+    setAttr(@"thumb", @"thumb/copy-bg.webp");
 
     NSMutableString *result = [trimmed mutableCopy];
     [result replaceCharactersInRange:tagRange withString:openTag];
@@ -710,8 +738,18 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
     return result;
 }
 
+static NSMutableDictionary<NSString *, NSString *> *AMLoadCustomThumbMap(void) {
+    NSString *mapPath = [AMCustomEffectsDir() stringByAppendingPathComponent:@"thumb_map.plist"];
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:mapPath];
+    return d ? [d mutableCopy] : [NSMutableDictionary dictionary];
+}
+
+static void AMSaveCustomThumbMap(NSDictionary<NSString *, NSString *> *map) {
+    NSString *mapPath = [AMCustomEffectsDir() stringByAppendingPathComponent:@"thumb_map.plist"];
+    [map writeToFile:mapPath atomically:YES];
+}
+
 static IMP gOrigURLsForResources = NULL;
-static IMP gOrigURLForResource = NULL;
 
 static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd, NSString *ext, NSString *subpath) {
     NSArray<NSURL *> *orig = nil;
@@ -727,8 +765,7 @@ static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd,
             NSMutableArray<NSURL *> *merged = orig ? [orig mutableCopy] : [NSMutableArray array];
             for (NSString *fn in files) {
                 if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
-                    NSURL *u = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:fn]];
-                    [merged addObject:u];
+                    [merged addObject:[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:fn]]];
                 }
             }
             return merged;
@@ -737,26 +774,61 @@ static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd,
     return orig;
 }
 
-static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString *ext, NSString *subpath) {
-    if (self == [NSBundle mainBundle] &&
-        name && [name hasPrefix:@"custom_"] &&
-        subpath && ([subpath isEqualToString:@"BuiltinThumb"] || [subpath isEqualToString:@"thumb"])) {
-        NSString *thumbsDir = AMCustomThumbsDir();
-        NSArray<NSString *> *candidates = @[
-            [thumbsDir stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"png"]],
-            [thumbsDir stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"webp"]],
-            [thumbsDir stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"jpg"]],
-        ];
-        for (NSString *p in candidates) {
-            if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
-                return [NSURL fileURLWithPath:p];
+// Overlay custom user PNG thumbnail onto the custom effect's box in EffectPickerCategoryVC
+static IMP gOrigEffectCatWillDisplayCell = NULL;
+
+static UILabel *AMFindFirstLabelInView(UIView *v) {
+    if ([v isKindOfClass:[UILabel class]]) {
+        UILabel *l = (UILabel *)v;
+        if (l.text.length > 0) return l;
+    }
+    for (UIView *sub in v.subviews) {
+        UILabel *found = AMFindFirstLabelInView(sub);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static UIImageView *AMFindLargestImageViewInView(UIView *v) {
+    UIImageView *best = nil;
+    CGFloat bestArea = 0;
+    if ([v isKindOfClass:[UIImageView class]]) {
+        best = (UIImageView *)v;
+        bestArea = v.bounds.size.width * v.bounds.size.height;
+    }
+    for (UIView *sub in v.subviews) {
+        UIImageView *cand = AMFindLargestImageViewInView(sub);
+        if (cand) {
+            CGFloat area = cand.bounds.size.width * cand.bounds.size.height;
+            if (!best || area >= bestArea) {
+                best = cand;
+                bestArea = area;
             }
         }
     }
-    if (gOrigURLForResource) {
-        return ((NSURL *(*)(id, SEL, NSString *, NSString *, NSString *))gOrigURLForResource)(self, _cmd, name, ext, subpath);
+    return best;
+}
+
+static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView *cv, UICollectionViewCell *cell, NSIndexPath *indexPath) {
+    if (gOrigEffectCatWillDisplayCell) {
+        ((void (*)(id, SEL, UICollectionView *, UICollectionViewCell *, NSIndexPath *))gOrigEffectCatWillDisplayCell)(self, _cmd, cv, cell, indexPath);
     }
-    return nil;
+    UILabel *lbl = AMFindFirstLabelInView(cell.contentView);
+    if (!lbl || lbl.text.length == 0) return;
+    NSDictionary<NSString *, NSString *> *map = AMLoadCustomThumbMap();
+    NSString *thumbFile = map[lbl.text];
+    if (thumbFile.length > 0) {
+        NSString *p = [AMCustomThumbsDir() stringByAppendingPathComponent:thumbFile];
+        UIImage *img = [UIImage imageWithContentsOfFile:p];
+        if (img) {
+            UIImageView *iv = AMFindLargestImageViewInView(cell.contentView);
+            if (iv) {
+                iv.image = img;
+                iv.contentMode = UIViewContentModeScaleAspectFill;
+                iv.clipsToBounds = YES;
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -813,13 +885,13 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
     [closeBtn addTarget:self action:@selector(onClose) forControlEvents:UIControlEventTouchUpInside];
 
     UILabel *hdrLabel = [[UILabel alloc] init];
-    hdrLabel.text = @"Import XML Effect";
+    hdrLabel.text = @"Create Custom Effect";
     hdrLabel.textAlignment = NSTextAlignmentCenter;
     hdrLabel.textColor = [UIColor whiteColor];
     hdrLabel.font = AMThemeFont(17.0, UIFontWeightBold);
 
     UIButton *importBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [importBtn setTitle:@"Import" forState:UIControlStateNormal];
+    [importBtn setTitle:@"Create" forState:UIControlStateNormal];
     [importBtn setTitleColor:AMAccentGreenColor() forState:UIControlStateNormal];
     importBtn.titleLabel.font = AMThemeFont(15.0, UIFontWeightBold);
     [importBtn addTarget:self action:@selector(onImport) forControlEvents:UIControlEventTouchUpInside];
@@ -839,7 +911,7 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
     self.nameField.layer.cornerRadius = 10.0;
     self.nameField.layer.borderWidth = 1.0;
     self.nameField.layer.borderColor = AMBorderColor().CGColor;
-    self.nameField.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"e.g. Custom CRT Glow"
+    self.nameField.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"e.g. Custom Glow"
                                                                            attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.55 alpha:1.0]}];
     UIView *pad = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 12, 42)];
     self.nameField.leftView = pad;
@@ -874,13 +946,12 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
 
     UIStackView *xmlHdr = [[UIStackView alloc] init];
     xmlHdr.axis = UILayoutConstraintAxisHorizontal;
-    xmlHdr.spacing = 8.0;
+    xmlHdr.spacing = 6.0;
     xmlHdr.alignment = UIStackViewAlignmentCenter;
-    [xmlHdr addArrangedSubview:[self makeSectionLabel:@"XML EFFECT CODE"]];
-    UIButton *pickFileBtn = [self makeCompactPill:@"Open .xml File" action:@selector(onPickXMLFile)];
-    UIButton *pasteBtn = [self makeCompactPill:@"Paste" action:@selector(onPasteXML)];
-    [xmlHdr addArrangedSubview:pickFileBtn];
-    [xmlHdr addArrangedSubview:pasteBtn];
+    [xmlHdr addArrangedSubview:[self makeSectionLabel:@"XML / GLSL CODE"]];
+    [xmlHdr addArrangedSubview:[self makeCompactPill:@"Sample" action:@selector(onInsertSample)]];
+    [xmlHdr addArrangedSubview:[self makeCompactPill:@"Open File" action:@selector(onPickXMLFile)]];
+    [xmlHdr addArrangedSubview:[self makeCompactPill:@"Paste" action:@selector(onPasteXML)]];
     [stack addArrangedSubview:xmlHdr];
 
     self.xmlTextView = [[UITextView alloc] init];
@@ -894,7 +965,7 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
     self.xmlTextView.autocorrectionType = UITextAutocorrectionTypeNo;
     self.xmlTextView.smartQuotesType = UITextSmartQuotesTypeNo;
     self.xmlTextView.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
-    [self.xmlTextView.heightAnchor constraintEqualToConstant:210.0].active = YES;
+    [self.xmlTextView.heightAnchor constraintEqualToConstant:200.0].active = YES;
     [stack addArrangedSubview:self.xmlTextView];
 
     [stack addArrangedSubview:[self makeSectionLabel:@"INSTALLED CUSTOM EFFECTS"]];
@@ -930,7 +1001,7 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
 - (UIButton *)makeCompactPill:(NSString *)title action:(SEL)sel {
     UIButton *b = [self makeActionButton:title action:sel];
     b.titleLabel.font = AMThemeFont(11.0, UIFontWeightBold);
-    b.contentEdgeInsets = UIEdgeInsetsMake(5, 9, 5, 9);
+    b.contentEdgeInsets = UIEdgeInsetsMake(5, 8, 5, 8);
     return b;
 }
 
@@ -981,7 +1052,7 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
     }
     if (shown == 0) {
         UILabel *empty = [[UILabel alloc] init];
-        empty.text = @"No custom XML effects imported yet.";
+        empty.text = @"No custom XML effects created yet.";
         empty.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
         empty.font = AMThemeFont(13.0, UIFontWeightRegular);
         [self.installedListStack addArrangedSubview:empty];
@@ -992,11 +1063,30 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
+- (void)onInsertSample {
+    if (self.nameField.text.length == 0) {
+        self.nameField.text = @"Custom Invert";
+    }
+    self.xmlTextView.text =
+        @"<?xml version='1.0' encoding='UTF-8' ?>\n"
+        @"<effect id=\"com.alightcreative.effects.custom_invert\" compat=\"acScreenNorm-y\" name=\"Custom Invert\" desc=\"Inverts layer colors\" category=\"other\" tags=\"custom\" thumb=\"thumb/copy-bg.webp\">\n"
+        @"    <params>\n"
+        @"        <texture id=\"inputImg\" srcType=\"content\" />\n"
+        @"        <spinner id=\"strength\" default=\"1.0\" min=\"0.0\" max=\"1.0\" step=\"0.01\" label=\"Strength\" type=\"percent\" />\n"
+        @"    </params>\n"
+        @"    <shader type=\"fragment\" precision=\"high\"><![CDATA[\n"
+        @"        void main() {\n"
+        @"            vec4 c = texture2DCv(inputImg.texture, acScreenNorm);\n"
+        @"            vec3 inv = vec3(1.0) - c.rgb;\n"
+        @"            gl_FragColor = vec4(mix(c.rgb, inv, strength), c.a);\n"
+        @"        }\n"
+        @"    ]]></shader>\n"
+        @"</effect>\n";
+}
+
 - (void)onPasteXML {
     NSString *clip = [UIPasteboard generalPasteboard].string;
-    if (clip.length > 0) {
-        self.xmlTextView.text = clip;
-    }
+    if (clip.length > 0) self.xmlTextView.text = clip;
 }
 
 - (void)onPickXMLFile {
@@ -1083,9 +1173,9 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
     }
     NSString *slug = AMSanitizeSlug(name);
     NSError *err = nil;
-    NSString *prepared = AMPrepareEffectXML(self.xmlTextView.text, name, slug, (self.selectedThumb != nil), &err);
+    NSString *prepared = AMPrepareEffectXML(self.xmlTextView.text, name, slug, &err);
     if (!prepared) {
-        [self showAlertTitle:@"Invalid XML" message:(err.localizedDescription ?: @"Could not parse XML.")];
+        [self showAlertTitle:@"Invalid Effect Code" message:(err.localizedDescription ?: @"Could not parse XML/GLSL.")];
         return;
     }
 
@@ -1098,18 +1188,25 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
     if (self.selectedThumb) {
         NSData *png = UIImagePNGRepresentation(self.selectedThumb);
         if (png) {
-            NSString *thumbPath = [AMCustomThumbsDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"custom_%@.png", slug]];
-            [png writeToFile:thumbPath atomically:YES];
+            NSString *thumbFn = [NSString stringWithFormat:@"custom_%@.png", slug];
+            [png writeToFile:[AMCustomThumbsDir() stringByAppendingPathComponent:thumbFn] atomically:YES];
+            NSMutableDictionary *map = AMLoadCustomThumbMap();
+            map[name] = thumbFn;
+            AMSaveCustomThumbMap(map);
         }
     }
 
     [self reloadInstalledList];
-    UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Effect Imported"
-                                                                  message:[NSString stringWithFormat:@"Saved '%@' into Other. Relaunch Alight Motion for the new effect to appear in the Other grid.", name]
+    UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Custom Effect Created"
+                                                                  message:[NSString stringWithFormat:@"'%@' is saved. Reopen Alight Motion so its own effect box loads in Effects > Other, then tap it to apply to any layer.", name]
                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [done addAction:[UIAlertAction actionWithTitle:@"Done" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+    [done addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:^(__kindof UIAlertAction * _Nonnull a) {
         (void)a;
         [self dismissViewControllerAnimated:YES completion:nil];
+    }]];
+    [done addAction:[UIAlertAction actionWithTitle:@"Close App Now" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+        (void)a;
+        exit(0);
     }]];
     [self presentViewController:done animated:YES completion:nil];
 }
@@ -1175,7 +1272,7 @@ static void AMHook_effectCategoryViewWillAppear(id self, SEL _cmd, BOOL animated
 
         UIButton *plusBtn = [UIButton buttonWithType:UIButtonTypeSystem];
         plusBtn.translatesAutoresizingMaskIntoConstraints = NO;
-        plusBtn.accessibilityLabel = @"Import Custom XML Effect";
+        plusBtn.accessibilityLabel = @"Create Custom XML Effect";
         if (@available(iOS 13.0, *)) {
             UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:18.0 weight:UIImageSymbolWeightMedium];
             [plusBtn setImage:[UIImage systemImageNamed:@"plus" withConfiguration:cfg] forState:UIControlStateNormal];
@@ -1233,7 +1330,6 @@ static void AlightMotionModsInit(void) {
         gPreviewDivisor = saved;
     }
 
-    // Module 1: Preview Quality Engine + Immediate AVPlayer Frame Redraw + Flat White Ladder Button
     AMSwizzleMethod(@"AVPlayer",
                     @"replaceCurrentItemWithPlayerItem:",
                     (IMP)AMHook_replaceCurrentItem,
@@ -1254,25 +1350,23 @@ static void AlightMotionModsInit(void) {
                     (IMP)AMHook_previewControlBarViewDidLoad,
                     &gOrigPreviewControlBarViewDidLoad);
 
-    // Module 2: Open Alight Motion Link inside SettingsVC
     AMSwizzleMethod(@"_TtC12AlightMotion10SettingsVC",
                     @"viewDidLoad",
                     (IMP)AMHook_settingsVCViewDidLoad,
                     &gOrigSettingsVCViewDidLoad);
 
-    // Module 3: Custom XML Effect Importer (NSBundle hooks + '+' in Other category)
     AMSwizzleMethod(@"NSBundle",
                     @"URLsForResourcesWithExtension:subdirectory:",
                     (IMP)AMHook_URLsForResourcesWithExtension,
                     &gOrigURLsForResources);
 
-    AMSwizzleMethod(@"NSBundle",
-                    @"URLForResource:withExtension:subdirectory:",
-                    (IMP)AMHook_URLForResource,
-                    &gOrigURLForResource);
-
     AMSwizzleMethod(@"_TtC12AlightMotion22EffectPickerCategoryVC",
                     @"viewWillAppear:",
                     (IMP)AMHook_effectCategoryViewWillAppear,
                     &gOrigEffectCatViewWillAppear);
+
+    AMSwizzleMethod(@"_TtC12AlightMotion22EffectPickerCategoryVC",
+                    @"collectionView:willDisplayCell:forItemAtIndexPath:",
+                    (IMP)AMHook_effectCatWillDisplayCell,
+                    &gOrigEffectCatWillDisplayCell);
 }
