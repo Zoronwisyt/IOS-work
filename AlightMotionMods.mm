@@ -58,21 +58,12 @@ static UIColor *AMAccentGreenColor(void) {
 }
 
 static UIColor *AMSettingsPillColor(void) {
-    // Adaptive pill color matching Leave Feedback / Privacy Settings / About rows
-    return [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull tc) {
-        if (tc.userInterfaceStyle == UIUserInterfaceStyleDark) {
-            return [UIColor colorWithRed:0.176 green:0.184 blue:0.247 alpha:1.0];
-        }
-        return [UIColor colorWithRed:0.918 green:0.922 blue:0.933 alpha:1.0]; // #EAEBF0
-    }];
+    // Matches Alight Motion's light Settings drawer pills (#EAEBF0)
+    return [UIColor colorWithRed:0.918 green:0.922 blue:0.933 alpha:1.0];
 }
 
 static UIColor *AMSettingsTextColor(void) {
-    return [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull tc) {
-        return (tc.userInterfaceStyle == UIUserInterfaceStyleDark)
-            ? [UIColor whiteColor]
-            : [UIColor colorWithRed:0.09 green:0.10 blue:0.14 alpha:1.0];
-    }];
+    return [UIColor colorWithRed:0.09 green:0.10 blue:0.14 alpha:1.0];
 }
 
 static UIFont *AMThemeFont(CGFloat size, UIFontWeight weight) {
@@ -338,6 +329,147 @@ static NSURL *AMNormalizeAlightLink(NSString *raw) {
     return [NSURL URLWithString:s];
 }
 
+static void AMOpenLocalFileInApp(NSURL *fileURL) {
+    if (!fileURL) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIApplication *app = [UIApplication sharedApplication];
+        id<UIApplicationDelegate> del = app.delegate;
+        if (del && [del respondsToSelector:@selector(application:openURL:options:)]) {
+            [del application:app openURL:fileURL options:@{}];
+        }
+    });
+}
+
+static NSString *AMExtractPackageURLFromText(NSString *text) {
+    if (text.length == 0) return nil;
+    NSArray<NSString *> *patterns = @[
+        @"https://firebasestorage\\.googleapis\\.com/[^\"'\\s<>]+",
+        @"https://storage\\.googleapis\\.com/[^\"'\\s<>]+",
+        @"https://[^\"'\\s<>]+\\.amproj(?:\\?[^\"'\\s<>]*)?",
+        @"https://[^\"'\\s<>]+\\.xml(?:\\?[^\"'\\s<>]*)?",
+    ];
+    for (NSString *pat in patterns) {
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:pat options:NSRegularExpressionCaseInsensitive error:nil];
+        NSTextCheckingResult *m = [rx firstMatchInString:text options:0 range:NSMakeRange(0, text.length)];
+        if (m && m.range.location != NSNotFound) {
+            NSString *found = [text substringWithRange:m.range];
+            found = [found stringByReplacingOccurrencesOfString:@"\\u0026" withString:@"&"];
+            found = [found stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+            return found;
+        }
+    }
+    return nil;
+}
+
+static NSURL *AMProxyURLForTarget(NSString *targetURLString) {
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"];
+    NSString *enc = [targetURLString stringByAddingPercentEncodingWithAllowedCharacters:allowed];
+    if (!enc) return nil;
+    return [NSURL URLWithString:[@"https://am-proxy.zoronwisyt.workers.dev/?url=" stringByAppendingString:enc]];
+}
+
+static void AMFetchAndImportViaProxy(NSURL *origURL, NSInteger depth, void (^completion)(NSURL * _Nullable localFile, NSError * _Nullable err)) {
+    if (!origURL || depth > 2) {
+        completion(nil, [NSError errorWithDomain:@"AMLinkImport" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Could not resolve project file."}]);
+        return;
+    }
+    NSURL *proxyURL = AMProxyURLForTarget(origURL.absoluteString);
+    if (!proxyURL) {
+        completion(nil, [NSError errorWithDomain:@"AMLinkImport" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Invalid URL."}]);
+        return;
+    }
+
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:proxyURL cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:20.0];
+    [req setValue:@"AlightMotion/6.2.60" forHTTPHeaderField:@"User-Agent"];
+
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable resp, NSError * _Nullable error) {
+        (void)resp;
+        if (error || data.length < 4) {
+            completion(nil, error ?: [NSError errorWithDomain:@"AMLinkImport" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Empty response from proxy."}]);
+            return;
+        }
+        const uint8_t *bytes = (const uint8_t *)data.bytes;
+        BOOL isZip = (bytes[0] == 'P' && bytes[1] == 'K' && bytes[2] == 0x03 && bytes[3] == 0x04);
+        NSString *prefix = [[NSString alloc] initWithData:[data subdataWithRange:NSMakeRange(0, MIN((NSUInteger)256, data.length))]
+                                                 encoding:NSUTF8StringEncoding];
+        BOOL isXML = (prefix && ([prefix containsString:@"<scene"] || [prefix containsString:@"<effect"] || [prefix containsString:@"<?xml"]));
+
+        if (isZip || isXML) {
+            NSString *ext = isZip ? @"amproj" : @"xml";
+            NSString *fname = [NSString stringWithFormat:@"AMImport_%lld.%@", (long long)[[NSDate date] timeIntervalSince1970], ext];
+            NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:fname];
+            NSError *werr = nil;
+            if ([data writeToFile:path options:NSDataWritingAtomic error:&werr]) {
+                completion([NSURL fileURLWithPath:path], nil);
+            } else {
+                completion(nil, werr);
+            }
+            return;
+        }
+
+        // Otherwise inspect HTML/JSON response for embedded .amproj / Firebase Storage URL
+        NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        NSString *nested = AMExtractPackageURLFromText(body);
+        if (nested.length > 0 && ![nested isEqualToString:origURL.absoluteString]) {
+            NSURL *nextURL = [NSURL URLWithString:nested];
+            if (nextURL) {
+                AMFetchAndImportViaProxy(nextURL, depth + 1, completion);
+                return;
+            }
+        }
+        completion(nil, [NSError errorWithDomain:@"AMLinkImport" code:4 userInfo:@{NSLocalizedDescriptionKey: @"No .amproj or .xml package found at link."}]);
+    }] resume];
+}
+
+static void AMHandleUserLinkFromVC(UIViewController *vc, NSURL *u) {
+    if (!u) return;
+    NSString *scheme = u.scheme.lowercaseString;
+    if ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]) {
+        // Download via Cloudflare proxy so no Alight Motion sign-in is required
+        UIAlertController *loading = [UIAlertController alertControllerWithTitle:@"Importing Link..."
+                                                                         message:@"Downloading project package via proxy..."
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+        [vc presentViewController:loading animated:YES completion:^{
+            AMFetchAndImportViaProxy(u, 0, ^(NSURL * _Nullable localFile, NSError * _Nullable err) {
+                (void)err;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [loading dismissViewControllerAnimated:YES completion:^{
+                        if (localFile) {
+                            UIViewController *presenter = vc.presentingViewController;
+                            if (presenter) {
+                                [vc dismissViewControllerAnimated:YES completion:^{
+                                    AMOpenLocalFileInApp(localFile);
+                                }];
+                            } else {
+                                AMOpenLocalFileInApp(localFile);
+                            }
+                        } else {
+                            // Fallback to native handler if proxy couldn't extract a direct package
+                            UIViewController *presenter = vc.presentingViewController;
+                            if (presenter) {
+                                [vc dismissViewControllerAnimated:YES completion:^{
+                                    AMDispatchAlightLink(u);
+                                }];
+                            } else {
+                                AMDispatchAlightLink(u);
+                            }
+                        }
+                    }];
+                });
+            });
+        }];
+    } else {
+        UIViewController *presenter = vc.presentingViewController;
+        if (presenter) {
+            [vc dismissViewControllerAnimated:YES completion:^{
+                AMDispatchAlightLink(u);
+            }];
+        } else {
+            AMDispatchAlightLink(u);
+        }
+    }
+}
+
 @interface AMSettingsLinkHandler : NSObject
 + (void)onTapOpenLink:(UIButton *)btn;
 @end
@@ -355,7 +487,7 @@ static NSURL *AMNormalizeAlightLink(NSString *raw) {
                               [trimmedClip localizedCaseInsensitiveContainsString:@"alightcreative"]);
 
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Open Alight Motion Link"
-                                                                message:@"Paste an alight.link or alightmotion:// project/preset URL to open it directly inside this app."
+                                                                message:@"Paste an alight.link or project URL. Downloads via proxy without requiring sign-in."
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ac addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull tf) {
         tf.placeholder = @"https://alight.link/...";
@@ -372,29 +504,12 @@ static NSURL *AMNormalizeAlightLink(NSString *raw) {
     [ac addAction:[UIAlertAction actionWithTitle:@"Paste Clipboard" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
         (void)a;
         NSURL *u = AMNormalizeAlightLink([UIPasteboard generalPasteboard].string);
-        if (!u) return;
-        UIViewController *presenter = vc.presentingViewController;
-        if (presenter) {
-            [vc dismissViewControllerAnimated:YES completion:^{
-                AMDispatchAlightLink(u);
-            }];
-        } else {
-            AMDispatchAlightLink(u);
-        }
+        AMHandleUserLinkFromVC(vc, u);
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"Open Link" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
         (void)a;
-        NSString *entered = ac.textFields.firstObject.text;
-        NSURL *u = AMNormalizeAlightLink(entered);
-        if (!u) return;
-        UIViewController *presenter = vc.presentingViewController;
-        if (presenter) {
-            [vc dismissViewControllerAnimated:YES completion:^{
-                AMDispatchAlightLink(u);
-            }];
-        } else {
-            AMDispatchAlightLink(u);
-        }
+        NSURL *u = AMNormalizeAlightLink(ac.textFields.firstObject.text);
+        AMHandleUserLinkFromVC(vc, u);
     }]];
 
     [vc presentViewController:ac animated:YES completion:nil];
@@ -417,46 +532,58 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     }
     if (!tv) return;
 
-    // Native Settings-style pill card placed right at the top of Settings table
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, tv.bounds.size.width > 0 ? tv.bounds.size.width : 280, 62)];
+    // Compact light-gray pill matching Alight Motion Settings rows (42pt tall), placed in tableFooterView
+    // or below existing tableHeaderView so the "Settings" title stays intact.
+    CGFloat w = tv.bounds.size.width > 0 ? tv.bounds.size.width : 280.0;
+    UIView *existingHdr = tv.tableHeaderView;
+    CGFloat existingH = existingHdr ? existingHdr.frame.size.height : 0.0;
+    CGFloat pillContainerH = 50.0;
+
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, existingH + pillContainerH)];
     header.backgroundColor = [UIColor clearColor];
+
+    if (existingHdr) {
+        existingHdr.frame = CGRectMake(0, 0, w, existingH);
+        existingHdr.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+        [header addSubview:existingHdr];
+    }
 
     UIButton *pill = [UIButton buttonWithType:UIButtonTypeSystem];
     pill.translatesAutoresizingMaskIntoConstraints = NO;
     pill.backgroundColor = AMSettingsPillColor();
-    pill.layer.cornerRadius = 16.0;
+    pill.layer.cornerRadius = 14.0;
     pill.clipsToBounds = YES;
     [header addSubview:pill];
 
     UILabel *lbl = [[UILabel alloc] init];
     lbl.translatesAutoresizingMaskIntoConstraints = NO;
     lbl.text = @"Open Alight Link";
-    lbl.font = AMThemeFont(15.0, UIFontWeightMedium);
+    lbl.font = AMThemeFont(14.0, UIFontWeightMedium);
     lbl.textColor = AMSettingsTextColor();
     lbl.userInteractionEnabled = NO;
     [pill addSubview:lbl];
 
-    UIImageView *chev = [[UIImageView alloc] init];
-    chev.translatesAutoresizingMaskIntoConstraints = NO;
-    chev.userInteractionEnabled = NO;
+    UIImageView *icon = [[UIImageView alloc] init];
+    icon.translatesAutoresizingMaskIntoConstraints = NO;
+    icon.userInteractionEnabled = NO;
     if (@available(iOS 13.0, *)) {
-        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.0 weight:UIImageSymbolWeightSemibold];
-        chev.image = [UIImage systemImageNamed:@"link" withConfiguration:cfg];
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:13.0 weight:UIImageSymbolWeightMedium];
+        icon.image = [UIImage systemImageNamed:@"link" withConfiguration:cfg];
     }
-    chev.tintColor = AMSettingsTextColor();
-    [pill addSubview:chev];
+    icon.tintColor = AMSettingsTextColor();
+    [pill addSubview:icon];
 
     [NSLayoutConstraint activateConstraints:@[
         [pill.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16.0],
         [pill.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16.0],
-        [pill.topAnchor constraintEqualToAnchor:header.topAnchor constant:8.0],
-        [pill.bottomAnchor constraintEqualToAnchor:header.bottomAnchor constant:-6.0],
+        [pill.topAnchor constraintEqualToAnchor:header.topAnchor constant:existingH + 4.0],
+        [pill.heightAnchor constraintEqualToConstant:42.0],
 
-        [lbl.leadingAnchor constraintEqualToAnchor:pill.leadingAnchor constant:18.0],
+        [lbl.leadingAnchor constraintEqualToAnchor:pill.leadingAnchor constant:16.0],
         [lbl.centerYAnchor constraintEqualToAnchor:pill.centerYAnchor],
 
-        [chev.trailingAnchor constraintEqualToAnchor:pill.trailingAnchor constant:-16.0],
-        [chev.centerYAnchor constraintEqualToAnchor:pill.centerYAnchor],
+        [icon.trailingAnchor constraintEqualToAnchor:pill.trailingAnchor constant:-15.0],
+        [icon.centerYAnchor constraintEqualToAnchor:pill.centerYAnchor],
     ]];
 
     objc_setAssociatedObject(pill, kAMSettingsLinkBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
