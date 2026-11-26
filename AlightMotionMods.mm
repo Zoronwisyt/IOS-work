@@ -2574,6 +2574,11 @@ static void AMHook_presentViewController(id self, SEL _cmd, UIViewController *vc
 
 static const void *kAMSpeedGraphBtnAssocKey = &kAMSpeedGraphBtnAssocKey;
 static const void *kAMSpeedGraphPanelAssocKey = &kAMSpeedGraphPanelAssocKey;
+static const void *kAMSpeedKfBarAssocKey = &kAMSpeedKfBarAssocKey;
+static const void *kAMSpeedKfBtnAssocKey = &kAMSpeedKfBtnAssocKey;
+static const void *kAMSpeedKfPrevBtnAssocKey = &kAMSpeedKfPrevBtnAssocKey;
+static const void *kAMSpeedKfNextBtnAssocKey = &kAMSpeedKfNextBtnAssocKey;
+static const void *kAMSpeedKfCountLblAssocKey = &kAMSpeedKfCountLblAssocKey;
 
 typedef struct {
     CGFloat x1;
@@ -2732,6 +2737,86 @@ static BOOL AMLoadSpeedGraphForKey(NSString *key, AMSpeedBezierCurve *outCurve, 
         *outPreset = [entry[@"preset"] isKindOfClass:[NSString class]] ? entry[@"preset"] : @"Cubic Bezier Easing";
     }
     return YES;
+}
+
+// ============================================================================
+// Speed Keyframes Model & Persistence
+// ============================================================================
+
+static NSString *AMSpeedKeyframesFilePath(void) {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    return [docs stringByAppendingPathComponent:@"AMSpeedKeyframes.json"];
+}
+
+static NSMutableDictionary *AMLoadSpeedKeyframesRoot(void) {
+    NSData *data = [NSData dataWithContentsOfFile:AMSpeedKeyframesFilePath()];
+    if (!data) return [NSMutableDictionary dictionary];
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+    return [obj isKindOfClass:[NSMutableDictionary class]] ? obj : [NSMutableDictionary dictionary];
+}
+
+static NSMutableArray<NSDictionary *> *AMGetSpeedKeyframesForKey(NSString *key) {
+    if (!key.length) return [NSMutableArray array];
+    NSDictionary *root = AMLoadSpeedKeyframesRoot();
+    NSArray *arr = [root[key] isKindOfClass:[NSArray class]] ? root[key] : nil;
+    if (!arr) return [NSMutableArray array];
+    NSMutableArray *sorted = [arr mutableCopy];
+    [sorted sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        double ta = [a[@"t"] doubleValue];
+        double tb = [b[@"t"] doubleValue];
+        if (ta < tb) return NSOrderedAscending;
+        if (ta > tb) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    return sorted;
+}
+
+static void AMSaveSpeedKeyframesForKey(NSString *key, NSArray<NSDictionary *> *kfs) {
+    if (!key.length) return;
+    NSMutableDictionary *root = AMLoadSpeedKeyframesRoot();
+    if (kfs.count == 0) {
+        [root removeObjectForKey:key];
+    } else {
+        root[key] = kfs;
+    }
+    NSData *json = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
+    if (json) [json writeToFile:AMSpeedKeyframesFilePath() atomically:YES];
+}
+
+static double AMCurrentPlayheadSeconds(void) {
+    AVPlayer *player = gActivePreviewPlayer;
+    if (!player) return 0.0;
+    CMTime ct = player.currentTime;
+    if (CMTIME_IS_INVALID(ct) || CMTIME_IS_INDEFINITE(ct)) return 0.0;
+    double sec = CMTimeGetSeconds(ct);
+    return (isfinite(sec) && sec >= 0.0) ? sec : 0.0;
+}
+
+static double AMReadCurrentSpeedFromVC(UIViewController *speedVC) {
+    UILabel *lbl = (UILabel *)AMCallObjCGetter(speedVC, @"speedValueLabel");
+    if ([lbl isKindOfClass:[UILabel class]] && lbl.text.length > 0) {
+        double val = [lbl.text doubleValue];
+        if (isfinite(val) && val >= 0.05 && val <= 10.0) return val;
+    }
+    return 1.0;
+}
+
+static NSString *AMSpeedLayerKeyForVC(UIViewController *speedVC) {
+    void *holderPtr = AMGetRawIvarPtr(speedVC, "holder");
+    return [NSString stringWithFormat:@"speed_%p", holderPtr];
+}
+
+static NSInteger AMFindKeyframeIndexNearTime(NSArray<NSDictionary *> *kfs, double tSec, double tol) {
+    NSInteger bestIdx = NSNotFound;
+    double bestDist = tol;
+    for (NSInteger i = 0; i < (NSInteger)kfs.count; i++) {
+        double dt = fabs([kfs[i][@"t"] doubleValue] - tSec);
+        if (dt <= bestDist) {
+            bestDist = dt;
+            bestIdx = i;
+        }
+    }
+    return bestIdx;
 }
 
 static CGFloat AMEvalCubic1D(CGFloat t, CGFloat p1, CGFloat p2) {
@@ -3350,9 +3435,127 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
 
 @interface AMSpeedGraphButtonHelper : NSObject
 + (void)openGraphForSpeedVC:(UIViewController *)speedVC;
++ (void)refreshKeyframeUIForSpeedVC:(UIViewController *)speedVC;
++ (void)toggleKeyframeForSpeedVC:(UIViewController *)speedVC;
++ (void)jumpKeyframeForSpeedVC:(UIViewController *)speedVC direction:(NSInteger)dir;
 @end
 
 @implementation AMSpeedGraphButtonHelper
+
++ (void)refreshKeyframeUIForSpeedVC:(UIViewController *)speedVC {
+    if (!speedVC) return;
+    UIButton *kfBtn = objc_getAssociatedObject(speedVC, kAMSpeedKfBtnAssocKey);
+    UILabel *countLbl = objc_getAssociatedObject(speedVC, kAMSpeedKfCountLblAssocKey);
+    UIButton *prevBtn = objc_getAssociatedObject(speedVC, kAMSpeedKfPrevBtnAssocKey);
+    UIButton *nextBtn = objc_getAssociatedObject(speedVC, kAMSpeedKfNextBtnAssocKey);
+    if (!kfBtn) return;
+
+    NSString *key = AMSpeedLayerKeyForVC(speedVC);
+    NSArray<NSDictionary *> *kfs = AMGetSpeedKeyframesForKey(key);
+    double now = AMCurrentPlayheadSeconds();
+    BOOL onKf = (AMFindKeyframeIndexNearTime(kfs, now, 0.03) != NSNotFound);
+
+    UIImage *kfIcon = [UIImage imageNamed:(onKf ? @"ic_keyframe_sign_select" : @"ic_keyframe_sign")]
+                   ?: [UIImage imageNamed:@"ic_keyframe"]
+                   ?: [UIImage systemImageNamed:(onKf ? @"diamond.fill" : @"diamond")];
+    if (kfIcon) {
+        [kfBtn setImage:[kfIcon imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+    }
+    kfBtn.tintColor = onKf ? AMAccentGreenColor() : [UIColor whiteColor];
+
+    if (countLbl) {
+        countLbl.text = kfs.count > 0 ? [NSString stringWithFormat:@"%lu", (unsigned long)kfs.count] : @"";
+        countLbl.hidden = (kfs.count == 0);
+    }
+    BOOL hasNav = (kfs.count > 0);
+    if (prevBtn) prevBtn.alpha = hasNav ? 0.9 : 0.35;
+    if (nextBtn) nextBtn.alpha = hasNav ? 0.9 : 0.35;
+}
+
++ (void)toggleKeyframeForSpeedVC:(UIViewController *)speedVC {
+    if (!speedVC) return;
+    NSString *key = AMSpeedLayerKeyForVC(speedVC);
+    NSMutableArray<NSDictionary *> *kfs = AMGetSpeedKeyframesForKey(key);
+    double now = AMCurrentPlayheadSeconds();
+    NSInteger existing = AMFindKeyframeIndexNearTime(kfs, now, 0.03);
+    if (existing != NSNotFound) {
+        [kfs removeObjectAtIndex:existing];
+    } else {
+        double spd = AMReadCurrentSpeedFromVC(speedVC);
+        [kfs addObject:@{
+            @"t": @(now),
+            @"speed": @(spd),
+            @"x1": @(0.42), @"y1": @(0.00),
+            @"x2": @(0.58), @"y2": @(1.00),
+        }];
+        [kfs sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            double ta = [a[@"t"] doubleValue];
+            double tb = [b[@"t"] doubleValue];
+            if (ta < tb) return NSOrderedAscending;
+            if (ta > tb) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+    }
+    AMSaveSpeedKeyframesForKey(key, kfs);
+    [self refreshKeyframeUIForSpeedVC:speedVC];
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [haptic impactOccurred];
+}
+
++ (void)jumpKeyframeForSpeedVC:(UIViewController *)speedVC direction:(NSInteger)dir {
+    if (!speedVC) return;
+    NSString *key = AMSpeedLayerKeyForVC(speedVC);
+    NSArray<NSDictionary *> *kfs = AMGetSpeedKeyframesForKey(key);
+    if (kfs.count == 0) return;
+
+    double now = AMCurrentPlayheadSeconds();
+    NSDictionary *target = nil;
+    if (dir < 0) {
+        for (NSInteger i = (NSInteger)kfs.count - 1; i >= 0; i--) {
+            if ([kfs[i][@"t"] doubleValue] < now - 0.03) {
+                target = kfs[i];
+                break;
+            }
+        }
+        if (!target) target = kfs.lastObject;
+    } else {
+        for (NSInteger i = 0; i < (NSInteger)kfs.count; i++) {
+            if ([kfs[i][@"t"] doubleValue] > now + 0.03) {
+                target = kfs[i];
+                break;
+            }
+        }
+        if (!target) target = kfs.firstObject;
+    }
+    if (!target) return;
+
+    double tSec = [target[@"t"] doubleValue];
+    double spd = [target[@"speed"] doubleValue];
+    AVPlayer *player = gActivePreviewPlayer;
+    if (player) {
+        CMTime seekT = CMTimeMakeWithSeconds(tSec, 600);
+        [player seekToTime:seekT toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero completionHandler:^(BOOL finished) {
+            (void)finished;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                void *vmPtr = AMGetRawIvarPtr(speedVC, "vm");
+                if (vmPtr && spd >= 0.05 && spd <= 10.0) {
+                    AMCallEditSpeedVMSetSpeed(vmPtr, (int64_t)llround(spd * 1000.0));
+                    AMCallEditSpeedVMRefreshUI(vmPtr);
+                }
+                AMForceImmediatePreviewRedraw();
+                [self refreshKeyframeUIForSpeedVC:speedVC];
+            });
+        }];
+    } else {
+        void *vmPtr = AMGetRawIvarPtr(speedVC, "vm");
+        if (vmPtr && spd >= 0.05 && spd <= 10.0) {
+            AMCallEditSpeedVMSetSpeed(vmPtr, (int64_t)llround(spd * 1000.0));
+            AMCallEditSpeedVMRefreshUI(vmPtr);
+            AMForceImmediatePreviewRedraw();
+        }
+        [self refreshKeyframeUIForSpeedVC:speedVC];
+    }
+}
 
 + (void)openGraphForSpeedVC:(UIViewController *)speedVC {
     if (!speedVC) return;
@@ -3372,8 +3575,7 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
     AMSpeedGraphPanelVC *graphVC = [[AMSpeedGraphPanelVC alloc] init];
     graphVC.speedVC = speedVC;
     graphVC.panelVC = hostVC;
-    void *holderPtr = AMGetRawIvarPtr(speedVC, "holder");
-    graphVC.layerKey = [NSString stringWithFormat:@"speed_%p", holderPtr];
+    graphVC.layerKey = AMSpeedLayerKeyForVC(speedVC);
 
     [hostVC addChildViewController:graphVC];
     graphVC.view.frame = hostVC.view.bounds;
@@ -3387,8 +3589,6 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
 static void AMEnsureSpeedGraphButton(UIViewController *speedVC) {
     if (!speedVC || !speedVC.view) return;
 
-    // Find parent EditSpeedControlPanelVC so we can place the button cleanly in its top header bar
-    // (aligned across from the green speedometer icon, never overlapping the 4 retime buttons).
     UIViewController *panelVC = speedVC.parentViewController;
     while (panelVC && ![NSStringFromClass([panelVC class]) containsString:@"EditSpeedControlPanelVC"]) {
         panelVC = panelVC.parentViewController;
@@ -3396,6 +3596,42 @@ static void AMEnsureSpeedGraphButton(UIViewController *speedVC) {
 
     UIButton *btn = objc_getAssociatedObject(speedVC, kAMSpeedGraphBtnAssocKey);
     if (!btn) {
+        UIView *cueView = panelVC ? (UIView *)AMCallObjCGetter(panelVC, @"cueView") : nil;
+        UIView *speedValLabel = (UIView *)AMCallObjCGetter(speedVC, @"speedValueLabel");
+        UIView *hostView = (cueView && cueView.superview) ? cueView.superview : speedVC.view;
+
+        // Compact horizontal toolbar: [<] [◇] [N] [>] [Graph]
+        UIStackView *toolbar = [[UIStackView alloc] init];
+        toolbar.translatesAutoresizingMaskIntoConstraints = NO;
+        toolbar.axis = UILayoutConstraintAxisHorizontal;
+        toolbar.alignment = UIStackViewAlignmentCenter;
+        toolbar.spacing = 6.0;
+        [hostView addSubview:toolbar];
+
+        UIButton *prevBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        prevBtn.translatesAutoresizingMaskIntoConstraints = NO;
+        prevBtn.accessibilityLabel = @"Previous Speed Keyframe";
+        [prevBtn setImage:[UIImage systemImageNamed:@"chevron.left"] forState:UIControlStateNormal];
+        prevBtn.tintColor = [UIColor whiteColor];
+
+        UIButton *kfBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        kfBtn.translatesAutoresizingMaskIntoConstraints = NO;
+        kfBtn.accessibilityLabel = @"Add or Remove Speed Keyframe";
+        kfBtn.tintColor = [UIColor whiteColor];
+        kfBtn.imageView.contentMode = UIViewContentModeScaleAspectFit;
+
+        UILabel *countLbl = [[UILabel alloc] init];
+        countLbl.translatesAutoresizingMaskIntoConstraints = NO;
+        countLbl.font = AMThemeFont(10.5, UIFontWeightSemibold);
+        countLbl.textColor = AMAccentGreenColor();
+        countLbl.hidden = YES;
+
+        UIButton *nextBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        nextBtn.translatesAutoresizingMaskIntoConstraints = NO;
+        nextBtn.accessibilityLabel = @"Next Speed Keyframe";
+        [nextBtn setImage:[UIImage systemImageNamed:@"chevron.right"] forState:UIControlStateNormal];
+        nextBtn.tintColor = [UIColor whiteColor];
+
         btn = [UIButton buttonWithType:UIButtonTypeSystem];
         btn.translatesAutoresizingMaskIntoConstraints = NO;
         btn.accessibilityLabel = @"Speed Graph Editor";
@@ -3418,46 +3654,73 @@ static void AMEnsureSpeedGraphButton(UIViewController *speedVC) {
         [btn setImage:nativeIcon forState:UIControlStateNormal];
 
         __weak UIViewController *weakSpeedVC = speedVC;
+        [prevBtn addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull action) {
+            (void)action;
+            [AMSpeedGraphButtonHelper jumpKeyframeForSpeedVC:weakSpeedVC direction:-1];
+        }] forControlEvents:UIControlEventTouchUpInside];
+        [kfBtn addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull action) {
+            (void)action;
+            [AMSpeedGraphButtonHelper toggleKeyframeForSpeedVC:weakSpeedVC];
+        }] forControlEvents:UIControlEventTouchUpInside];
+        [nextBtn addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull action) {
+            (void)action;
+            [AMSpeedGraphButtonHelper jumpKeyframeForSpeedVC:weakSpeedVC direction:1];
+        }] forControlEvents:UIControlEventTouchUpInside];
         [btn addAction:[UIAction actionWithHandler:^(__kindof UIAction * _Nonnull action) {
             (void)action;
             [AMSpeedGraphButtonHelper openGraphForSpeedVC:weakSpeedVC];
         }] forControlEvents:UIControlEventTouchUpInside];
 
-        UIView *cueView = panelVC ? (UIView *)AMCallObjCGetter(panelVC, @"cueView") : nil;
-        UIView *speedValLabel = (UIView *)AMCallObjCGetter(speedVC, @"speedValueLabel");
+        [toolbar addArrangedSubview:prevBtn];
+        [toolbar addArrangedSubview:kfBtn];
+        [toolbar addArrangedSubview:countLbl];
+        [toolbar addArrangedSubview:nextBtn];
+        [toolbar addArrangedSubview:btn];
 
-        if (cueView && cueView.superview) {
-            [cueView.superview addSubview:btn];
+        [NSLayoutConstraint activateConstraints:@[
+            [prevBtn.widthAnchor constraintEqualToConstant:24.0],
+            [prevBtn.heightAnchor constraintEqualToConstant:32.0],
+            [kfBtn.widthAnchor constraintEqualToConstant:30.0],
+            [kfBtn.heightAnchor constraintEqualToConstant:32.0],
+            [nextBtn.widthAnchor constraintEqualToConstant:24.0],
+            [nextBtn.heightAnchor constraintEqualToConstant:32.0],
+            [btn.widthAnchor constraintEqualToConstant:34.0],
+            [btn.heightAnchor constraintEqualToConstant:34.0],
+        ]];
+
+        if (cueView && cueView.superview == hostView) {
             [NSLayoutConstraint activateConstraints:@[
-                [btn.trailingAnchor constraintEqualToAnchor:cueView.superview.trailingAnchor constant:-12.0],
-                [btn.centerYAnchor constraintEqualToAnchor:cueView.centerYAnchor],
-                [btn.widthAnchor constraintEqualToConstant:36.0],
-                [btn.heightAnchor constraintEqualToConstant:36.0],
+                [toolbar.trailingAnchor constraintEqualToAnchor:hostView.trailingAnchor constant:-12.0],
+                [toolbar.centerYAnchor constraintEqualToAnchor:cueView.centerYAnchor],
             ]];
-        } else if (speedValLabel && speedValLabel.superview) {
-            [speedVC.view addSubview:btn];
+        } else if (speedValLabel && speedValLabel.superview == hostView) {
             [NSLayoutConstraint activateConstraints:@[
-                [btn.trailingAnchor constraintEqualToAnchor:speedVC.view.trailingAnchor constant:-16.0],
-                [btn.centerYAnchor constraintEqualToAnchor:speedValLabel.centerYAnchor],
-                [btn.widthAnchor constraintEqualToConstant:36.0],
-                [btn.heightAnchor constraintEqualToConstant:36.0],
+                [toolbar.trailingAnchor constraintEqualToAnchor:hostView.trailingAnchor constant:-12.0],
+                [toolbar.centerYAnchor constraintEqualToAnchor:speedValLabel.centerYAnchor],
             ]];
         } else {
-            [speedVC.view addSubview:btn];
             [NSLayoutConstraint activateConstraints:@[
-                [btn.trailingAnchor constraintEqualToAnchor:speedVC.view.trailingAnchor constant:-16.0],
-                [btn.centerYAnchor constraintEqualToAnchor:speedVC.view.centerYAnchor],
-                [btn.widthAnchor constraintEqualToConstant:36.0],
-                [btn.heightAnchor constraintEqualToConstant:36.0],
+                [toolbar.trailingAnchor constraintEqualToAnchor:hostView.trailingAnchor constant:-12.0],
+                [toolbar.topAnchor constraintEqualToAnchor:hostView.topAnchor constant:8.0],
             ]];
         }
+
+        objc_setAssociatedObject(speedVC, kAMSpeedKfBarAssocKey, toolbar, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(speedVC, kAMSpeedKfPrevBtnAssocKey, prevBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(speedVC, kAMSpeedKfBtnAssocKey, kfBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(speedVC, kAMSpeedKfCountLblAssocKey, countLbl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(speedVC, kAMSpeedKfNextBtnAssocKey, nextBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(speedVC, kAMSpeedGraphBtnAssocKey, btn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
+    UIView *toolbar = objc_getAssociatedObject(speedVC, kAMSpeedKfBarAssocKey);
     UIView *cover = (UIView *)AMCallObjCGetter(speedVC, @"speedControlCover");
     BOOL disabled = (cover && !cover.hidden && cover.alpha > 0.01);
-    btn.hidden = disabled;
-    if (btn.superview) [btn.superview bringSubviewToFront:btn];
+    if (toolbar) {
+        toolbar.hidden = disabled;
+        if (toolbar.superview) [toolbar.superview bringSubviewToFront:toolbar];
+    }
+    [AMSpeedGraphButtonHelper refreshKeyframeUIForSpeedVC:speedVC];
 }
 
 static void AMHook_editSpeedVCViewDidLoad(id self, SEL _cmd) {
