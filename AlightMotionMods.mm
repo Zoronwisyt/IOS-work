@@ -1408,6 +1408,35 @@ static uint8_t AMCustomCategoryFilter(void *effectPtr) {
     return (uint8_t)((isExp ^ 1) & 1);
 }
 
+static uint8_t AMGoldMotionCategoryFilter(void *effectPtr) {
+    if (!effectPtr) return 0;
+    intptr_t slide = AMMainBinarySlide();
+    typedef void *(*AMMetaFn)(uintptr_t);
+    typedef uint8_t (*AMStrEqFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint8_t);
+
+    AMMetaFn getEffectMeta = (AMMetaFn)(0x10045b298ULL + slide);
+    uint8_t *meta = (uint8_t *)getEffectMeta(0);
+    if (!meta) return 0;
+
+    int32_t catOff = *(int32_t *)(meta + 0x48);
+    int32_t expOff = *(int32_t *)(meta + 0x44);
+    uint64_t strLo = *(uint64_t *)((uint8_t *)effectPtr + catOff);
+    uint64_t strHi = *(uint64_t *)((uint8_t *)effectPtr + catOff + 8);
+
+    // Swift 5 small inline ASCII string "goldmotion" (10 bytes)
+    const uint64_t kGMLo = 0x69746f6d646c6f67ULL;
+    const uint64_t kGMHi = 0xea00000000006e6fULL;
+
+    BOOL matched = (strLo == kGMLo && strHi == kGMHi);
+    if (!matched) {
+        AMStrEqFn strEq = (AMStrEqFn)(0x1025b7bb8ULL + slide);
+        matched = (strEq(strLo, strHi, kGMLo, kGMHi, 0) & 1) != 0;
+    }
+    if (!matched) return 0;
+    uint8_t isExp = *((uint8_t *)effectPtr + expOff);
+    return (uint8_t)((isExp ^ 1) & 1);
+}
+
 static void AMMigrateCustomEffectXMLCategories(void) {
     NSString *dir = AMCustomEffectsDir();
     NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
@@ -1457,7 +1486,7 @@ static void AMInstallCustomEffectCategoryIfNeeded(void) {
         }
 
         int64_t origCount = origHdr->count;
-        int64_t newCount = origCount + 1;
+        int64_t newCount = origCount + 2;
         size_t newBytes = sizeof(AMSwiftArrayHeader) + (size_t)newCount * sizeof(AMEffectCategoryEntry);
 
         AMSwiftArrayHeader *newHdr = (AMSwiftArrayHeader *)swiftAllocObject(origHdr->isa, newBytes, 7);
@@ -1488,6 +1517,16 @@ static void AMInstallCustomEffectCategoryIfNeeded(void) {
                 customEntry.filterFn = (void *)&AMCustomCategoryFilter;
                 customEntry.filterCtx = NULL;
                 newItems[dst++] = customEntry;
+
+                AMEffectCategoryEntry gmEntry;
+                gmEntry.catId = 0x72; // 114: unique, non-zero (excluded by Other), != 500 (always visible)
+                gmEntry.nameLo = 0x746f4d20646c6f47ULL; // Swift small ASCII String "Gold Motion" (11 bytes)
+                gmEntry.nameHi = 0xeb000000006e6f69ULL;
+                gmEntry.thumbLo = 0;
+                gmEntry.thumbHi = 0;
+                gmEntry.filterFn = (void *)&AMGoldMotionCategoryFilter;
+                gmEntry.filterCtx = NULL;
+                newItems[dst++] = gmEntry;
             }
             AMEffectCategoryEntry e = origItems[i];
             if (e.nameHi) swiftBridgeRetain((void *)e.nameHi);
@@ -1505,6 +1544,16 @@ static void AMInstallCustomEffectCategoryIfNeeded(void) {
             customEntry.filterFn = (void *)&AMCustomCategoryFilter;
             customEntry.filterCtx = NULL;
             newItems[dst++] = customEntry;
+
+            AMEffectCategoryEntry gmEntry;
+            gmEntry.catId = 0x72;
+            gmEntry.nameLo = 0x746f4d20646c6f47ULL;
+            gmEntry.nameHi = 0xeb000000006e6f69ULL;
+            gmEntry.thumbLo = 0;
+            gmEntry.thumbHi = 0;
+            gmEntry.filterFn = (void *)&AMGoldMotionCategoryFilter;
+            gmEntry.filterCtx = NULL;
+            newItems[dst++] = gmEntry;
         }
 
         // Publish new array globally (intentionally keep origHdr retained for safety)
@@ -1529,18 +1578,26 @@ static void AMHook_effectMainWillDisplayCell(id self, SEL _cmd, UICollectionView
     }
     if (!titleLbl) titleLbl = AMFindFirstLabelInView(cell.contentView);
     BOOL isCustom = (titleLbl.text && [titleLbl.text caseInsensitiveCompare:@"Custom"] == NSOrderedSame);
+    BOOL isGoldMotion = (titleLbl.text && [titleLbl.text caseInsensitiveCompare:@"Gold Motion"] == NSOrderedSame);
     CAGradientLayer *grad = objc_getAssociatedObject(cell, kAMCustomCatGradKey);
-    if (isCustom) {
+    if (isCustom || isGoldMotion) {
         if (!grad) {
             grad = [CAGradientLayer layer];
-            grad.colors = @[
-                (id)[UIColor colorWithRed:0.15 green:0.20 blue:0.35 alpha:1.0].CGColor,
-                (id)[UIColor colorWithRed:0.12 green:0.30 blue:0.28 alpha:1.0].CGColor,
-            ];
             grad.startPoint = CGPointMake(0.0, 0.0);
             grad.endPoint = CGPointMake(1.0, 1.0);
             [cell.contentView.layer insertSublayer:grad atIndex:0];
             objc_setAssociatedObject(cell, kAMCustomCatGradKey, grad, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (isGoldMotion) {
+            grad.colors = @[
+                (id)[UIColor colorWithRed:0.26 green:0.18 blue:0.04 alpha:1.0].CGColor,
+                (id)[UIColor colorWithRed:0.46 green:0.32 blue:0.06 alpha:1.0].CGColor,
+            ];
+        } else {
+            grad.colors = @[
+                (id)[UIColor colorWithRed:0.15 green:0.20 blue:0.35 alpha:1.0].CGColor,
+                (id)[UIColor colorWithRed:0.12 green:0.30 blue:0.28 alpha:1.0].CGColor,
+            ];
         }
         grad.hidden = NO;
         grad.frame = cell.contentView.bounds;
@@ -1560,17 +1617,22 @@ static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd,
         ext && [ext caseInsensitiveCompare:@"xml"] == NSOrderedSame &&
         subpath && [subpath isEqualToString:@"BuiltinEffects"]) {
         AMInstallCustomEffectCategoryIfNeeded();
+        NSMutableArray<NSURL *> *merged = orig ? [orig mutableCopy] : [NSMutableArray array];
         NSString *dir = AMCustomEffectsDir();
         NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
-        if (files.count > 0) {
-            NSMutableArray<NSURL *> *merged = orig ? [orig mutableCopy] : [NSMutableArray array];
-            for (NSString *fn in files) {
-                if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
-                    [merged addObject:[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:fn]]];
-                }
+        for (NSString *fn in files) {
+            if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
+                [merged addObject:[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:fn]]];
             }
-            return merged;
         }
+        NSString *gmDir = [[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"GoldMotionEffects"];
+        NSArray<NSString *> *gmFiles = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:gmDir error:nil];
+        for (NSString *fn in gmFiles) {
+            if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
+                [merged addObject:[NSURL fileURLWithPath:[gmDir stringByAppendingPathComponent:fn]]];
+            }
+        }
+        return merged;
     }
     return orig;
 }
