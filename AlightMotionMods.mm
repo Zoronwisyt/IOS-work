@@ -108,6 +108,9 @@ static BOOL AMItemUsesAMCompositor(AVPlayerItem *item) {
 
 static void AMTrackPlayerIfPreview(AVPlayer *player, AVPlayerItem *item) {
     if (!player) return;
+    if (AMItemUsesAMCompositor(item)) {
+        item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmVarispeed;
+    }
     if (AMItemUsesAMCompositor(item) || AMItemUsesAMCompositor(player.currentItem)) {
         gActivePreviewPlayer = player;
     } else if (item && gActivePreviewPlayer == nil) {
@@ -5308,6 +5311,129 @@ static void AMHook_layerParentingDidSelectRow(id self, SEL _cmd, UITableView *ta
 // Constructor: Install All Hooks Safely on Launch
 // ============================================================================
 
+// ============================================================================
+// Audio Layer Speed Scaling + Varispeed Pitch Shifting (Preview & Export)
+// ============================================================================
+// Binary patches in inject_mods.py:
+//   - 0x006D4D44: bypass EditSpeedVM "audio" speed_control_not_avail_audio gate
+//   - 0x00222C70: bypass audio composition speed!=1.0 skip so s8 (element.speed)
+//                 proceeds into [AVAsset tracksWithMediaType:AVMediaTypeAudio]
+//                 (0x100222d24) and [AVMutableCompositionTrack insertTimeRange:
+//                 ofTrack:atTime:error:] (0x100224004).
+// Here we capture s8 (callee-saved element.speed) at 0x100222d28, scale the
+// inserted audio segment by 1/speed at 0x100224008, and force
+// AVAudioTimePitchAlgorithmVarispeed on AVPlayerItem, AVAssetReaderAudioMixOutput,
+// and AVAssetExportSession so speed changes shift pitch in both preview & export.
+
+static thread_local float gPendingAudioSpeed = 1.0f;
+
+static IMP gOrigAVAssetTracksWithMediaType = NULL;
+static IMP gOrigAVURLAssetTracksWithMediaType = NULL;
+static IMP gOrigCompTrackInsertTimeRange = NULL;
+static IMP gOrigPlayerItemSetAudioMix = NULL;
+static IMP gOrigAudioMixOutputInit = NULL;
+static IMP gOrigAudioMixOutputSetAudioMix = NULL;
+static IMP gOrigExportSessionSetAudioMix = NULL;
+
+static __attribute__((noinline))
+NSArray<AVAssetTrack *> *AMHandleTracksWithMediaType(
+    id self, SEL _cmd, AVMediaType mediaType, IMP origImp, uintptr_t retAddr, float s8Val)
+{
+    static uintptr_t kAudioTracksRet = 0;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        kAudioTracksRet = 0x100222d28ULL + (uintptr_t)AMMainBinarySlide();
+    });
+    if (retAddr == kAudioTracksRet) {
+        if (isfinite(s8Val) && s8Val > 0.01f && s8Val < 100.0f) {
+            gPendingAudioSpeed = s8Val;
+        } else {
+            gPendingAudioSpeed = 1.0f;
+        }
+    }
+    return ((NSArray<AVAssetTrack *> *(*)(id, SEL, AVMediaType))origImp)(self, _cmd, mediaType);
+}
+
+static NSArray<AVAssetTrack *> *AMHook_avAssetTracksWithMediaType(id self, SEL _cmd, AVMediaType mediaType) {
+    float s8Val = 1.0f;
+#if defined(__aarch64__)
+    __asm__ volatile("fmov %s0, s8" : "=w"(s8Val));
+#endif
+    uintptr_t retAddr = (uintptr_t)__builtin_return_address(0);
+    return AMHandleTracksWithMediaType(self, _cmd, mediaType, gOrigAVAssetTracksWithMediaType, retAddr, s8Val);
+}
+
+static NSArray<AVAssetTrack *> *AMHook_avURLAssetTracksWithMediaType(id self, SEL _cmd, AVMediaType mediaType) {
+    float s8Val = 1.0f;
+#if defined(__aarch64__)
+    __asm__ volatile("fmov %s0, s8" : "=w"(s8Val));
+#endif
+    uintptr_t retAddr = (uintptr_t)__builtin_return_address(0);
+    return AMHandleTracksWithMediaType(self, _cmd, mediaType, gOrigAVURLAssetTracksWithMediaType, retAddr, s8Val);
+}
+
+static BOOL AMHook_compTrackInsertTimeRange(
+    id self, SEL _cmd, CMTimeRange timeRange, AVAssetTrack *track, CMTime startTime, NSError **outError)
+{
+    uintptr_t retAddr = (uintptr_t)__builtin_return_address(0);
+    BOOL ok = ((BOOL (*)(id, SEL, CMTimeRange, AVAssetTrack *, CMTime, NSError **))gOrigCompTrackInsertTimeRange)(
+        self, _cmd, timeRange, track, startTime, outError);
+
+    static uintptr_t kAudioInsertRet = 0;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        kAudioInsertRet = 0x100224008ULL + (uintptr_t)AMMainBinarySlide();
+    });
+
+    if (retAddr == kAudioInsertRet) {
+        float spd = gPendingAudioSpeed;
+        gPendingAudioSpeed = 1.0f;
+        if (ok && isfinite(spd) && fabsf(spd - 1.0f) > 1e-6f && spd > 0.01f && spd < 100.0f) {
+            if (CMTIME_IS_VALID(timeRange.duration) && CMTimeCompare(timeRange.duration, kCMTimeZero) > 0) {
+                CMTime scaledDur = CMTimeMultiplyByFloat64(timeRange.duration, 1.0 / (double)spd);
+                if (CMTIME_IS_VALID(scaledDur) && CMTimeCompare(scaledDur, kCMTimeZero) > 0) {
+                    [(AVMutableCompositionTrack *)self scaleTimeRange:CMTimeRangeMake(startTime, timeRange.duration)
+                                                           toDuration:scaledDur];
+                }
+            }
+        }
+    }
+    return ok;
+}
+
+static void AMHook_playerItemSetAudioMix(id self, SEL _cmd, AVAudioMix *audioMix) {
+    if (gOrigPlayerItemSetAudioMix) {
+        ((void (*)(id, SEL, AVAudioMix *))gOrigPlayerItemSetAudioMix)(self, _cmd, audioMix);
+    }
+    [(AVPlayerItem *)self setAudioTimePitchAlgorithm:AVAudioTimePitchAlgorithmVarispeed];
+}
+
+static id AMHook_audioMixOutputInit(id self, SEL _cmd, NSArray<AVAssetTrack *> *audioTracks, NSDictionary<NSString *, id> *audioSettings) {
+    id res = self;
+    if (gOrigAudioMixOutputInit) {
+        res = ((id (*)(id, SEL, NSArray<AVAssetTrack *> *, NSDictionary<NSString *, id> *))gOrigAudioMixOutputInit)(
+            self, _cmd, audioTracks, audioSettings);
+    }
+    if (res) {
+        [(AVAssetReaderAudioMixOutput *)res setAudioTimePitchAlgorithm:AVAudioTimePitchAlgorithmVarispeed];
+    }
+    return res;
+}
+
+static void AMHook_audioMixOutputSetAudioMix(id self, SEL _cmd, AVAudioMix *audioMix) {
+    if (gOrigAudioMixOutputSetAudioMix) {
+        ((void (*)(id, SEL, AVAudioMix *))gOrigAudioMixOutputSetAudioMix)(self, _cmd, audioMix);
+    }
+    [(AVAssetReaderAudioMixOutput *)self setAudioTimePitchAlgorithm:AVAudioTimePitchAlgorithmVarispeed];
+}
+
+static void AMHook_exportSessionSetAudioMix(id self, SEL _cmd, AVAudioMix *audioMix) {
+    if (gOrigExportSessionSetAudioMix) {
+        ((void (*)(id, SEL, AVAudioMix *))gOrigExportSessionSetAudioMix)(self, _cmd, audioMix);
+    }
+    [(AVAssetExportSession *)self setAudioTimePitchAlgorithm:AVAudioTimePitchAlgorithmVarispeed];
+}
+
 static void AMSwizzleMethod(NSString *className, NSString *selName, IMP replacement, IMP *outOrig) {
     Class cls = NSClassFromString(className);
     if (!cls) return;
@@ -5343,6 +5469,39 @@ static void AlightMotionModsInit(void) {
                     @"initWithPlayerItem:",
                     (IMP)AMHook_initWithPlayerItem,
                     &gOrigInitWithPlayerItem);
+
+    // Audio speed scaling + varispeed pitch shift hooks
+    {
+        SEL tracksSel = @selector(tracksWithMediaType:);
+        Method mAsset = class_getInstanceMethod([AVAsset class], tracksSel);
+        Method mURLAsset = class_getInstanceMethod([AVURLAsset class], tracksSel);
+        if (mAsset) {
+            gOrigAVAssetTracksWithMediaType = method_setImplementation(mAsset, (IMP)AMHook_avAssetTracksWithMediaType);
+        }
+        if (mURLAsset && mURLAsset != mAsset) {
+            gOrigAVURLAssetTracksWithMediaType = method_setImplementation(mURLAsset, (IMP)AMHook_avURLAssetTracksWithMediaType);
+        }
+    }
+    AMSwizzleMethod(@"AVMutableCompositionTrack",
+                    @"insertTimeRange:ofTrack:atTime:error:",
+                    (IMP)AMHook_compTrackInsertTimeRange,
+                    &gOrigCompTrackInsertTimeRange);
+    AMSwizzleMethod(@"AVPlayerItem",
+                    @"setAudioMix:",
+                    (IMP)AMHook_playerItemSetAudioMix,
+                    &gOrigPlayerItemSetAudioMix);
+    AMSwizzleMethod(@"AVAssetReaderAudioMixOutput",
+                    @"initWithAudioTracks:audioSettings:",
+                    (IMP)AMHook_audioMixOutputInit,
+                    &gOrigAudioMixOutputInit);
+    AMSwizzleMethod(@"AVAssetReaderAudioMixOutput",
+                    @"setAudioMix:",
+                    (IMP)AMHook_audioMixOutputSetAudioMix,
+                    &gOrigAudioMixOutputSetAudioMix);
+    AMSwizzleMethod(@"AVAssetExportSession",
+                    @"setAudioMix:",
+                    (IMP)AMHook_exportSessionSetAudioMix,
+                    &gOrigExportSessionSetAudioMix);
 
     AMSwizzleMethod(@"_TtC12AlightMotion12AMCompositor",
                     @"startVideoCompositionRequest:",
