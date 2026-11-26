@@ -32,6 +32,7 @@ static __weak AVPlayer *gActivePreviewPlayer = nil;
 static IMP gOrigReplaceCurrentItem = NULL;
 static IMP gOrigInitWithPlayerItem = NULL;
 static IMP gOrigGTMBeginFetch = NULL;
+static IMP gOrigFIRCallableResultData = NULL;
 
 // ============================================================================
 // Theme Helpers
@@ -272,6 +273,26 @@ static void AMHook_previewControlBarViewDidLoad(id self, SEL _cmd) {
 // FirebaseFunctions & FirebaseStorage use GTMSessionFetcher (`beginFetchWithCompletionHandler:`),
 // not `NSURLSession dataTaskWithRequest:completionHandler:`. On sideloaded IPAs, invalid
 // AppCheck / Auth headers cause `getProjectMetadata` to fail with `INTERNAL`.
+
+static id AMHook_firCallableResultData(id self, SEL _cmd) {
+    id res = gOrigFIRCallableResultData ? ((id (*)(id, SEL))gOrigFIRCallableResultData)(self, _cmd) : nil;
+    if ([res isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)res;
+        id dl = d[@"download"];
+        if ([dl isKindOfClass:[NSString class]] && ![(NSString *)dl isEqualToString:@"allowed"]) {
+            NSMutableDictionary *mut = [d mutableCopy];
+            mut[@"download"] = @"allowed";
+            mut[@"message"] = [NSNull null];
+            if ([mut[@"info"] isKindOfClass:[NSDictionary class]]) {
+                NSMutableDictionary *info = [mut[@"info"] mutableCopy];
+                info[@"size"] = @(1000000);
+                mut[@"info"] = info;
+            }
+            return mut;
+        }
+    }
+    return res;
+}
 
 static NSData *AMRewriteProjectMetadataJSON(NSData *data) {
     if (data.length == 0) return data;
@@ -1474,6 +1495,11 @@ static void AlightMotionModsInit(void) {
     if (saved >= 1 && saved <= 4) {
         gPreviewDivisor = saved;
     }
+
+    AMSwizzleMethod(@"FIRHTTPSCallableResult",
+                    @"data",
+                    (IMP)AMHook_firCallableResultData,
+                    &gOrigFIRCallableResultData);
 
     AMSwizzleMethod(@"GTMSessionFetcher",
                     @"beginFetchWithCompletionHandler:",
