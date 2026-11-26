@@ -21,6 +21,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <Metal/Metal.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <math.h>
@@ -898,10 +899,438 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
 
     NSMutableString *result = [trimmed mutableCopy];
     [result replaceCharactersInRange:tagRange withString:openTag];
+
+    // Normalize bare <shader> tags missing type="fragment" (common in Android/Gold Motion XMLs)
+    {
+        NSRegularExpression *bareShaderRx = [NSRegularExpression regularExpressionWithPattern:@"<shader(?![^>]*\\btype\\s*=)([^>]*)>"
+                                                                                      options:NSRegularExpressionCaseInsensitive
+                                                                                        error:nil];
+        [bareShaderRx replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:@"<shader type=\"fragment\"$1>"];
+    }
+
+    // Fallback missing Android bundled image textures (<texture ... srcType="image" .../>) to srcType="content"
+    // if the referenced image file does not exist inside AlightMotion.app/BuiltinEffects.
+    {
+        NSRegularExpression *imgTexRx = [NSRegularExpression regularExpressionWithPattern:@"<texture\\b[^>]*\\bsrcType\\s*=\\s*\"image\"[^>]*>"
+                                                                                  options:NSRegularExpressionCaseInsensitive
+                                                                                    error:nil];
+        NSArray<NSTextCheckingResult *> *matches = [imgTexRx matchesInString:result options:0 range:NSMakeRange(0, result.length)];
+        NSString *builtinDir = [[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"BuiltinEffects"];
+        NSRegularExpression *srcAttrRx = [NSRegularExpression regularExpressionWithPattern:@"\\bsrc\\s*=\\s*\"([^\"]+)\""
+                                                                                   options:NSRegularExpressionCaseInsensitive
+                                                                                     error:nil];
+        for (NSTextCheckingResult *m in [matches reverseObjectEnumerator]) {
+            NSString *tag = [result substringWithRange:m.range];
+            NSTextCheckingResult *srcM = [srcAttrRx firstMatchInString:tag options:0 range:NSMakeRange(0, tag.length)];
+            BOOL exists = NO;
+            if (srcM && srcM.numberOfRanges > 1) {
+                NSString *rel = [tag substringWithRange:[srcM rangeAtIndex:1]];
+                exists = [[NSFileManager defaultManager] fileExistsAtPath:[builtinDir stringByAppendingPathComponent:rel]];
+            }
+            if (!exists) {
+                NSMutableString *fixedTag = [tag mutableCopy];
+                NSRegularExpression *stRx = [NSRegularExpression regularExpressionWithPattern:@"\\bsrcType\\s*=\\s*\"image\""
+                                                                                      options:NSRegularExpressionCaseInsensitive
+                                                                                        error:nil];
+                [stRx replaceMatchesInString:fixedTag options:0 range:NSMakeRange(0, fixedTag.length) withTemplate:@"srcType=\"content\""];
+                [srcAttrRx replaceMatchesInString:fixedTag options:0 range:NSMakeRange(0, fixedTag.length) withTemplate:@""];
+                [result replaceCharactersInRange:m.range withString:fixedTag];
+            }
+        }
+    }
+
     if (![result hasPrefix:@"<?xml"]) {
         [result insertString:@"<?xml version='1.0' encoding='UTF-8' ?>\n" atIndex:0];
     }
     return result;
+}
+
+// ============================================================================
+// Module 3B: GLSL-ES-to-MSL Shader Compatibility Engine (Android -> iOS)
+// Hooks MTLDevice -newLibraryWithSource:options:error: with zero overhead on
+// shaders that already compile cleanly. When an AC_ShaderWrapper effect fails
+// Metal compilation, injects missing GLSL ES 2.0/3.0 built-ins/overloads and
+// rewrites GLSL-only syntax (precision, out/inout, sampler2D, const int,
+// struct/array constructors, stpq swizzles, uniform/varying, not()) to MSL.
+// ============================================================================
+
+static id<MTLLibrary> (*gOrigNewLibraryWithSource)(id, SEL, NSString *, MTLCompileOptions *, NSError **) = NULL;
+
+static NSString *AMGLSLGlobalCompatPreamble(void) {
+    return @"\n"
+    "// --- AMMod GLSL-ES-to-MSL Compatibility Preamble ---\n"
+    "typedef bool2 bvec2; typedef bool3 bvec3; typedef bool4 bvec4;\n"
+    "typedef int2 ivec2; typedef int3 ivec3; typedef int4 ivec4;\n"
+    "typedef uint2 uvec2; typedef uint3 uvec3; typedef uint4 uvec4;\n"
+    "typedef texture2d<half> sampler2D;\n"
+    "\n"
+    "inline float radians(float d) { return d * 0.017453292519943295f; }\n"
+    "inline vec2  radians(vec2  d) { return d * 0.017453292519943295f; }\n"
+    "inline vec3  radians(vec3  d) { return d * 0.017453292519943295f; }\n"
+    "inline vec4  radians(vec4  d) { return d * 0.017453292519943295f; }\n"
+    "inline float degrees(float r) { return r * 57.29577951308232f; }\n"
+    "inline vec2  degrees(vec2  r) { return r * 57.29577951308232f; }\n"
+    "inline vec3  degrees(vec3  r) { return r * 57.29577951308232f; }\n"
+    "inline vec4  degrees(vec4  r) { return r * 57.29577951308232f; }\n"
+    "\n"
+    "inline float inversesqrt(float x) { return metal::rsqrt(x); }\n"
+    "inline vec2  inversesqrt(vec2  x) { return metal::rsqrt(x); }\n"
+    "inline vec3  inversesqrt(vec3  x) { return metal::rsqrt(x); }\n"
+    "inline vec4  inversesqrt(vec4  x) { return metal::rsqrt(x); }\n"
+    "\n"
+    "inline float dFdx(float x) { return metal::dfdx(x); }\n"
+    "inline vec2  dFdx(vec2  x) { return metal::dfdx(x); }\n"
+    "inline vec3  dFdx(vec3  x) { return metal::dfdx(x); }\n"
+    "inline vec4  dFdx(vec4  x) { return metal::dfdx(x); }\n"
+    "inline float dFdy(float x) { return metal::dfdy(x); }\n"
+    "inline vec2  dFdy(vec2  x) { return metal::dfdy(x); }\n"
+    "inline vec3  dFdy(vec3  x) { return metal::dfdy(x); }\n"
+    "inline vec4  dFdy(vec4  x) { return metal::dfdy(x); }\n"
+    "\n"
+    "inline vec2 mod(vec2 x, float y) { return x - y * metal::floor(x / y); }\n"
+    "inline vec3 mod(vec3 x, float y) { return x - y * metal::floor(x / y); }\n"
+    "inline vec4 mod(vec4 x, float y) { return x - y * metal::floor(x / y); }\n"
+    "inline vec2 mod(float x, vec2 y) { return x - y * metal::floor(x / y); }\n"
+    "inline vec3 mod(float x, vec3 y) { return x - y * metal::floor(x / y); }\n"
+    "inline vec4 mod(float x, vec4 y) { return x - y * metal::floor(x / y); }\n"
+    "\n"
+    "inline vec2 atan(vec2 y, vec2 x) { return metal::atan2(y, x); }\n"
+    "inline vec3 atan(vec3 y, vec3 x) { return metal::atan2(y, x); }\n"
+    "inline vec4 atan(vec4 y, vec4 x) { return metal::atan2(y, x); }\n"
+    "\n"
+    "inline vec2  min(vec2  a, float b) { return metal::min(a, vec2(b)); }\n"
+    "inline vec3  min(vec3  a, float b) { return metal::min(a, vec3(b)); }\n"
+    "inline vec4  min(vec4  a, float b) { return metal::min(a, vec4(b)); }\n"
+    "inline vec2  min(float a, vec2  b) { return metal::min(vec2(a), b); }\n"
+    "inline vec3  min(float a, vec3  b) { return metal::min(vec3(a), b); }\n"
+    "inline vec4  min(float a, vec4  b) { return metal::min(vec4(a), b); }\n"
+    "inline float min(float a, int   b) { return metal::min(a, float(b)); }\n"
+    "inline float min(int   a, float b) { return metal::min(float(a), b); }\n"
+    "\n"
+    "inline vec2  max(vec2  a, float b) { return metal::max(a, vec2(b)); }\n"
+    "inline vec3  max(vec3  a, float b) { return metal::max(a, vec3(b)); }\n"
+    "inline vec4  max(vec4  a, float b) { return metal::max(a, vec4(b)); }\n"
+    "inline vec2  max(float a, vec2  b) { return metal::max(vec2(a), b); }\n"
+    "inline vec3  max(float a, vec3  b) { return metal::max(vec3(a), b); }\n"
+    "inline vec4  max(float a, vec4  b) { return metal::max(vec4(a), b); }\n"
+    "inline float max(float a, int   b) { return metal::max(a, float(b)); }\n"
+    "inline float max(int   a, float b) { return metal::max(float(a), b); }\n"
+    "\n"
+    "inline vec2  pow(vec2  x, float y) { return metal::pow(x, vec2(y)); }\n"
+    "inline vec3  pow(vec3  x, float y) { return metal::pow(x, vec3(y)); }\n"
+    "inline vec4  pow(vec4  x, float y) { return metal::pow(x, vec4(y)); }\n"
+    "inline float pow(float x, int   y) { return metal::pow(x, float(y)); }\n"
+    "\n"
+    "inline vec2 step(float e, vec2 x) { return metal::step(vec2(e), x); }\n"
+    "inline vec3 step(float e, vec3 x) { return metal::step(vec3(e), x); }\n"
+    "inline vec4 step(float e, vec4 x) { return metal::step(vec4(e), x); }\n"
+    "inline vec2 smoothstep(float e0, float e1, vec2 x) { return metal::smoothstep(vec2(e0), vec2(e1), x); }\n"
+    "inline vec3 smoothstep(float e0, float e1, vec3 x) { return metal::smoothstep(vec3(e0), vec3(e1), x); }\n"
+    "inline vec4 smoothstep(float e0, float e1, vec4 x) { return metal::smoothstep(vec4(e0), vec4(e1), x); }\n"
+    "\n"
+    "inline float mix(float x, float y, bool  a) { return a ? y : x; }\n"
+    "inline vec2  mix(vec2  x, vec2  y, bool  a) { return a ? y : x; }\n"
+    "inline vec3  mix(vec3  x, vec3  y, bool  a) { return a ? y : x; }\n"
+    "inline vec4  mix(vec4  x, vec4  y, bool  a) { return a ? y : x; }\n"
+    "inline vec2  mix(vec2  x, vec2  y, bvec2 a) { return metal::select(x, y, a); }\n"
+    "inline vec3  mix(vec3  x, vec3  y, bvec3 a) { return metal::select(x, y, a); }\n"
+    "inline vec4  mix(vec4  x, vec4  y, bvec4 a) { return metal::select(x, y, a); }\n"
+    "\n"
+    "inline bvec2 lessThan(vec2 a, vec2 b) { return a < b; }\n"
+    "inline bvec3 lessThan(vec3 a, vec3 b) { return a < b; }\n"
+    "inline bvec4 lessThan(vec4 a, vec4 b) { return a < b; }\n"
+    "inline bvec2 lessThan(ivec2 a, ivec2 b) { return a < b; }\n"
+    "inline bvec3 lessThan(ivec3 a, ivec3 b) { return a < b; }\n"
+    "inline bvec4 lessThan(ivec4 a, ivec4 b) { return a < b; }\n"
+    "inline bvec2 lessThanEqual(vec2 a, vec2 b) { return a <= b; }\n"
+    "inline bvec3 lessThanEqual(vec3 a, vec3 b) { return a <= b; }\n"
+    "inline bvec4 lessThanEqual(vec4 a, vec4 b) { return a <= b; }\n"
+    "inline bvec2 lessThanEqual(ivec2 a, ivec2 b) { return a <= b; }\n"
+    "inline bvec3 lessThanEqual(ivec3 a, ivec3 b) { return a <= b; }\n"
+    "inline bvec4 lessThanEqual(ivec4 a, ivec4 b) { return a <= b; }\n"
+    "inline bvec2 greaterThan(vec2 a, vec2 b) { return a > b; }\n"
+    "inline bvec3 greaterThan(vec3 a, vec3 b) { return a > b; }\n"
+    "inline bvec4 greaterThan(vec4 a, vec4 b) { return a > b; }\n"
+    "inline bvec2 greaterThan(ivec2 a, ivec2 b) { return a > b; }\n"
+    "inline bvec3 greaterThan(ivec3 a, ivec3 b) { return a > b; }\n"
+    "inline bvec4 greaterThan(ivec4 a, ivec4 b) { return a > b; }\n"
+    "inline bvec2 greaterThanEqual(vec2 a, vec2 b) { return a >= b; }\n"
+    "inline bvec3 greaterThanEqual(vec3 a, vec3 b) { return a >= b; }\n"
+    "inline bvec4 greaterThanEqual(vec4 a, vec4 b) { return a >= b; }\n"
+    "inline bvec2 greaterThanEqual(ivec2 a, ivec2 b) { return a >= b; }\n"
+    "inline bvec3 greaterThanEqual(ivec3 a, ivec3 b) { return a >= b; }\n"
+    "inline bvec4 greaterThanEqual(ivec4 a, ivec4 b) { return a >= b; }\n"
+    "inline bvec2 equal(vec2 a, vec2 b) { return a == b; }\n"
+    "inline bvec3 equal(vec3 a, vec3 b) { return a == b; }\n"
+    "inline bvec4 equal(vec4 a, vec4 b) { return a == b; }\n"
+    "inline bvec2 equal(ivec2 a, ivec2 b) { return a == b; }\n"
+    "inline bvec3 equal(ivec3 a, ivec3 b) { return a == b; }\n"
+    "inline bvec4 equal(ivec4 a, ivec4 b) { return a == b; }\n"
+    "inline bvec2 equal(bvec2 a, bvec2 b) { return a == b; }\n"
+    "inline bvec3 equal(bvec3 a, bvec3 b) { return a == b; }\n"
+    "inline bvec4 equal(bvec4 a, bvec4 b) { return a == b; }\n"
+    "inline bvec2 notEqual(vec2 a, vec2 b) { return a != b; }\n"
+    "inline bvec3 notEqual(vec3 a, vec3 b) { return a != b; }\n"
+    "inline bvec4 notEqual(vec4 a, vec4 b) { return a != b; }\n"
+    "inline bvec2 notEqual(ivec2 a, ivec2 b) { return a != b; }\n"
+    "inline bvec3 notEqual(ivec3 a, ivec3 b) { return a != b; }\n"
+    "inline bvec4 notEqual(ivec4 a, ivec4 b) { return a != b; }\n"
+    "inline bvec2 notEqual(bvec2 a, bvec2 b) { return a != b; }\n"
+    "inline bvec3 notEqual(bvec3 a, bvec3 b) { return a != b; }\n"
+    "inline bvec4 notEqual(bvec4 a, bvec4 b) { return a != b; }\n"
+    "inline bvec2 am_bnot(bvec2 a) { return !a; }\n"
+    "inline bvec3 am_bnot(bvec3 a) { return !a; }\n"
+    "inline bvec4 am_bnot(bvec4 a) { return !a; }\n"
+    "\n"
+    "inline mat2 matrixCompMult(mat2 a, mat2 b) { return mat2(a[0]*b[0], a[1]*b[1]); }\n"
+    "inline mat3 matrixCompMult(mat3 a, mat3 b) { return mat3(a[0]*b[0], a[1]*b[1], a[2]*b[2]); }\n"
+    "inline mat4 matrixCompMult(mat4 a, mat4 b) { return mat4(a[0]*b[0], a[1]*b[1], a[2]*b[2], a[3]*b[3]); }\n"
+    "inline mat2 outerProduct(vec2 c, vec2 r) { return mat2(c*r.x, c*r.y); }\n"
+    "inline mat3 outerProduct(vec3 c, vec3 r) { return mat3(c*r.x, c*r.y, c*r.z); }\n"
+    "inline mat4 outerProduct(vec4 c, vec4 r) { return mat4(c*r.x, c*r.y, c*r.z, c*r.w); }\n"
+    "inline mat2 inverse(mat2 m) {\n"
+    "    float d = m[0][0]*m[1][1] - m[1][0]*m[0][1];\n"
+    "    return mat2(m[1][1], -m[0][1], -m[1][0], m[0][0]) * (1.0f / d);\n"
+    "}\n"
+    "inline mat3 inverse(mat3 m) {\n"
+    "    float a00=m[0][0],a01=m[0][1],a02=m[0][2],a10=m[1][0],a11=m[1][1],a12=m[1][2],a20=m[2][0],a21=m[2][1],a22=m[2][2];\n"
+    "    float b01=a22*a11-a12*a21, b11=-a22*a10+a12*a20, b21=a21*a10-a11*a20;\n"
+    "    float invD = 1.0f / (a00*b01 + a01*b11 + a02*b21);\n"
+    "    return mat3(\n"
+    "        vec3(b01, (-a22*a01+a02*a21), (a12*a01-a02*a11)) * invD,\n"
+    "        vec3(b11, (a22*a00-a02*a20), (-a12*a00+a02*a10)) * invD,\n"
+    "        vec3(b21, (-a21*a00+a01*a20), (a11*a00-a01*a10)) * invD);\n"
+    "}\n"
+    "inline mat4 inverse(mat4 m) {\n"
+    "    float c00=m[2][2]*m[3][3]-m[3][2]*m[2][3], c02=m[1][2]*m[3][3]-m[3][2]*m[1][3], c03=m[1][2]*m[2][3]-m[2][2]*m[1][3];\n"
+    "    float c04=m[2][1]*m[3][3]-m[3][1]*m[2][3], c06=m[1][1]*m[3][3]-m[3][1]*m[1][3], c07=m[1][1]*m[2][3]-m[2][1]*m[1][3];\n"
+    "    float c08=m[2][1]*m[3][2]-m[3][1]*m[2][2], c10=m[1][1]*m[3][2]-m[3][1]*m[1][2], c11=m[1][1]*m[2][2]-m[2][1]*m[1][2];\n"
+    "    float c12=m[2][0]*m[3][3]-m[3][0]*m[2][3], c14=m[1][0]*m[3][3]-m[3][0]*m[1][3], c15=m[1][0]*m[2][3]-m[2][0]*m[1][3];\n"
+    "    float c16=m[2][0]*m[3][2]-m[3][0]*m[2][2], c18=m[1][0]*m[3][2]-m[3][0]*m[1][2], c19=m[1][0]*m[2][2]-m[2][0]*m[1][2];\n"
+    "    float c20=m[2][0]*m[3][1]-m[3][0]*m[2][1], c22=m[1][0]*m[3][1]-m[3][0]*m[1][1], c23=m[1][0]*m[2][1]-m[2][0]*m[1][1];\n"
+    "    vec4 f0(c00,c00,c02,c03), f1(c04,c04,c06,c07), f2(c08,c08,c10,c11);\n"
+    "    vec4 f3(c12,c12,c14,c15), f4(c16,c16,c18,c19), f5(c20,c20,c22,c23);\n"
+    "    vec4 v0(m[1][0],m[0][0],m[0][0],m[0][0]), v1(m[1][1],m[0][1],m[0][1],m[0][1]);\n"
+    "    vec4 v2(m[1][2],m[0][2],m[0][2],m[0][2]), v3(m[1][3],m[0][3],m[0][3],m[0][3]);\n"
+    "    vec4 i0(v1*f0 - v2*f1 + v3*f2), i1(v0*f0 - v2*f3 + v3*f4), i2(v0*f1 - v1*f3 + v3*f5), i3(v0*f2 - v1*f4 + v2*f5);\n"
+    "    vec4 sA(+1,-1,+1,-1), sB(-1,+1,-1,+1);\n"
+    "    mat4 inv(i0*sA, i1*sB, i2*sA, i3*sB);\n"
+    "    vec4 r0(inv[0][0], inv[1][0], inv[2][0], inv[3][0]);\n"
+    "    return inv * (1.0f / metal::dot(m[0], r0));\n"
+    "}\n"
+    "// --- End AMMod GLSL-ES-to-MSL Compatibility Preamble ---\n\n";
+}
+
+static NSString *AMGLSLWrapperExtraMethods(void) {
+    return @"\n"
+    "    vec4 texture2D(texture2d<half> t, vec2 p, float bias) { return vec4(t.sample(textureSampler, p)); }\n"
+    "    vec4 texture2DCv(texture2d<half> t, vec2 p, float bias) { return texture2DCv(t, p); }\n"
+    "    vec4 texture2D(AC_ImageInfo info, vec2 p) { return texture2D(info.texture, p); }\n"
+    "    vec4 texture2DCv(AC_ImageInfo info, vec2 p) { return texture2DCv(info.texture, p); }\n"
+    "    vec4 texture(texture2d<half> t, vec2 p) { return texture2D(t, p); }\n"
+    "    vec4 texture(texture2d<half> t, vec2 p, float bias) { return texture2D(t, p); }\n"
+    "    vec4 texture(AC_ImageInfo info, vec2 p) { return texture2D(info.texture, p); }\n";
+}
+
+static NSString *AMSanitizeUserGLSLBody(NSString *body) {
+    NSMutableString *s = [body mutableCopy];
+
+    // 1. Strip #version and #extension directives
+    {
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"^[ \\t]*#(?:version|extension)\\b[^\\n]*$"
+                                                                            options:NSRegularExpressionAnchorsMatchLines
+                                                                              error:nil];
+        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@""];
+    }
+
+    // 2. Strip `precision highp/mediump/lowp float/int/sampler2D;` statements
+    {
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\bprecision\\s+(?:highp|mediump|lowp)\\s+\\w+\\s*;"
+                                                                            options:0
+                                                                              error:nil];
+        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@""];
+    }
+
+    // 3. Strip standalone top-level `uniform ...;`, `varying ...;`, `attribute ...;` declarations
+    {
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"^[ \\t]*(?:uniform|varying|attribute)\\s+[^;\\n]+;"
+                                                                            options:NSRegularExpressionAnchorsMatchLines
+                                                                              error:nil];
+        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@""];
+    }
+
+    // 4. Preserve compile-time `const int NAME = INT_EXPR;` (avoid `#define const` breaking array bounds)
+    {
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\bconst\\s+int\\s+([A-Za-z_]\\w*)\\s*=\\s*([0-9+\\-*/()\\s]+);"
+                                                                            options:0
+                                                                              error:nil];
+        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"static constexpr int $1 = $2;"];
+    }
+
+    // 5. Rewrite GLSL `out` / `inout` function parameters to MSL `thread T&`
+    {
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\b(?:inout|out)\\s+(?:(?:highp|mediump|lowp)\\s+)?(float|int|uint|bool|vec[234]|ivec[234]|uvec[234]|bvec[234]|mat[234])\\s+([A-Za-z_]\\w*)"
+                                                                            options:0
+                                                                              error:nil];
+        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"thread $1& $2"];
+    }
+
+    // 6. Rewrite GLSL array constructors `float[N](...)` / `vec2[](...)` -> `{...}`
+    {
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\b(?:float|int|uint|bool|vec[234]|ivec[234]|mat[234])\\s*\\[\\s*\\d*\\s*\\]\\s*\\(([^()]*)\\)"
+                                                                            options:0
+                                                                              error:nil];
+        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"{$1}"];
+    }
+
+    // 7. Rewrite GLSL struct aggregate constructor calls `MyStruct(a, b)` -> `MyStruct{a, b}`
+    {
+        NSRegularExpression *structDeclRx = [NSRegularExpression regularExpressionWithPattern:@"\\bstruct\\s+([A-Za-z_]\\w*)\\s*\\{"
+                                                                                      options:0
+                                                                                        error:nil];
+        NSArray<NSTextCheckingResult *> *decls = [structDeclRx matchesInString:s options:0 range:NSMakeRange(0, s.length)];
+        NSMutableSet<NSString *> *structNames = [NSMutableSet set];
+        for (NSTextCheckingResult *m in decls) {
+            if (m.numberOfRanges > 1) {
+                [structNames addObject:[s substringWithRange:[m rangeAtIndex:1]]];
+            }
+        }
+        for (NSString *sname in structNames) {
+            NSString *pat = [NSString stringWithFormat:@"(?<!struct\\s)\\b%@\\s*\\(([^()]*)\\)", [NSRegularExpression escapedPatternForString:sname]];
+            NSRegularExpression *callRx = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
+            [callRx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length)
+                              withTemplate:[NSString stringWithFormat:@"%@{$1}", sname]];
+        }
+    }
+
+    // 8. Rewrite GLSL `not(...)` boolean vector built-in (C++ keyword collision)
+    {
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\bnot\\s*\\(" options:0 error:nil];
+        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"am_bnot("];
+    }
+
+    // 9. Rewrite extra GLSL multi-component `.stpq` swizzles missed by iOS's `.st/.s/.t` regex
+    NSDictionary<NSString *, NSString *> *swizzles = @{
+        @"\\.stpq(?![A-Za-z0-9_])": @".xyzw",
+        @"\\.stp(?![A-Za-z0-9_])":  @".xyz",
+        @"\\.ts(?![A-Za-z0-9_])":   @".yx",
+        @"\\.ss(?![A-Za-z0-9_])":   @".xx",
+        @"\\.tt(?![A-Za-z0-9_])":   @".yy",
+        @"\\.pq(?![A-Za-z0-9_])":   @".zw",
+    };
+    for (NSString *pat in swizzles) {
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
+        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:swizzles[pat]];
+    }
+
+    return s;
+}
+
+static NSString *AMTranspileGLSLWrapperToMSL(NSString *source) {
+    if (!source || ![source containsString:@"AC_ShaderWrapper"]) return nil;
+    NSMutableString *out = [source mutableCopy];
+
+    // A. Inject global GLSL compatibility preamble right before `struct AC_ShaderWrapper`
+    NSRange wrapperRange = [out rangeOfString:@"struct AC_ShaderWrapper"];
+    if (wrapperRange.location == NSNotFound) return nil;
+    [out insertString:AMGLSLGlobalCompatPreamble() atIndex:wrapperRange.location];
+
+    // B. Inject extra texture2D / texture2DCv / texture overloads inside AC_ShaderWrapper
+    NSRange getTexRange = [out rangeOfString:@"vec2 getTexSize("];
+    if (getTexRange.location != NSNotFound) {
+        [out insertString:AMGLSLWrapperExtraMethods() atIndex:getTexRange.location];
+    }
+
+    // C. Inject extra Android uniform & precision #defines right after `#define acPass`
+    NSRange acPassRange = [out rangeOfString:@"#define acPass"];
+    if (acPassRange.location != NSNotFound) {
+        NSRange nl = [out rangeOfString:@"\n" options:0 range:NSMakeRange(acPassRange.location, out.length - acPassRange.location)];
+        if (nl.location != NSNotFound) {
+            NSString *extraDefines =
+                @"#define acProjectSize (acScreenSize)\n"
+                @"#define acLayerSizeNorm (acLayerSize / max(acScreenSize, vec2(1.0)))\n"
+                @"#define acLTS (acLayerToScreen)\n"
+                @"#define highp\n"
+                @"#define mediump\n"
+                @"#define lowp\n";
+            [out insertString:extraDefines atIndex:nl.location + 1];
+        }
+    }
+
+    // D. Sanitize user GLSL body between `#define discard` line and `#undef acScreenToLayer`
+    NSRange discardDef = [out rangeOfString:@"#define discard"];
+    NSRange undefStart = [out rangeOfString:@"#undef acScreenToLayer"];
+    if (discardDef.location != NSNotFound && undefStart.location != NSNotFound && undefStart.location > discardDef.location) {
+        NSRange nl = [out rangeOfString:@"\n" options:0 range:NSMakeRange(discardDef.location, undefStart.location - discardDef.location)];
+        if (nl.location != NSNotFound && nl.location + 1 < undefStart.location) {
+            NSRange bodyRange = NSMakeRange(nl.location + 1, undefStart.location - (nl.location + 1));
+            NSString *rawBody = [out substringWithRange:bodyRange];
+            NSString *fixedBody = AMSanitizeUserGLSLBody(rawBody);
+            [out replaceCharactersInRange:bodyRange withString:fixedBody];
+        }
+    }
+
+    // E. Undefine our extra macros right after `#undef discard`
+    NSRange undefDiscard = [out rangeOfString:@"#undef discard"];
+    if (undefDiscard.location != NSNotFound) {
+        NSUInteger pos = NSMaxRange(undefDiscard);
+        [out insertString:@"\n#undef acProjectSize\n#undef acLayerSizeNorm\n#undef acLTS\n#undef highp\n#undef mediump\n#undef lowp\n" atIndex:pos];
+    }
+
+    return out;
+}
+
+static void AMLogShaderCompileFailure(NSError *err, NSString *mslSource) {
+    @try {
+        NSString *logPath = [AMCustomEffectsDir() stringByAppendingPathComponent:@"last_shader_error.txt"];
+        NSString *msg = [NSString stringWithFormat:@"=== Metal Compile Error ===\n%@\n\n=== Transpiled MSL ===\n%@\n",
+                         err.localizedDescription ?: @"(no error)", mslSource ?: @""];
+        [msg writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (NSException *ignored) {}
+}
+
+static id<MTLLibrary> AMHook_newLibraryWithSource(id self, SEL _cmd, NSString *source, MTLCompileOptions *options, NSError **error) {
+    if (!gOrigNewLibraryWithSource) return nil;
+
+    NSError *firstErr = nil;
+    id<MTLLibrary> lib = gOrigNewLibraryWithSource(self, _cmd, source, options, &firstErr);
+    if (lib != nil) {
+        if (error) *error = firstErr;
+        return lib;
+    }
+
+    if (source && [source containsString:@"AC_ShaderWrapper"]) {
+        NSString *transpiled = AMTranspileGLSLWrapperToMSL(source);
+        if (transpiled && ![transpiled isEqualToString:source]) {
+            NSError *retryErr = nil;
+            id<MTLLibrary> retryLib = gOrigNewLibraryWithSource(self, _cmd, transpiled, options, &retryErr);
+            if (retryLib != nil) {
+                if (error) *error = nil;
+                return retryLib;
+            }
+            AMLogShaderCompileFailure(retryErr ?: firstErr, transpiled);
+            if (error) *error = retryErr ?: firstErr;
+            return nil;
+        }
+    }
+
+    if (error) *error = firstErr;
+    return nil;
+}
+
+static void AMInstallMetalShaderCompatHook(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (!dev) return;
+        Class devCls = object_getClass(dev);
+        if (!devCls) return;
+        SEL sel = @selector(newLibraryWithSource:options:error:);
+        Method m = class_getInstanceMethod(devCls, sel);
+        if (!m) return;
+        gOrigNewLibraryWithSource = (id<MTLLibrary> (*)(id, SEL, NSString *, MTLCompileOptions *, NSError **))
+            method_setImplementation(m, (IMP)AMHook_newLibraryWithSource);
+    });
 }
 
 static NSMutableDictionary<NSString *, NSString *> *AMLoadCustomThumbMap(void) {
@@ -5348,6 +5777,7 @@ static void AlightMotionModsInit(void) {
 
     dispatch_async(dispatch_get_main_queue(), ^{
         AMInstallCustomEffectCategoryIfNeeded();
+        AMInstallMetalShaderCompatHook();
     });
 
     [[AMHomepageSearchOverlayManager shared] start];
