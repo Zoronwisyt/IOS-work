@@ -2798,21 +2798,38 @@ static void AMSwiftRelease(void *obj, intptr_t slide) {
     ((ReleaseFn)(0x1025bb80cULL + slide))(obj);
 }
 
-static void *AMHolderGetSelectedIdsArray(void *holder, intptr_t slide) {
-    if (!holder) return NULL;
-    void *selectedArr = NULL;
-    uintptr_t getSelectedFn = (uintptr_t)(0x1003959f0ULL + slide);
-    __asm__ volatile(
-        "mov x20, %1\n"
-        "blr %2\n"
-        "mov %0, x0\n"
-        : "=r"(selectedArr)
-        : "r"(holder), "r"(getSelectedFn)
-        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
-          "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
-          "x16", "x17", "x20", "memory"
-    );
-    return selectedArr;
+static BOOL AMReadHolderSelectedIds(void *holder, intptr_t slide, uint64_t **outIds, NSUInteger *outCount) {
+    if (outIds) *outIds = NULL;
+    if (outCount) *outCount = 0;
+    if (!holder || !outIds || !outCount) return NO;
+
+    ptrdiff_t selOff = *(ptrdiff_t *)(0x103332390ULL + slide);
+    const uint8_t *selSlot = (const uint8_t *)holder + selOff;
+    uint64_t rawVal = *(const uint64_t *)selSlot;
+    uint8_t tag = selSlot[8];
+    uint8_t kind = tag >> 6;
+
+    if (kind == 0) {
+        // Single selection: rawVal is the ElementId
+        uint64_t *buf = (uint64_t *)malloc(sizeof(uint64_t));
+        if (!buf) return NO;
+        buf[0] = rawVal;
+        *outIds = buf;
+        *outCount = 1;
+        return YES;
+    } else if (kind == 1 && rawVal != 0) {
+        // Multi selection: rawVal is Swift._ContiguousArrayStorage<ElementId> *
+        const uint8_t *arr = (const uint8_t *)rawVal;
+        int64_t cnt = *(const int64_t *)(arr + 0x10);
+        if (cnt <= 0 || cnt > 100000) return NO;
+        uint64_t *buf = (uint64_t *)malloc((size_t)cnt * sizeof(uint64_t));
+        if (!buf) return NO;
+        memcpy(buf, arr + 0x20, (size_t)cnt * sizeof(uint64_t));
+        *outIds = buf;
+        *outCount = (NSUInteger)cnt;
+        return YES;
+    }
+    return NO;
 }
 
 static void *AMSwiftArrayStorageForObj(id obj, const char *ivarName) {
@@ -2885,19 +2902,23 @@ static void AMMultiParentEditCallback(void *scenePtr) {
     ((CopyFn)(0x100019e78ULL + slide))(scenePtr, sceneCopy, (void *)(0x1003c6b10ULL + slide));
 
     // Ensure COW uniqueness on scene.elements before mutating elements in-place
-    typedef void (*MakeUniqueFn)(void *elMetaArg);
-    MakeUniqueFn makeUnique = (MakeUniqueFn)dlsym(RTLD_DEFAULT, "$sSa36_makeUniqueAndReserveCapacityIfNotUniqueyyF");
+    void *makeUnique = dlsym(RTLD_DEFAULT, "$sSa36_makeUniqueAndReserveCapacityIfNotUniqueyyF");
     void **elementsField = (void **)((uint8_t *)scenePtr + elementsOff);
     if (makeUnique && *elementsField) {
+        struct { uint64_t selfPtr, metaPtr, fnPtr; } uArgs = {
+            (uint64_t)elementsField, (uint64_t)elMeta, (uint64_t)makeUnique
+        };
         __asm__ volatile(
-            "mov x20, %0\n"
-            "mov x0, %1\n"
-            "blr %2\n"
+            "mov x9, %0\n"
+            "ldr x20, [x9, #0]\n"
+            "ldr x0,  [x9, #8]\n"
+            "ldr x16, [x9, #16]\n"
+            "blr x16\n"
             :
-            : "r"(elementsField), "r"(elMeta), "r"(makeUnique)
+            : "r"(&uArgs)
             : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
               "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
-              "x16", "x17", "x20", "memory"
+              "x16", "x17", "x20", "x30", "memory"
         );
     }
 
@@ -2909,7 +2930,7 @@ static void AMMultiParentEditCallback(void *scenePtr) {
 
         uintptr_t setParentAddr = (uintptr_t)(0x1003ebba4ULL + slide);
         uint64_t parentId = gAMMultiParentCtx.hasParent ? gAMMultiParentCtx.targetParentId : 0;
-        uint32_t isNil = gAMMultiParentCtx.hasParent ? 0 : 1;
+        uint64_t isNil = gAMMultiParentCtx.hasParent ? 0 : 1;
         int64_t curTime = gAMMultiParentCtx.currentTime;
 
         for (int64_t i = 0; i < count; i++) {
@@ -2922,18 +2943,24 @@ static void AMMultiParentEditCallback(void *scenePtr) {
                 AMWouldCreateParentCycle(eid, parentId, basePtr, count, elStride, parentIdOff)) {
                 continue;
             }
+            struct { uint64_t a0, a1, a2, a3, a20, fn; } spArgs = {
+                (uint64_t)sceneCopy, parentId, isNil, (uint64_t)curTime, (uint64_t)elPtr, (uint64_t)setParentAddr
+            };
             __asm__ volatile(
-                "mov x0, %0\n"
-                "mov x1, %1\n"
-                "mov w2, %w2\n"
-                "mov x3, %3\n"
-                "mov x20, %4\n"
-                "blr %5\n"
+                "mov x9, %0\n"
+                "ldr x0,  [x9, #0]\n"
+                "ldr x1,  [x9, #8]\n"
+                "ldr x2,  [x9, #16]\n"
+                "ldr x3,  [x9, #24]\n"
+                "ldr x20, [x9, #32]\n"
+                "ldr x16, [x9, #40]\n"
+                "blr x16\n"
                 :
-                : "r"(sceneCopy), "r"(parentId), "r"(isNil), "r"(curTime), "r"(elPtr), "r"(setParentAddr)
+                : "r"(&spArgs)
                 : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
                   "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
-                  "x16", "x17", "x20", "memory", "v0", "v1", "v2", "v3"
+                  "x16", "x17", "x20", "x30", "memory",
+                  "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"
             );
         }
     }
@@ -2963,19 +2990,16 @@ static void AMOnTapMultiParent(id self, SEL _cmd, UIButton *sender) {
     void *holder = AMSwiftWeakLoadHolder(self, slide);
     if (!holder) return;
 
-    // Grab first selected layer ID so LayerParentingVC.willDisplayCell can populate cells
+    // Grab first selected layer ID directly from holder.selection so LayerParentingVC.willDisplayCell populates cells
     uint64_t firstSelId = 0;
     BOOL hasFirstSel = NO;
-    void *selArr = AMHolderGetSelectedIdsArray(holder, slide);
-    if (selArr) {
-        int64_t cnt = *(int64_t *)((uint8_t *)selArr + 0x10);
-        if (cnt > 0) {
-            firstSelId = *(const uint64_t *)((uint8_t *)selArr + 0x20);
-            hasFirstSel = YES;
-        }
-        typedef void (*BridgeReleaseFn)(void *);
-        ((BridgeReleaseFn)(0x1025bb404ULL + slide))(selArr);
+    uint64_t *selIds = NULL;
+    NSUInteger selCount = 0;
+    if (AMReadHolderSelectedIds(holder, slide, &selIds, &selCount) && selCount > 0) {
+        firstSelId = selIds[0];
+        hasFirstSel = YES;
     }
+    if (selIds) free(selIds);
 
     // Instantiate LayerParentingVC via native factory 0x10099e2c0(x0=holder, x20=LayerParentingVC.Type)
     typedef void *(*MetaFn)(uintptr_t);
@@ -2983,18 +3007,24 @@ static void AMOnTapMultiParent(id self, SEL _cmd, UIButton *sender) {
     void *lpvcRaw = NULL;
     if (lpMeta) {
         AMSwiftRetain(holder, slide);
-        uintptr_t factoryFn = (uintptr_t)(0x10099e2c0ULL + slide);
+        struct { uint64_t a0, a20, fn, ret; } fArgs = {
+            (uint64_t)holder, (uint64_t)lpMeta, (uint64_t)(0x10099e2c0ULL + slide), 0
+        };
         __asm__ volatile(
-            "mov x0, %1\n"
-            "mov x20, %2\n"
-            "blr %3\n"
-            "mov %0, x0\n"
-            : "=r"(lpvcRaw)
-            : "r"(holder), "r"(lpMeta), "r"(factoryFn)
+            "mov x9, %0\n"
+            "ldr x0,  [x9, #0]\n"
+            "ldr x20, [x9, #8]\n"
+            "ldr x16, [x9, #16]\n"
+            "blr x16\n"
+            "mov x9, %0\n"
+            "str x0,  [x9, #24]\n"
+            :
+            : "r"(&fArgs)
             : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
               "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
-              "x16", "x17", "x20", "memory"
+              "x16", "x17", "x20", "x30", "memory"
         );
+        lpvcRaw = (void *)fArgs.ret;
         AMSwiftRelease(holder, slide);
     }
     AMSwiftRelease(holder, slide);
@@ -3163,37 +3193,40 @@ static void AMHook_layerParentingDidSelectRow(id self, SEL _cmd, UITableView *ta
 
     void *holder = AMSwiftWeakLoadHolder(navVC, slide);
     if (holder) {
-        void *selectedArr = AMHolderGetSelectedIdsArray(holder, slide);
-        if (selectedArr) {
-            int64_t selCount = *(int64_t *)((uint8_t *)selectedArr + 0x10);
-            if (selCount > 0) {
-                const uint64_t *selIds = (const uint64_t *)((uint8_t *)selectedArr + 0x20);
-                gAMMultiParentCtx.selectedIds = selIds;
-                gAMMultiParentCtx.selectedCount = (NSUInteger)selCount;
-                gAMMultiParentCtx.targetParentId = targetParentId;
-                gAMMultiParentCtx.hasParent = hasParent;
-                gAMMultiParentCtx.currentTime = AMReadHolderCurrentTime(holder, slide);
+        uint64_t *selIds = NULL;
+        NSUInteger selCount = 0;
+        if (AMReadHolderSelectedIds(holder, slide, &selIds, &selCount) && selCount > 0) {
+            gAMMultiParentCtx.selectedIds = selIds;
+            gAMMultiParentCtx.selectedCount = selCount;
+            gAMMultiParentCtx.targetParentId = targetParentId;
+            gAMMultiParentCtx.hasParent = hasParent;
+            gAMMultiParentCtx.currentTime = AMReadHolderCurrentTime(holder, slide);
 
-                uintptr_t performEditFn = (uintptr_t)(0x100392588ULL + slide);
-                uintptr_t cbPtr = (uintptr_t)AMMultiParentEditCallback;
-                __asm__ volatile(
-                    "mov w0, #4\n"
-                    "mov x1, #0\n"
-                    "mov w2, #2\n"
-                    "mov x3, %0\n"
-                    "mov x4, #0\n"
-                    "mov x20, %1\n"
-                    "blr %2\n"
-                    :
-                    : "r"(cbPtr), "r"(holder), "r"(performEditFn)
-                    : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
-                      "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
-                      "x16", "x17", "x20", "memory"
-                );
-            }
-            typedef void (*BridgeReleaseFn)(void *);
-            ((BridgeReleaseFn)(0x1025bb404ULL + slide))(selectedArr);
+            struct { uint64_t cb, holderPtr, fn; } peArgs = {
+                (uint64_t)AMMultiParentEditCallback, (uint64_t)holder, (uint64_t)(0x100392588ULL + slide)
+            };
+            __asm__ volatile(
+                "mov x9, %0\n"
+                "mov w0, #4\n"
+                "mov x1, #0\n"
+                "mov w2, #2\n"
+                "ldr x3,  [x9, #0]\n"
+                "mov x4, #0\n"
+                "ldr x20, [x9, #8]\n"
+                "ldr x16, [x9, #16]\n"
+                "blr x16\n"
+                :
+                : "r"(&peArgs)
+                : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+                  "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+                  "x16", "x17", "x20", "x30", "memory",
+                  "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"
+            );
+
+            gAMMultiParentCtx.selectedIds = NULL;
+            gAMMultiParentCtx.selectedCount = 0;
         }
+        if (selIds) free(selIds);
         AMSwiftRelease(holder, slide);
     }
 
