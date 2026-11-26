@@ -31,6 +31,7 @@ static NSInteger gPreviewDivisor = 1; // 1=Full, 2=Half, 3=Third, 4=Quarter
 static __weak AVPlayer *gActivePreviewPlayer = nil;
 static IMP gOrigReplaceCurrentItem = NULL;
 static IMP gOrigInitWithPlayerItem = NULL;
+static IMP gOrigDataTaskWithRequestCompletion = NULL;
 
 // ============================================================================
 // Theme Helpers
@@ -263,6 +264,50 @@ static void AMHook_previewControlBarViewDidLoad(id self, SEL _cmd) {
     }
 
     objc_setAssociatedObject(self, kAMQualityButtonAssocKey, qBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// ============================================================================
+// Module 2A: Fix `getProjectMetadata` INTERNAL / sub-required-size on Sideloaded IPA
+// ============================================================================
+// Sideloaded IPAs send invalid Firebase AppCheck / Auth headers to `getProjectMetadata`,
+// causing Firebase Functions to return `INTERNAL`. Stripping those headers yields a clean
+// HTTP 200 JSON response, and normalizing `download` -> "allowed" lets Alight Motion's
+// native PackageImporter download `projectfiles.zip` directly from Firebase Storage.
+
+static id AMHook_dataTaskWithRequestCompletion(id self, SEL _cmd, NSURLRequest *request, void (^completionHandler)(NSData * _Nullable, NSURLResponse * _Nullable, NSError * _Nullable)) {
+    NSString *urlStr = request.URL.absoluteString;
+    if (urlStr && [urlStr containsString:@"/getProjectMetadata"] && completionHandler != nil) {
+        NSMutableURLRequest *cleanReq = [request mutableCopy];
+        [cleanReq setValue:nil forHTTPHeaderField:@"Authorization"];
+        [cleanReq setValue:nil forHTTPHeaderField:@"X-Firebase-AppCheck"];
+        [cleanReq setValue:nil forHTTPHeaderField:@"Firebase-Instance-ID-Token"];
+        if (![cleanReq valueForHTTPHeaderField:@"Content-Type"]) {
+            [cleanReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        }
+
+        void (^wrapped)(NSData * _Nullable, NSURLResponse * _Nullable, NSError * _Nullable) =
+            ^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+                NSData *outData = data;
+                if (!error && data.length > 0) {
+                    id obj = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+                    if ([obj isKindOfClass:[NSMutableDictionary class]]) {
+                        NSMutableDictionary *root = (NSMutableDictionary *)obj;
+                        NSMutableDictionary *res = [root[@"result"] isKindOfClass:[NSMutableDictionary class]] ? root[@"result"] : nil;
+                        if (res && [res[@"result"] isEqualToString:@"success"]) {
+                            res[@"download"] = @"allowed";
+                            res[@"message"] = [NSNull null];
+                            NSData *reencoded = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
+                            if (reencoded) outData = reencoded;
+                        }
+                    }
+                }
+                completionHandler(outData, response, error);
+            };
+
+        return ((id (*)(id, SEL, NSURLRequest *, id))gOrigDataTaskWithRequestCompletion)(self, _cmd, cleanReq, wrapped);
+    }
+
+    return ((id (*)(id, SEL, NSURLRequest *, id))gOrigDataTaskWithRequestCompletion)(self, _cmd, request, completionHandler);
 }
 
 // ============================================================================
@@ -1409,6 +1454,11 @@ static void AlightMotionModsInit(void) {
     if (saved >= 1 && saved <= 4) {
         gPreviewDivisor = saved;
     }
+
+    AMSwizzleMethod(@"NSURLSession",
+                    @"dataTaskWithRequest:completionHandler:",
+                    (IMP)AMHook_dataTaskWithRequestCompletion,
+                    &gOrigDataTaskWithRequestCompletion);
 
     AMSwizzleMethod(@"AVPlayer",
                     @"replaceCurrentItemWithPlayerItem:",
