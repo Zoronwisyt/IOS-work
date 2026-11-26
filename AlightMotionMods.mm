@@ -3021,7 +3021,7 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
     self.canvasView.translatesAutoresizingMaskIntoConstraints = NO;
     self.canvasView.curve = initialCurve;
     self.canvasView.baseSpeed = baseSpeed;
-    __weak typeof(self) weakSelf = self;
+    __weak AMSpeedGraphPanelVC *weakSelf = self;
     self.canvasView.onCurveChanged = ^(AMSpeedBezierCurve c, BOOL finished) {
         [weakSelf applyCurveToLayer:c commit:finished];
     };
@@ -3276,7 +3276,7 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Speed Graph"
                                                                    message:nil
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
-    __weak typeof(self) weakSelf = self;
+    __weak AMSpeedGraphPanelVC *weakSelf = self;
     [sheet addAction:[UIAlertAction actionWithTitle:@"Reset to Linear (1.0x)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         AMSpeedBezierCurve lin = {0.0, 0.0, 1.0, 1.0};
         weakSelf.canvasView.baseSpeed = 1.0;
