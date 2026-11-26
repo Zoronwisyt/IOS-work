@@ -1142,6 +1142,13 @@ static void *const kAMUserCatFilters[kAMMaxUserCategories] = {
     (void *)&AMUserCategoryFilter_30, (void *)&AMUserCategoryFilter_31,
 };
 
+static uint8_t AMEditCategoriesDummyFilter(void *effectPtr) {
+    (void)effectPtr;
+    return 0;
+}
+
+static const int64_t kAMEditCategoriesSentinelId = 999;
+
 static NSMutableArray<NSDictionary *> *gAMActiveRuntimeCategories = nil;
 
 static void AMMigrateCustomEffectXMLCategories(void) {
@@ -1309,6 +1316,30 @@ static void AMInstallCustomEffectCategoryIfNeeded(void) {
             slot++;
         }
 
+        // 3B. Append native "Edit Categories" rectangle cell at the bottom of the categories grid
+        if (finalCount < 63) {
+            AMSwiftString editNameSw = AMMakeSwiftString(@"Edit Categories");
+            AMEffectCategoryEntry editEntry;
+            editEntry.catId = kAMEditCategoriesSentinelId;
+            editEntry.nameLo = editNameSw.lo;
+            editEntry.nameHi = editNameSw.hi;
+            editEntry.thumbLo = 0;
+            editEntry.thumbHi = 0;
+            editEntry.filterFn = (void *)&AMEditCategoriesDummyFilter;
+            editEntry.filterCtx = NULL;
+            finalEntries[finalCount++] = editEntry;
+
+            [gAMActiveRuntimeCategories addObject:@{
+                @"id": @(kAMEditCategoriesSentinelId),
+                @"name": @"Edit Categories",
+                @"slug": @"__edit_categories__",
+                @"image": @"",
+                @"isUser": @NO,
+                @"isCustom": @NO,
+                @"isEditAction": @YES,
+            }];
+        }
+
         if (hasExp && finalCount < 64) {
             if (expEntry.nameHi) swiftBridgeRetain((void *)expEntry.nameHi);
             if (expEntry.thumbHi) swiftBridgeRetain((void *)expEntry.thumbHi);
@@ -1336,9 +1367,18 @@ static void AMInstallCustomEffectCategoryIfNeeded(void) {
 static UILabel *AMFindFirstLabelInView(UIView *v);
 static UIImageView *AMFindLargestImageViewInView(UIView *v);
 static IMP gOrigEffectMainWillDisplayCell = NULL;
-static IMP gOrigEffectMainViewDidAppear = NULL;
+static IMP gOrigEffectMainDidSelectItem = NULL;
 static const void *kAMCustomCatGradKey = &kAMCustomCatGradKey;
-static const void *kAMManageCatBtnKey = &kAMManageCatBtnKey;
+
+static UICollectionView *AMCategoriesCollectionViewOfMainVC(id vc) {
+    if (!vc) return nil;
+    SEL sel = NSSelectorFromString(@"categoriesCollectionView");
+    if ([vc respondsToSelector:sel]) {
+        id obj = ((id (*)(id, SEL))objc_msgSend)(vc, sel);
+        if ([obj isKindOfClass:[UICollectionView class]]) return (UICollectionView *)obj;
+    }
+    return nil;
+}
 
 static UIImageView *AMMainCellThumbnailImageView(UICollectionViewCell *cell) {
     if (!cell) return nil;
@@ -1374,10 +1414,13 @@ static void AMHook_effectMainWillDisplayCell(id self, SEL _cmd, UICollectionView
         ((void (*)(id, SEL, UICollectionView *, UICollectionViewCell *, NSIndexPath *))gOrigEffectMainWillDisplayCell)(self, _cmd, cv, cell, indexPath);
     }
     if (!cell) return;
+    UICollectionView *catCV = AMCategoriesCollectionViewOfMainVC(self);
+    if (catCV && cv != catCV) return;
 
     NSDictionary *catInfo = AMRuntimeCategoryForCell(cell, indexPath);
     NSString *imgFile = catInfo[@"image"];
-    if (catInfo[@"id"]) {
+    BOOL isEditAction = [catInfo[@"isEditAction"] boolValue];
+    if (!isEditAction && catInfo[@"id"]) {
         NSDictionary *liveCfg = AMLoadCategoriesConfig();
         NSString *idKey = [NSString stringWithFormat:@"%@", catInfo[@"id"]];
         NSDictionary *ov = liveCfg[@"overrides"][idKey];
@@ -1393,7 +1436,7 @@ static void AMHook_effectMainWillDisplayCell(id self, SEL _cmd, UICollectionView
         }
     }
 
-    UIImage *customBg = (imgFile.length > 0) ? AMLoadCategoryThumbImage(imgFile) : nil;
+    UIImage *customBg = (!isEditAction && imgFile.length > 0) ? AMLoadCategoryThumbImage(imgFile) : nil;
     BOOL isUserOrCustom = [catInfo[@"isUser"] boolValue];
     UIImageView *thumbIV = AMMainCellThumbnailImageView(cell);
     CAGradientLayer *grad = objc_getAssociatedObject(cell, kAMCustomCatGradKey);
@@ -1406,7 +1449,7 @@ static void AMHook_effectMainWillDisplayCell(id self, SEL _cmd, UICollectionView
             thumbIV.hidden = NO;
         }
         if (grad) grad.hidden = YES;
-    } else if (isUserOrCustom) {
+    } else if (isEditAction || isUserOrCustom) {
         if (thumbIV) {
             thumbIV.image = nil;
         }
@@ -1417,8 +1460,13 @@ static void AMHook_effectMainWillDisplayCell(id self, SEL _cmd, UICollectionView
             [cell.contentView.layer insertSublayer:grad atIndex:0];
             objc_setAssociatedObject(cell, kAMCustomCatGradKey, grad, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
-        BOOL isMainCustom = [catInfo[@"isCustom"] boolValue];
-        if (isMainCustom) {
+        if (isEditAction) {
+            // Subtle native Alight Motion dark slate gradient matching Other/Custom bars
+            grad.colors = @[
+                (id)[UIColor colorWithRed:0.165 green:0.176 blue:0.251 alpha:1.0].CGColor,
+                (id)[UIColor colorWithRed:0.125 green:0.133 blue:0.192 alpha:1.0].CGColor,
+            ];
+        } else if ([catInfo[@"isCustom"] boolValue]) {
             grad.colors = @[
                 (id)[UIColor colorWithRed:0.15 green:0.20 blue:0.35 alpha:1.0].CGColor,
                 (id)[UIColor colorWithRed:0.12 green:0.30 blue:0.28 alpha:1.0].CGColor,
@@ -2276,73 +2324,22 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
 
 @end
 
-@interface AMCategoryManagerPresenter : NSObject
-+ (void)onTapManageCategories:(UIButton *)btn;
-@end
-
-@implementation AMCategoryManagerPresenter
-+ (void)onTapManageCategories:(UIButton *)btn {
-    UIViewController *vc = objc_getAssociatedObject(btn, kAMManageCatBtnKey);
-    if (!vc) return;
-    AMEffectCategoriesManagerVC *mgr = [[AMEffectCategoriesManagerVC alloc] init];
-    mgr.modalPresentationStyle = UIModalPresentationPageSheet;
-    [vc presentViewController:mgr animated:YES completion:nil];
-}
-@end
-
-static void AMHook_effectMainViewDidAppear(id self, SEL _cmd, BOOL animated) {
-    if (gOrigEffectMainViewDidAppear) {
-        ((void (*)(id, SEL, BOOL))gOrigEffectMainViewDidAppear)(self, _cmd, animated);
+static void AMHook_effectMainDidSelectItem(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
+    UICollectionView *catCV = AMCategoriesCollectionViewOfMainVC(self);
+    if (catCV && cv == catCV && indexPath && indexPath.item >= 0 && (NSUInteger)indexPath.item < gAMActiveRuntimeCategories.count) {
+        NSDictionary *catInfo = gAMActiveRuntimeCategories[(NSUInteger)indexPath.item];
+        if ([catInfo[@"isEditAction"] boolValue]) {
+            [cv deselectItemAtIndexPath:indexPath animated:YES];
+            UIViewController *vc = (UIViewController *)self;
+            AMEffectCategoriesManagerVC *mgr = [[AMEffectCategoriesManagerVC alloc] init];
+            mgr.modalPresentationStyle = UIModalPresentationPageSheet;
+            [vc presentViewController:mgr animated:YES completion:nil];
+            return;
+        }
     }
-    UIViewController *vc = (UIViewController *)self;
-    if (objc_getAssociatedObject(vc, kAMManageCatBtnKey)) return;
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (objc_getAssociatedObject(vc, kAMManageCatBtnKey)) return;
-        UIView *catCV = nil;
-        @try {
-            id obj = [vc valueForKey:@"categoriesCollectionView"];
-            if ([obj isKindOfClass:[UIView class]]) catCV = (UIView *)obj;
-        } @catch (NSException *ex) { (void)ex; }
-
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.translatesAutoresizingMaskIntoConstraints = NO;
-        [btn setTitle:@"Edit Categories" forState:UIControlStateNormal];
-        [btn setTitleColor:[UIColor colorWithWhite:0.90 alpha:1.0] forState:UIControlStateNormal];
-        btn.titleLabel.font = AMThemeFont(11.0, UIFontWeightSemibold);
-        btn.backgroundColor = AMSurfaceColor();
-        btn.layer.cornerRadius = 11.0;
-        btn.layer.borderWidth = 0.75;
-        btn.layer.borderColor = AMBorderColor().CGColor;
-        btn.contentEdgeInsets = UIEdgeInsetsMake(4, 10, 4, 10);
-        if (@available(iOS 13.0, *)) {
-            UIImageSymbolConfiguration *symCfg = [UIImageSymbolConfiguration configurationWithPointSize:10.5 weight:UIImageSymbolWeightSemibold];
-            [btn setImage:[UIImage systemImageNamed:@"slider.horizontal.3" withConfiguration:symCfg] forState:UIControlStateNormal];
-            btn.tintColor = AMAccentGreenColor();
-            btn.imageEdgeInsets = UIEdgeInsetsMake(0, -3, 0, 3);
-        }
-        objc_setAssociatedObject(btn, kAMManageCatBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
-        [btn addTarget:[AMCategoryManagerPresenter class]
-                action:@selector(onTapManageCategories:)
-      forControlEvents:UIControlEventTouchUpInside];
-
-        UIView *host = catCV.superview ?: vc.view;
-        [host addSubview:btn];
-        if (catCV && catCV.superview == host) {
-            [NSLayoutConstraint activateConstraints:@[
-                [btn.trailingAnchor constraintEqualToAnchor:catCV.trailingAnchor constant:-10.0],
-                [btn.bottomAnchor constraintEqualToAnchor:catCV.topAnchor constant:-4.0],
-                [btn.heightAnchor constraintEqualToConstant:24.0],
-            ]];
-        } else {
-            [NSLayoutConstraint activateConstraints:@[
-                [btn.trailingAnchor constraintEqualToAnchor:host.safeAreaLayoutGuide.trailingAnchor constant:-12.0],
-                [btn.bottomAnchor constraintEqualToAnchor:host.safeAreaLayoutGuide.bottomAnchor constant:-12.0],
-                [btn.heightAnchor constraintEqualToConstant:26.0],
-            ]];
-        }
-        objc_setAssociatedObject(vc, kAMManageCatBtnKey, btn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    });
+    if (gOrigEffectMainDidSelectItem) {
+        ((void (*)(id, SEL, UICollectionView *, NSIndexPath *))gOrigEffectMainDidSelectItem)(self, _cmd, cv, indexPath);
+    }
 }
 
 // ============================================================================
@@ -6832,9 +6829,9 @@ static void AlightMotionModsInit(void) {
                     &gOrigEffectMainWillDisplayCell);
 
     AMSwizzleMethod(@"_TtC12AlightMotion18EffectPickerMainVC",
-                    @"viewDidAppear:",
-                    (IMP)AMHook_effectMainViewDidAppear,
-                    &gOrigEffectMainViewDidAppear);
+                    @"collectionView:didSelectItemAtIndexPath:",
+                    (IMP)AMHook_effectMainDidSelectItem,
+                    &gOrigEffectMainDidSelectItem);
 
     AMSwizzleMethod(@"_TtC12AlightMotion22EffectPickerCategoryVC",
                     @"viewWillAppear:",
