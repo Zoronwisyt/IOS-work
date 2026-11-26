@@ -2739,6 +2739,355 @@ static BOOL AMOpenLocalProjectInMainVC(NSString *projectPath) {
 @end
 
 // ============================================================================
+// Multi-Layer Parenting (Timeline Multi-Select Toolbar)
+// ============================================================================
+
+static const NSInteger kAMMultiParentBtnTag = 0x414D5052; // 'AMPR'
+static const void *kAMMultiParentNavKey = &kAMMultiParentNavKey;
+
+static IMP gOrigMultiSelectorNavViewDidLoad = NULL;
+static IMP gOrigLayerParentingDidSelectRow = NULL;
+
+@interface AMMultiParentPopoverDelegate : NSObject <UIPopoverPresentationControllerDelegate>
++ (instancetype)shared;
+@end
+
+@implementation AMMultiParentPopoverDelegate
++ (instancetype)shared {
+    static AMMultiParentPopoverDelegate *inst = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ inst = [AMMultiParentPopoverDelegate new]; });
+    return inst;
+}
+- (UIModalPresentationStyle)adaptivePresentationStyleForPresentationController:(UIPresentationController *)controller {
+    return UIModalPresentationNone;
+}
+@end
+
+typedef struct {
+    const uint64_t *selectedIds;
+    NSUInteger selectedCount;
+    uint64_t targetParentId;
+    BOOL hasParent;
+    int64_t currentTime;
+} AMMultiParentEditContext;
+
+static AMMultiParentEditContext gAMMultiParentCtx;
+
+static id AMReadObjectIvar(id obj, const char *ivarName) {
+    if (!obj || !ivarName) return nil;
+    Ivar iv = class_getInstanceVariable([obj class], ivarName);
+    if (!iv) return nil;
+    ptrdiff_t off = ivar_getOffset(iv);
+    void *ptr = *(void **)((uint8_t *)(__bridge void *)obj + off);
+    return (__bridge id)ptr;
+}
+
+static void AMWriteStrongObjectIvar(id obj, const char *ivarName, id value) {
+    if (!obj || !ivarName) return;
+    Ivar iv = class_getInstanceVariable([obj class], ivarName);
+    if (!iv) return;
+    ptrdiff_t off = ivar_getOffset(iv);
+    id __strong *slot = (id __strong *)((uint8_t *)(__bridge void *)obj + off);
+    *slot = value;
+}
+
+static void *AMSwiftArrayStorageForObj(id obj, const char *ivarName) {
+    if (!obj || !ivarName) return NULL;
+    Ivar iv = class_getInstanceVariable([obj class], ivarName);
+    if (!iv) return NULL;
+    ptrdiff_t off = ivar_getOffset(iv);
+    return *(void **)((uint8_t *)(__bridge void *)obj + off);
+}
+
+static BOOL AMIsIdInList(uint64_t eid, const uint64_t *ids, NSUInteger count) {
+    for (NSUInteger i = 0; i < count; i++) {
+        if (ids[i] == eid) return YES;
+    }
+    return NO;
+}
+
+static BOOL AMWouldCreateParentCycle(uint64_t childId,
+                                     uint64_t candidateParentId,
+                                     const uint8_t *basePtr,
+                                     int64_t count,
+                                     size_t stride,
+                                     ptrdiff_t parentIdOff) {
+    if (childId == candidateParentId) return YES;
+    uint64_t cur = candidateParentId;
+    for (int depth = 0; depth < 64; depth++) {
+        BOOL found = NO;
+        for (int64_t i = 0; i < count; i++) {
+            const uint8_t *el = basePtr + (size_t)i * stride;
+            uint64_t eid = *(const uint64_t *)(el + 0x18);
+            if (eid == cur) {
+                uint8_t isNil = *(const uint8_t *)(el + parentIdOff + 8);
+                if (isNil & 1) return NO;
+                uint64_t nextParent = *(const uint64_t *)(el + parentIdOff);
+                if (nextParent == childId) return YES;
+                cur = nextParent;
+                found = YES;
+                break;
+            }
+        }
+        if (!found) break;
+    }
+    return NO;
+}
+
+static void AMMultiParentEditCallback(void *scenePtr) {
+    if (!scenePtr || !gAMMultiParentCtx.selectedIds || gAMMultiParentCtx.selectedCount == 0) return;
+    intptr_t slide = AMSlide();
+
+    typedef void *(*MetaFn)(uintptr_t);
+    typedef void *(*CopyFn)(void *, void *, void *);
+    typedef void (*DestroyFn)(void *, void *);
+    typedef void (*SetParentFn)(void *, uint64_t, uint32_t, int64_t);
+
+    void *sceneMeta = ((MetaFn)(0x1003c6b10ULL + slide))(0);
+    void *elMeta = ((MetaFn)(0x1003e0404ULL + slide))(0);
+    if (!sceneMeta || !elMeta) return;
+
+    void *sceneVWT = *(void **)((uint8_t *)sceneMeta - 8);
+    size_t sceneSize = *(size_t *)((uint8_t *)sceneVWT + 0x40);
+    int32_t elementsOff = *(int32_t *)((uint8_t *)sceneMeta + 0x1c);
+
+    void *elVWT = *(void **)((uint8_t *)elMeta - 8);
+    uint8_t elAlignMask = *(uint8_t *)((uint8_t *)elVWT + 0x50);
+    size_t elStride = *(size_t *)((uint8_t *)elVWT + 0x48);
+    int32_t parentIdOff = *(int32_t *)((uint8_t *)elMeta + 0x94);
+
+    void *sceneCopy = calloc(1, sceneSize + 32);
+    if (!sceneCopy) return;
+    ((CopyFn)(0x100019e78ULL + slide))(scenePtr, sceneCopy, (void *)(0x1003c6b10ULL + slide));
+
+    // Ensure COW uniqueness on scene.elements before mutating elements in-place
+    typedef void (*MakeUniqueFn)(void *elMetaArg);
+    MakeUniqueFn makeUnique = (MakeUniqueFn)dlsym(RTLD_DEFAULT, "$sSa36_makeUniqueAndReserveCapacityIfNotUniqueyyF");
+    void **elementsField = (void **)((uint8_t *)scenePtr + elementsOff);
+    if (makeUnique && *elementsField) {
+        __asm__ volatile(
+            "mov x20, %0\n"
+            "mov x0, %1\n"
+            "blr %2\n"
+            :
+            : "r"(elementsField), "r"(elMeta), "r"(makeUnique)
+            : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+              "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+              "x16", "x17", "x20", "memory"
+        );
+    }
+
+    void *arrStorage = *elementsField;
+    if (arrStorage) {
+        int64_t count = *(int64_t *)((uint8_t *)arrStorage + 0x10);
+        size_t headerOffset = (0x20 + (size_t)elAlignMask) & ~(size_t)elAlignMask;
+        uint8_t *basePtr = (uint8_t *)arrStorage + headerOffset;
+
+        uintptr_t setParentAddr = (uintptr_t)(0x1003ebba4ULL + slide);
+        uint64_t parentId = gAMMultiParentCtx.hasParent ? gAMMultiParentCtx.targetParentId : 0;
+        uint32_t isNil = gAMMultiParentCtx.hasParent ? 0 : 1;
+        int64_t curTime = gAMMultiParentCtx.currentTime;
+
+        for (int64_t i = 0; i < count; i++) {
+            uint8_t *elPtr = basePtr + (size_t)i * elStride;
+            uint64_t eid = *(uint64_t *)(elPtr + 0x18);
+            if (!AMIsIdInList(eid, gAMMultiParentCtx.selectedIds, gAMMultiParentCtx.selectedCount)) {
+                continue;
+            }
+            if (gAMMultiParentCtx.hasParent &&
+                AMWouldCreateParentCycle(eid, parentId, basePtr, count, elStride, parentIdOff)) {
+                continue;
+            }
+            __asm__ volatile(
+                "mov x0, %0\n"
+                "mov x1, %1\n"
+                "mov w2, %w2\n"
+                "mov x3, %3\n"
+                "mov x20, %4\n"
+                "blr %5\n"
+                :
+                : "r"(sceneCopy), "r"(parentId), "r"(isNil), "r"(curTime), "r"(elPtr), "r"(setParentAddr)
+                : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+                  "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+                  "x16", "x17", "x20", "memory", "v0", "v1", "v2", "v3"
+            );
+        }
+    }
+
+    ((DestroyFn)(0x1000199c0ULL + slide))(sceneCopy, (void *)(0x1003c6b10ULL + slide));
+    free(sceneCopy);
+}
+
+static int64_t AMReadHolderCurrentTime(id holder, intptr_t slide) {
+    if (!holder) return 0;
+    uint8_t *h = (uint8_t *)(__bridge void *)holder;
+    ptrdiff_t flagOff = *(ptrdiff_t *)(0x1033e54d0ULL + slide);
+    ptrdiff_t t1Off = *(ptrdiff_t *)(0x1033e54e8ULL + slide);
+    ptrdiff_t t2Off = *(ptrdiff_t *)(0x1033e5500ULL + slide);
+    uint8_t flag = *(uint8_t *)(h + flagOff);
+    int64_t t2 = *(int64_t *)(h + t2Off);
+    if (flag == 1) {
+        int64_t t1 = *(int64_t *)(h + t1Off);
+        return (t2 > t1) ? t2 : t1;
+    }
+    return t2;
+}
+
+static void AMOnTapMultiParent(id self, SEL _cmd, UIButton *sender) {
+    id holder = AMReadObjectIvar(self, "holder");
+    if (!holder) return;
+
+    UIStoryboard *sb = [UIStoryboard storyboardWithName:@"LayerParentingVC" bundle:nil];
+    UIViewController *lpvc = [sb instantiateInitialViewController];
+    if (!lpvc) {
+        Class lpCls = NSClassFromString(@"_TtC12AlightMotion16LayerParentingVC");
+        if (!lpCls) return;
+        lpvc = [[lpCls alloc] initWithNibName:nil bundle:nil];
+    }
+    if (!lpvc) return;
+
+    AMWriteStrongObjectIvar(lpvc, "holder", holder);
+    objc_setAssociatedObject(lpvc, kAMMultiParentNavKey, self, OBJC_ASSOCIATION_ASSIGN);
+
+    lpvc.modalPresentationStyle = UIModalPresentationPopover;
+    lpvc.preferredContentSize = CGSizeMake(300.0, 360.0);
+    UIPopoverPresentationController *pop = lpvc.popoverPresentationController;
+    if (pop && sender) {
+        pop.sourceView = sender;
+        pop.sourceRect = sender.bounds;
+        pop.permittedArrowDirections = UIPopoverArrowDirectionUp | UIPopoverArrowDirectionAny;
+        pop.delegate = [AMMultiParentPopoverDelegate shared];
+    }
+    [(UIViewController *)self presentViewController:lpvc animated:YES completion:nil];
+}
+
+static void AMHook_multiSelectorNavViewDidLoad(id self, SEL _cmd) {
+    if (gOrigMultiSelectorNavViewDidLoad) {
+        ((void (*)(id, SEL))gOrigMultiSelectorNavViewDidLoad)(self, _cmd);
+    }
+    if (![self respondsToSelector:@selector(basicStackView)]) return;
+    UIStackView *stack = ((UIStackView *(*)(id, SEL))objc_msgSend)(self, @selector(basicStackView));
+    if (![stack isKindOfClass:[UIStackView class]]) return;
+    if ([stack viewWithTag:kAMMultiParentBtnTag]) return;
+
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.tag = kAMMultiParentBtnTag;
+    btn.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImage *img = [UIImage imageNamed:@"ic_parent_of_layer"];
+    if (!img && @available(iOS 13.0, *)) {
+        img = [UIImage systemImageNamed:@"square.on.square.dashed"];
+    }
+    if (img) {
+        img = [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        [btn setImage:img forState:UIControlStateNormal];
+    }
+    btn.tintColor = [UIColor blackColor];
+    btn.imageView.contentMode = UIViewContentModeScaleAspectFit;
+
+    UIView *refView = stack.arrangedSubviews.firstObject;
+    if (refView && refView.bounds.size.width > 0 && refView.bounds.size.height > 0) {
+        [NSLayoutConstraint activateConstraints:@[
+            [btn.widthAnchor constraintEqualToConstant:refView.bounds.size.width],
+            [btn.heightAnchor constraintEqualToConstant:refView.bounds.size.height]
+        ]];
+    } else {
+        [NSLayoutConstraint activateConstraints:@[
+            [btn.widthAnchor constraintEqualToConstant:28.0],
+            [btn.heightAnchor constraintEqualToConstant:28.0]
+        ]];
+    }
+
+    [btn addTarget:self action:@selector(am_onTapMultiParent:) forControlEvents:UIControlEventTouchUpInside];
+
+    // Insert right after the group buttons (Group, Masking Group, Exclude Group)
+    NSUInteger insertIdx = MIN((NSUInteger)3, stack.arrangedSubviews.count);
+    [stack insertArrangedSubview:btn atIndex:insertIdx];
+}
+
+static void AMHook_layerParentingDidSelectRow(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) {
+    id navVC = objc_getAssociatedObject(self, kAMMultiParentNavKey);
+    if (!navVC) {
+        if (gOrigLayerParentingDidSelectRow) {
+            ((void (*)(id, SEL, UITableView *, NSIndexPath *))gOrigLayerParentingDidSelectRow)(self, _cmd, tableView, indexPath);
+        }
+        return;
+    }
+
+    intptr_t slide = AMSlide();
+    BOOL hasParent = NO;
+    uint64_t targetParentId = 0;
+
+    if (indexPath.section == 1) {
+        void *elementsStorage = AMSwiftArrayStorageForObj(self, "elements");
+        if (elementsStorage) {
+            typedef void *(*MetaFn)(uintptr_t);
+            void *elMeta = ((MetaFn)(0x1003e0404ULL + slide))(0);
+            void *elVWT = *(void **)((uint8_t *)elMeta - 8);
+            uint8_t elAlignMask = *(uint8_t *)((uint8_t *)elVWT + 0x50);
+            size_t elStride = *(size_t *)((uint8_t *)elVWT + 0x48);
+            int64_t count = *(int64_t *)((uint8_t *)elementsStorage + 0x10);
+            if (indexPath.row >= 0 && indexPath.row < count) {
+                size_t headerOffset = (0x20 + (size_t)elAlignMask) & ~(size_t)elAlignMask;
+                const uint8_t *elPtr = (const uint8_t *)elementsStorage + headerOffset + (size_t)indexPath.row * elStride;
+                targetParentId = *(const uint64_t *)(elPtr + 0x18);
+                hasParent = YES;
+            }
+        }
+    }
+
+    id vm = AMReadObjectIvar(navVC, "vm");
+    id holder = AMReadObjectIvar(navVC, "holder");
+    if (vm && holder) {
+        void *selectedArr = NULL;
+        uintptr_t getSelectedFn = (uintptr_t)(0x1003959f0ULL + slide);
+        __asm__ volatile(
+            "mov x20, %1\n"
+            "blr %2\n"
+            "mov %0, x0\n"
+            : "=r"(selectedArr)
+            : "r"((__bridge void *)vm), "r"(getSelectedFn)
+            : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+              "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+              "x16", "x17", "x20", "memory"
+        );
+
+        if (selectedArr) {
+            int64_t selCount = *(int64_t *)((uint8_t *)selectedArr + 0x10);
+            if (selCount > 0) {
+                const uint64_t *selIds = (const uint64_t *)((uint8_t *)selectedArr + 0x20);
+                gAMMultiParentCtx.selectedIds = selIds;
+                gAMMultiParentCtx.selectedCount = (NSUInteger)selCount;
+                gAMMultiParentCtx.targetParentId = targetParentId;
+                gAMMultiParentCtx.hasParent = hasParent;
+                gAMMultiParentCtx.currentTime = AMReadHolderCurrentTime(holder, slide);
+
+                uintptr_t performEditFn = (uintptr_t)(0x100392588ULL + slide);
+                uintptr_t cbPtr = (uintptr_t)AMMultiParentEditCallback;
+                __asm__ volatile(
+                    "mov w0, #4\n"
+                    "mov x1, #0\n"
+                    "mov w2, #2\n"
+                    "mov x3, %0\n"
+                    "mov x4, #0\n"
+                    "mov x20, %1\n"
+                    "blr %2\n"
+                    :
+                    : "r"(cbPtr), "r"((__bridge void *)holder), "r"(performEditFn)
+                    : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+                      "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+                      "x16", "x17", "x20", "memory"
+                );
+            }
+            typedef void (*ReleaseFn)(void *);
+            ((ReleaseFn)(0x1025bb404ULL + slide))(selectedArr);
+        }
+    }
+
+    [(UIViewController *)self dismissViewControllerAnimated:YES completion:nil];
+}
+
+// ============================================================================
 // Constructor: Install All Hooks Safely on Launch
 // ============================================================================
 
@@ -2812,6 +3161,19 @@ static void AlightMotionModsInit(void) {
                     @"collectionView:willDisplayCell:forItemAtIndexPath:",
                     (IMP)AMHook_effectCatWillDisplayCell,
                     &gOrigEffectCatWillDisplayCell);
+
+    Class multiNavCls = NSClassFromString(@"_TtC12AlightMotion18MultiSelectorNavVC");
+    if (multiNavCls) {
+        class_addMethod(multiNavCls, @selector(am_onTapMultiParent:), (IMP)AMOnTapMultiParent, "v@:@");
+    }
+    AMSwizzleMethod(@"_TtC12AlightMotion18MultiSelectorNavVC",
+                    @"viewDidLoad",
+                    (IMP)AMHook_multiSelectorNavViewDidLoad,
+                    &gOrigMultiSelectorNavViewDidLoad);
+    AMSwizzleMethod(@"_TtC12AlightMotion16LayerParentingVC",
+                    @"tableView:didSelectRowAtIndexPath:",
+                    (IMP)AMHook_layerParentingDidSelectRow,
+                    &gOrigLayerParentingDidSelectRow);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         AMInstallCustomEffectCategoryIfNeeded();
