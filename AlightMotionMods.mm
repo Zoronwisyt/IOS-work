@@ -3322,18 +3322,9 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
     [self updateReadout];
     AMSaveSpeedGraphForKey(self.layerKey, curve, self.canvasView.baseSpeed, self.presetTitleLabel.text);
     if (!commit) return;
-
-    void *vmPtr = AMGetRawIvarPtr(self.speedVC, "vm");
-    if (vmPtr) {
-        CGFloat mult = AMComputeSpeedMultiplierAtProgress(curve, 0.5);
-        CGFloat targetSpeed = self.canvasView.baseSpeed * mult;
-        if (targetSpeed < 0.10) targetSpeed = 0.10;
-        if (targetSpeed > 8.00) targetSpeed = 8.00;
-        int64_t milli = (int64_t)llround(targetSpeed * 1000.0);
-        AMCallEditSpeedVMSetSpeed(vmPtr, milli);
-        AMCallEditSpeedVMRefreshUI(vmPtr);
-        AMForceImmediatePreviewRedraw();
-    }
+    // Preserve layer timeline length when editing the Speed Graph (After Effects behavior):
+    // do not invoke EditSpeedVM::setSpeed, which rescales element.endTime.
+    AMForceImmediatePreviewRedraw();
 }
 
 - (void)onTapPresetButton:(UIButton *)sender {
@@ -3594,11 +3585,25 @@ static void AMEnsureSpeedGraphButton(UIViewController *speedVC) {
         panelVC = panelVC.parentViewController;
     }
 
+    UIView *cueView = panelVC ? (UIView *)AMCallObjCGetter(panelVC, @"cueView") : nil;
+    UIView *targetHost = (cueView && cueView.superview) ? cueView.superview : nil;
+    if (!targetHost) {
+        return;
+    }
+
     UIButton *btn = objc_getAssociatedObject(speedVC, kAMSpeedGraphBtnAssocKey);
+    UIView *existingToolbar = objc_getAssociatedObject(speedVC, kAMSpeedKfBarAssocKey);
+    if (existingToolbar && existingToolbar.superview != targetHost) {
+        [existingToolbar removeFromSuperview];
+        [targetHost addSubview:existingToolbar];
+        [NSLayoutConstraint activateConstraints:@[
+            [existingToolbar.trailingAnchor constraintEqualToAnchor:targetHost.trailingAnchor constant:-12.0],
+            [existingToolbar.centerYAnchor constraintEqualToAnchor:cueView.centerYAnchor],
+        ]];
+    }
+
     if (!btn) {
-        UIView *cueView = panelVC ? (UIView *)AMCallObjCGetter(panelVC, @"cueView") : nil;
-        UIView *speedValLabel = (UIView *)AMCallObjCGetter(speedVC, @"speedValueLabel");
-        UIView *hostView = (cueView && cueView.superview) ? cueView.superview : speedVC.view;
+        UIView *hostView = targetHost;
 
         // Compact horizontal toolbar: [<] [◇] [N] [>] [Graph]
         UIStackView *toolbar = [[UIStackView alloc] init];
@@ -3679,31 +3684,16 @@ static void AMEnsureSpeedGraphButton(UIViewController *speedVC) {
 
         [NSLayoutConstraint activateConstraints:@[
             [prevBtn.widthAnchor constraintEqualToConstant:24.0],
-            [prevBtn.heightAnchor constraintEqualToConstant:32.0],
-            [kfBtn.widthAnchor constraintEqualToConstant:30.0],
-            [kfBtn.heightAnchor constraintEqualToConstant:32.0],
+            [prevBtn.heightAnchor constraintEqualToConstant:28.0],
+            [kfBtn.widthAnchor constraintEqualToConstant:28.0],
+            [kfBtn.heightAnchor constraintEqualToConstant:28.0],
             [nextBtn.widthAnchor constraintEqualToConstant:24.0],
-            [nextBtn.heightAnchor constraintEqualToConstant:32.0],
-            [btn.widthAnchor constraintEqualToConstant:34.0],
-            [btn.heightAnchor constraintEqualToConstant:34.0],
+            [nextBtn.heightAnchor constraintEqualToConstant:28.0],
+            [btn.widthAnchor constraintEqualToConstant:30.0],
+            [btn.heightAnchor constraintEqualToConstant:30.0],
+            [toolbar.trailingAnchor constraintEqualToAnchor:hostView.trailingAnchor constant:-12.0],
+            [toolbar.centerYAnchor constraintEqualToAnchor:cueView.centerYAnchor],
         ]];
-
-        if (cueView && cueView.superview == hostView) {
-            [NSLayoutConstraint activateConstraints:@[
-                [toolbar.trailingAnchor constraintEqualToAnchor:hostView.trailingAnchor constant:-12.0],
-                [toolbar.centerYAnchor constraintEqualToAnchor:cueView.centerYAnchor],
-            ]];
-        } else if (speedValLabel && speedValLabel.superview == hostView) {
-            [NSLayoutConstraint activateConstraints:@[
-                [toolbar.trailingAnchor constraintEqualToAnchor:hostView.trailingAnchor constant:-12.0],
-                [toolbar.centerYAnchor constraintEqualToAnchor:speedValLabel.centerYAnchor],
-            ]];
-        } else {
-            [NSLayoutConstraint activateConstraints:@[
-                [toolbar.trailingAnchor constraintEqualToAnchor:hostView.trailingAnchor constant:-12.0],
-                [toolbar.topAnchor constraintEqualToAnchor:hostView.topAnchor constant:8.0],
-            ]];
-        }
 
         objc_setAssociatedObject(speedVC, kAMSpeedKfBarAssocKey, toolbar, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(speedVC, kAMSpeedKfPrevBtnAssocKey, prevBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
