@@ -1597,87 +1597,118 @@ static BOOL AMIsOnHomepage(UIWindow *win) {
     return YES;
 }
 
-static BOOL AMSearchStringIsChrome(NSString *s) {
-    if (s.length == 0 || s.length > 90) return YES;
-    NSString *low = s.lowercaseString;
-    static NSSet<NSString *> *chrome = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        chrome = [NSSet setWithArray:@[
-            @"your projects", @"projects", @"your templates", @"elements", @"cloud",
-            @"cloud projects", @"home", @"tutorials", @"templates", @"upload", @"new",
-            @"alight motion", @"search", @"all", @"edit", @"select", @"cancel", @"done",
-            @"upload an xml file from your device", @"more", @"menu", @"profile",
-            @"account", @"create", @"settings", @"close"
-        ]];
-    });
-    if ([chrome containsObject:low]) return YES;
-    if ([low hasSuffix:@"fps"] || [low hasSuffix:@"mb"] || [low hasSuffix:@"kb"] || [low hasSuffix:@"gb"]) return YES;
-    if ([low rangeOfString:@"^\\d+x\\d+$" options:NSRegularExpressionSearch].location != NSNotFound) return YES;
-    if ([low rangeOfString:@"^\\d{2}:\\d{2}(:\\d{2})?$" options:NSRegularExpressionSearch].location != NSNotFound) return YES;
-    return NO;
+static NSString *AMExtractXMLAttr(NSString *tag, NSString *attrName) {
+    NSString *pattern = [NSString stringWithFormat:@"\\b%@\\s*=\\s*\"([^\"]+)\"", attrName];
+    NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:nil];
+    NSTextCheckingResult *m = [rx firstMatchInString:tag options:0 range:NSMakeRange(0, tag.length)];
+    if (!m || m.numberOfRanges < 2) return nil;
+    NSString *val = [tag substringWithRange:[m rangeAtIndex:1]];
+    val = [val stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
+    val = [val stringByReplacingOccurrencesOfString:@"&quot;" withString:@"\""];
+    val = [val stringByReplacingOccurrencesOfString:@"&lt;" withString:@"<"];
+    val = [val stringByReplacingOccurrencesOfString:@"&gt;" withString:@">"];
+    val = [val stringByReplacingOccurrencesOfString:@"&#39;" withString:@"'"];
+    return [val stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 }
 
-static void AMExtractSearchCandidate(NSString *raw, NSMutableOrderedSet<NSString *> *out) {
-    if (raw.length == 0) return;
-    NSArray<NSString *> *lines = [raw componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
-    for (NSString *line in lines) {
-        NSString *first = [[line componentsSeparatedByString:@", "].firstObject stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (!AMSearchStringIsChrome(first)) {
-            [out addObject:first];
-            return;
-        }
-    }
-}
+// Scans Alight Motion's real local project storage (Documents & Application Support)
+// for <scene title="..."> XMLs, project metadata JSON/plists, and .amproj files.
+static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDisk(void) {
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *results = [NSMutableArray array];
+    NSMutableSet<NSString *> *seenTitles = [NSMutableSet set];
+    NSFileManager *fm = [NSFileManager defaultManager];
 
-static void AMCollectProjectNamesFromObject(id obj, NSMutableOrderedSet<NSString *> *out, NSInteger depth) {
-    if (!obj || depth > 16) return;
-    if ([obj isKindOfClass:[UIView class]]) {
-        UIView *v = (UIView *)obj;
-        if (v.hidden || v.alpha < 0.05) return;
-        if ([v isKindOfClass:[UILabel class]]) {
-            AMExtractSearchCandidate(((UILabel *)v).text, out);
-        }
-    }
-    if ([obj respondsToSelector:@selector(accessibilityLabel)]) {
-        NSString *lbl = [obj accessibilityLabel];
-        if (lbl.length > 0) AMExtractSearchCandidate(lbl, out);
-    }
-    if ([obj respondsToSelector:@selector(accessibilityElements)]) {
-        NSArray *elems = [obj accessibilityElements];
-        if ([elems isKindOfClass:[NSArray class]] && elems.count > 0) {
-            for (id child in elems) AMCollectProjectNamesFromObject(child, out, depth + 1);
-        } else if ([obj respondsToSelector:@selector(accessibilityElementCount)] &&
-                   [obj respondsToSelector:@selector(accessibilityElementAtIndex:)]) {
-            NSInteger cnt = [obj accessibilityElementCount];
-            if (cnt > 0 && cnt < 200) {
-                for (NSInteger k = 0; k < cnt; ++k) {
-                    id child = [obj accessibilityElementAtIndex:k];
-                    if (child && child != obj) AMCollectProjectNamesFromObject(child, out, depth + 1);
-                }
+    NSMutableArray<NSString *> *roots = [NSMutableArray array];
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *appSup = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+    if (docs) [roots addObject:docs];
+    if (appSup) [roots addObject:appSup];
+
+    NSSet<NSString *> *skipDirs = [NSSet setWithArray:@[
+        @"CustomEffects", @"ProjectFolders", @"Firebase", @"Google", @"Amplitude",
+        @"Caches", @"Logs", @"Crashlytics", @"com.apple.nsurlsessiond", @"Inbox"
+    ]];
+
+    for (NSString *root in roots) {
+        NSDirectoryEnumerator<NSString *> *en = [fm enumeratorAtPath:root];
+        NSString *rel = nil;
+        NSInteger scanned = 0;
+        while ((rel = [en nextObject]) != nil && scanned < 2500) {
+            scanned++;
+            NSString *firstComp = rel.pathComponents.firstObject ?: @"";
+            if ([skipDirs containsObject:firstComp]) {
+                [en skipDescendants];
+                continue;
+            }
+            NSString *full = [root stringByAppendingPathComponent:rel];
+            NSString *ext = rel.pathExtension.lowercaseString;
+
+            if ([ext isEqualToString:@"xml"]) {
+                NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:full];
+                NSData *head = [fh readDataOfLength:2048];
+                [fh closeFile];
+                if (head.length == 0) continue;
+                NSString *txt = [[NSString alloc] initWithData:head encoding:NSUTF8StringEncoding];
+                if (!txt || ![txt containsString:@"<scene"]) continue;
+                NSRange sStart = [txt rangeOfString:@"<scene"];
+                NSRange sEnd = [txt rangeOfString:@">" options:0 range:NSMakeRange(sStart.location, txt.length - sStart.location)];
+                if (sEnd.location == NSNotFound) continue;
+                NSString *tag = [txt substringWithRange:NSMakeRange(sStart.location, (sEnd.location - sStart.location) + 1)];
+                NSString *title = AMExtractXMLAttr(tag, @"title");
+                if (title.length == 0) continue;
+                if ([seenTitles containsObject:title]) continue;
+                [seenTitles addObject:title];
+
+                NSString *w = AMExtractXMLAttr(tag, @"width");
+                NSString *h = AMExtractXMLAttr(tag, @"height");
+                NSString *fps = AMExtractXMLAttr(tag, @"fps");
+                NSMutableArray<NSString *> *parts = [NSMutableArray array];
+                if (w.length > 0 && h.length > 0) [parts addObject:[NSString stringWithFormat:@"%@x%@", w, h]];
+                if (fps.length > 0) [parts addObject:[NSString stringWithFormat:@"%@fps", fps]];
+                NSString *meta = parts.count > 0 ? [parts componentsJoinedByString:@"  •  "] : @"Alight Motion Project";
+                [results addObject:@{@"title": title, @"meta": meta, @"path": full}];
+            } else if ([ext isEqualToString:@"json"]) {
+                NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
+                unsigned long long fsize = [attrs fileSize];
+                if (fsize == 0 || fsize > 262144) continue;
+                NSData *d = [NSData dataWithContentsOfFile:full];
+                if (d.length == 0) continue;
+                id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+                if (![obj isKindOfClass:[NSDictionary class]]) continue;
+                NSDictionary *dict = (NSDictionary *)obj;
+                // Only accept JSON that looks like a project metadata record
+                BOOL looksLikeProj = (dict[@"fps"] != nil || dict[@"width"] != nil || dict[@"scene"] != nil || dict[@"projectId"] != nil || dict[@"duration"] != nil);
+                if (!looksLikeProj) continue;
+                NSString *title = [dict[@"title"] isKindOfClass:[NSString class]] ? dict[@"title"] :
+                                  ([dict[@"name"] isKindOfClass:[NSString class]] ? dict[@"name"] : nil);
+                title = [title stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (title.length == 0 || [seenTitles containsObject:title]) continue;
+                [seenTitles addObject:title];
+
+                NSMutableArray<NSString *> *parts = [NSMutableArray array];
+                if (dict[@"width"] && dict[@"height"]) [parts addObject:[NSString stringWithFormat:@"%@x%@", dict[@"width"], dict[@"height"]]];
+                if (dict[@"fps"]) [parts addObject:[NSString stringWithFormat:@"%@fps", dict[@"fps"]]];
+                NSString *meta = parts.count > 0 ? [parts componentsJoinedByString:@"  •  "] : @"Alight Motion Project";
+                [results addObject:@{@"title": title, @"meta": meta, @"path": full}];
+            } else if ([ext isEqualToString:@"amproj"]) {
+                NSString *title = [[rel lastPathComponent] stringByDeletingPathExtension];
+                if (title.length == 0 || [seenTitles containsObject:title]) continue;
+                [seenTitles addObject:title];
+                [results addObject:@{@"title": title, @"meta": @"Alight Motion Package (.amproj)", @"path": full}];
             }
         }
     }
-    if ([obj isKindOfClass:[UIView class]]) {
-        for (UIView *sub in ((UIView *)obj).subviews) {
-            AMCollectProjectNamesFromObject(sub, out, depth + 1);
-        }
-    }
+
+    [results sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"title"] localizedCaseInsensitiveCompare:b[@"title"]];
+    }];
+    return results;
 }
 
-static NSArray<NSString *> *AMSnapshotHomepageProjects(void) {
-    NSMutableOrderedSet<NSString *> *names = [NSMutableOrderedSet orderedSet];
-    UIWindow *win = AMKeyWindow();
-    if (win) {
-        AMCollectProjectNamesFromObject(win, names, 0);
-    }
-    return [names array];
-}
-
-@interface AMProjectSearchVC : UIViewController <UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate>
-@property (nonatomic, copy) NSArray<NSString *> *allProjects;
-@property (nonatomic, strong) NSArray<NSString *> *filteredProjects;
-@property (nonatomic, strong) UISearchBar *searchBar;
+@interface AMProjectSearchVC : UIViewController <UITableViewDataSource, UITableViewDelegate, UITextFieldDelegate>
+@property (nonatomic, copy) NSArray<NSDictionary<NSString *, NSString *> *> *allProjects;
+@property (nonatomic, strong) NSArray<NSDictionary<NSString *, NSString *> *> *filteredProjects;
+@property (nonatomic, strong) UITextField *searchField;
 @property (nonatomic, strong) UITableView *tableView;
 @end
 
@@ -1685,39 +1716,100 @@ static NSArray<NSString *> *AMSnapshotHomepageProjects(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor colorWithRed:0.961 green:0.965 blue:0.980 alpha:1.0]; // #F5F6FA
+    if (@available(iOS 13.0, *)) {
+        self.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
+    }
+    UIColor *bgColor = [UIColor colorWithRed:0.965 green:0.969 blue:0.984 alpha:1.0]; // #F6F7FB
+    UIColor *navy = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];    // #1D1E2C
+    UIColor *muted = [UIColor colorWithRed:0.557 green:0.573 blue:0.643 alpha:1.0];   // #8E92A4
+
+    self.view.backgroundColor = bgColor;
     self.title = @"Search Projects";
     self.filteredProjects = self.allProjects ?: @[];
 
-    UIColor *navy = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0]; // #1D1E2C
-    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Close"
-                                                                             style:UIBarButtonItemStylePlain
-                                                                            target:self
-                                                                            action:@selector(onClose)];
-    self.navigationItem.leftBarButtonItem.tintColor = navy;
+    if (@available(iOS 13.0, *)) {
+        UINavigationBarAppearance *app = [[UINavigationBarAppearance alloc] init];
+        [app configureWithOpaqueBackground];
+        app.backgroundColor = bgColor;
+        app.shadowColor = [UIColor clearColor];
+        app.titleTextAttributes = @{
+            NSForegroundColorAttributeName: navy,
+            NSFontAttributeName: AMThemeFont(17.0, UIFontWeightBold)
+        };
+        self.navigationController.navigationBar.standardAppearance = app;
+        self.navigationController.navigationBar.scrollEdgeAppearance = app;
+    }
 
-    self.searchBar = [[UISearchBar alloc] init];
-    self.searchBar.translatesAutoresizingMaskIntoConstraints = NO;
-    self.searchBar.placeholder = @"Search your projects...";
-    self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
-    self.searchBar.delegate = self;
-    self.searchBar.tintColor = navy;
-    [self.view addSubview:self.searchBar];
+    UIBarButtonItem *closeItem = [[UIBarButtonItem alloc] initWithTitle:@"Close"
+                                                                  style:UIBarButtonItemStylePlain
+                                                                 target:self
+                                                                 action:@selector(onClose)];
+    closeItem.tintColor = navy;
+    self.navigationItem.leftBarButtonItem = closeItem;
 
-    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
+    // Alight Motion-styled rounded white search bar card
+    UIView *searchBox = [[UIView alloc] init];
+    searchBox.translatesAutoresizingMaskIntoConstraints = NO;
+    searchBox.backgroundColor = [UIColor whiteColor];
+    searchBox.layer.cornerRadius = 14.0;
+    searchBox.layer.borderWidth = 1.0;
+    searchBox.layer.borderColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08].CGColor;
+    searchBox.layer.shadowColor = [UIColor blackColor].CGColor;
+    searchBox.layer.shadowOpacity = 0.04;
+    searchBox.layer.shadowRadius = 8.0;
+    searchBox.layer.shadowOffset = CGSizeMake(0, 2);
+    [self.view addSubview:searchBox];
+
+    UIImageView *mag = [[UIImageView alloc] init];
+    mag.translatesAutoresizingMaskIntoConstraints = NO;
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:15.0 weight:UIImageSymbolWeightMedium];
+        mag.image = [UIImage systemImageNamed:@"magnifyingglass" withConfiguration:cfg];
+    }
+    mag.tintColor = muted;
+    [searchBox addSubview:mag];
+
+    self.searchField = [[UITextField alloc] init];
+    self.searchField.translatesAutoresizingMaskIntoConstraints = NO;
+    self.searchField.font = AMThemeFont(15.0, UIFontWeightMedium);
+    self.searchField.textColor = navy;
+    self.searchField.tintColor = navy;
+    self.searchField.clearButtonMode = UITextFieldViewModeWhileEditing;
+    self.searchField.returnKeyType = UIReturnKeySearch;
+    self.searchField.autocorrectionType = UITextAutocorrectionTypeNo;
+    self.searchField.delegate = self;
+    self.searchField.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"Search your projects..."
+                                                                             attributes:@{NSForegroundColorAttributeName: muted}];
+    [self.searchField addTarget:self action:@selector(onSearchTextChanged:) forControlEvents:UIControlEventEditingChanged];
+    [searchBox addSubview:self.searchField];
+
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
-    self.tableView.backgroundColor = self.view.backgroundColor;
+    self.tableView.backgroundColor = bgColor;
+    self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
     self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+    self.tableView.contentInset = UIEdgeInsetsMake(6.0, 0.0, 20.0, 0.0);
     self.tableView.dataSource = self;
     self.tableView.delegate = self;
     [self.view addSubview:self.tableView];
 
     [NSLayoutConstraint activateConstraints:@[
-        [self.searchBar.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:4.0],
-        [self.searchBar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:8.0],
-        [self.searchBar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-8.0],
+        [searchBox.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8.0],
+        [searchBox.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16.0],
+        [searchBox.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16.0],
+        [searchBox.heightAnchor constraintEqualToConstant:46.0],
 
-        [self.tableView.topAnchor constraintEqualToAnchor:self.searchBar.bottomAnchor constant:2.0],
+        [mag.leadingAnchor constraintEqualToAnchor:searchBox.leadingAnchor constant:14.0],
+        [mag.centerYAnchor constraintEqualToAnchor:searchBox.centerYAnchor],
+        [mag.widthAnchor constraintEqualToConstant:18.0],
+        [mag.heightAnchor constraintEqualToConstant:18.0],
+
+        [self.searchField.leadingAnchor constraintEqualToAnchor:mag.trailingAnchor constant:10.0],
+        [self.searchField.trailingAnchor constraintEqualToAnchor:searchBox.trailingAnchor constant:-10.0],
+        [self.searchField.topAnchor constraintEqualToAnchor:searchBox.topAnchor],
+        [self.searchField.bottomAnchor constraintEqualToAnchor:searchBox.bottomAnchor],
+
+        [self.tableView.topAnchor constraintEqualToAnchor:searchBox.bottomAnchor constant:10.0],
         [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
         [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
@@ -1727,7 +1819,7 @@ static NSArray<NSString *> *AMSnapshotHomepageProjects(void) {
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     gAMSearchModalOpen = YES;
-    [self.searchBar becomeFirstResponder];
+    [self.searchField becomeFirstResponder];
 }
 
 - (void)viewDidDisappear:(BOOL)animated {
@@ -1742,16 +1834,16 @@ static NSArray<NSString *> *AMSnapshotHomepageProjects(void) {
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
-- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
-    (void)searchBar;
-    NSString *q = [searchText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+- (void)onSearchTextChanged:(UITextField *)tf {
+    NSString *q = [tf.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (q.length == 0) {
         self.filteredProjects = self.allProjects ?: @[];
     } else {
-        NSMutableArray<NSString *> *hits = [NSMutableArray array];
-        for (NSString *name in self.allProjects) {
-            if ([name localizedCaseInsensitiveContainsString:q]) {
-                [hits addObject:name];
+        NSMutableArray *hits = [NSMutableArray array];
+        for (NSDictionary *item in self.allProjects) {
+            NSString *title = item[@"title"] ?: @"";
+            if ([title localizedCaseInsensitiveContainsString:q]) {
+                [hits addObject:item];
             }
         }
         self.filteredProjects = hits;
@@ -1759,8 +1851,9 @@ static NSArray<NSString *> *AMSnapshotHomepageProjects(void) {
     [self.tableView reloadData];
 }
 
-- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
-    [searchBar resignFirstResponder];
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    [textField resignFirstResponder];
+    return YES;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -1768,41 +1861,119 @@ static NSArray<NSString *> *AMSnapshotHomepageProjects(void) {
     return self.filteredProjects.count > 0 ? self.filteredProjects.count : 1;
 }
 
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    (void)tableView; (void)indexPath;
+    return 76.0;
+}
+
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"SearchProjCell"];
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"AMSearchCardCell"];
     if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"SearchProjCell"];
-    }
-    if (self.filteredProjects.count == 0) {
-        cell.textLabel.text = self.allProjects.count == 0 ? @"Open the Projects tab to load projects" : @"No matching projects";
-        cell.detailTextLabel.text = nil;
-        cell.textLabel.font = AMThemeFont(14.0, UIFontWeightRegular);
-        cell.textLabel.textColor = [UIColor colorWithWhite:0.50 alpha:1.0];
-        cell.imageView.image = nil;
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"AMSearchCardCell"];
+        cell.backgroundColor = [UIColor clearColor];
+        cell.contentView.backgroundColor = [UIColor clearColor];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+        UIView *card = [[UIView alloc] init];
+        card.tag = 101;
+        card.translatesAutoresizingMaskIntoConstraints = NO;
+        card.backgroundColor = [UIColor whiteColor];
+        card.layer.cornerRadius = 14.0;
+        card.layer.shadowColor = [UIColor blackColor].CGColor;
+        card.layer.shadowOpacity = 0.04;
+        card.layer.shadowRadius = 8.0;
+        card.layer.shadowOffset = CGSizeMake(0, 2);
+        [cell.contentView addSubview:card];
+
+        UIView *iconBg = [[UIView alloc] init];
+        iconBg.tag = 102;
+        iconBg.translatesAutoresizingMaskIntoConstraints = NO;
+        iconBg.backgroundColor = [UIColor colorWithRed:0.933 green:0.941 blue:0.969 alpha:1.0]; // #EEF0F7
+        iconBg.layer.cornerRadius = 10.0;
+        [card addSubview:iconBg];
+
+        UIImageView *iv = [[UIImageView alloc] init];
+        iv.tag = 103;
+        iv.translatesAutoresizingMaskIntoConstraints = NO;
+        iv.contentMode = UIViewContentModeScaleAspectFit;
+        [iconBg addSubview:iv];
+
+        UILabel *titleLbl = [[UILabel alloc] init];
+        titleLbl.tag = 104;
+        titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
+        titleLbl.font = AMThemeFont(15.0, UIFontWeightBold);
+        titleLbl.textColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+        [card addSubview:titleLbl];
+
+        UILabel *metaLbl = [[UILabel alloc] init];
+        metaLbl.tag = 105;
+        metaLbl.translatesAutoresizingMaskIntoConstraints = NO;
+        metaLbl.font = AMThemeFont(12.0, UIFontWeightRegular);
+        metaLbl.textColor = [UIColor colorWithRed:0.557 green:0.573 blue:0.643 alpha:1.0];
+        [card addSubview:metaLbl];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [card.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:5.0],
+            [card.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-5.0],
+            [card.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16.0],
+            [card.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16.0],
+
+            [iconBg.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12.0],
+            [iconBg.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+            [iconBg.widthAnchor constraintEqualToConstant:42.0],
+            [iconBg.heightAnchor constraintEqualToConstant:42.0],
+
+            [iv.centerXAnchor constraintEqualToAnchor:iconBg.centerXAnchor],
+            [iv.centerYAnchor constraintEqualToAnchor:iconBg.centerYAnchor],
+            [iv.widthAnchor constraintEqualToConstant:20.0],
+            [iv.heightAnchor constraintEqualToConstant:20.0],
+
+            [titleLbl.leadingAnchor constraintEqualToAnchor:iconBg.trailingAnchor constant:12.0],
+            [titleLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14.0],
+            [titleLbl.topAnchor constraintEqualToAnchor:card.topAnchor constant:14.0],
+
+            [metaLbl.leadingAnchor constraintEqualToAnchor:titleLbl.leadingAnchor],
+            [metaLbl.trailingAnchor constraintEqualToAnchor:titleLbl.trailingAnchor],
+            [metaLbl.topAnchor constraintEqualToAnchor:titleLbl.bottomAnchor constant:3.0],
+        ]];
+    }
+
+    UIImageView *iv = (UIImageView *)[cell.contentView viewWithTag:103];
+    UILabel *titleLbl = (UILabel *)[cell.contentView viewWithTag:104];
+    UILabel *metaLbl = (UILabel *)[cell.contentView viewWithTag:105];
+
+    if (self.filteredProjects.count == 0) {
+        titleLbl.text = self.allProjects.count == 0 ? @"No local projects found" : @"No matching projects";
+        metaLbl.text = self.allProjects.count == 0 ? @"Create or import a project first" : @"Try a different search term";
+        if (@available(iOS 13.0, *)) {
+            iv.image = [UIImage systemImageNamed:@"magnifyingglass"];
+            iv.tintColor = [UIColor colorWithRed:0.557 green:0.573 blue:0.643 alpha:1.0];
+        }
         return cell;
     }
-    NSString *name = self.filteredProjects[indexPath.row];
-    cell.textLabel.text = name;
-    cell.textLabel.font = AMThemeFont(15.0, UIFontWeightSemibold);
-    cell.textLabel.textColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
-    cell.detailTextLabel.text = @"Project";
-    cell.detailTextLabel.font = AMThemeFont(12.0, UIFontWeightRegular);
-    cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
+
+    NSDictionary<NSString *, NSString *> *item = self.filteredProjects[indexPath.row];
+    titleLbl.text = item[@"title"];
+    metaLbl.text = item[@"meta"];
     if (@available(iOS 13.0, *)) {
         UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:18.0 weight:UIImageSymbolWeightMedium];
-        cell.imageView.image = [UIImage systemImageNamed:@"film.stack" withConfiguration:cfg];
-        cell.imageView.tintColor = [UIColor colorWithRed:0.204 green:0.827 blue:0.600 alpha:1.0];
+        iv.image = [UIImage systemImageNamed:@"film.stack" withConfiguration:cfg];
+        iv.tintColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
     }
-    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     return cell;
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (self.filteredProjects.count == 0) return;
+    NSDictionary<NSString *, NSString *> *item = self.filteredProjects[indexPath.row];
+    NSString *path = item[@"path"];
     gAMSearchModalOpen = NO;
-    [self dismissViewControllerAnimated:YES completion:nil];
+    [self dismissViewControllerAnimated:YES completion:^{
+        if (path.length > 0 && [path.pathExtension.lowercaseString isEqualToString:@"amproj"]) {
+            AMOpenLocalFileInApp([NSURL fileURLWithPath:path]);
+        }
+    }];
 }
 
 @end
@@ -1840,7 +2011,6 @@ static NSArray<NSString *> *AMSnapshotHomepageProjects(void) {
     if (!self.searchButton) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
         btn.accessibilityLabel = @"Search Projects";
-        // Matches Alight Motion Homepage top-bar aesthetic (soft light circle + dark navy icon)
         btn.backgroundColor = [UIColor colorWithRed:0.933 green:0.941 blue:0.969 alpha:1.0]; // #EEF0F7
         btn.tintColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0]; // #1D1E2C
         btn.layer.cornerRadius = 17.0;
@@ -1869,21 +2039,23 @@ static NSArray<NSString *> *AMSnapshotHomepageProjects(void) {
         return;
     }
     [self ensureButtonInWindow:win];
-    // Position neatly to the left of the top-right profile circle in Alight Motion's header bar
     CGFloat size = 34.0;
-    CGFloat x = win.bounds.size.width - 16.0 - 36.0 - 10.0 - size; // 16pt margin + 36pt profile icon + 10pt gap
+    CGFloat x = win.bounds.size.width - 16.0 - 36.0 - 10.0 - size;
     CGFloat y = win.safeAreaInsets.top + 8.0;
     self.searchButton.frame = CGRectMake(x, y, size, size);
     self.searchButton.hidden = NO;
 }
 
 - (void)onTapSearch {
-    NSArray<NSString *> *projects = AMSnapshotHomepageProjects();
+    NSArray<NSDictionary<NSString *, NSString *> *> *projects = AMLoadUserProjectsFromDisk();
     UIViewController *top = AMTopMostViewController();
     if (!top) return;
     AMProjectSearchVC *vc = [[AMProjectSearchVC alloc] init];
     vc.allProjects = projects;
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    if (@available(iOS 13.0, *)) {
+        nav.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
+    }
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     [top presentViewController:nav animated:YES completion:nil];
 }
