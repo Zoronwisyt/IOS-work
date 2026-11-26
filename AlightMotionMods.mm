@@ -4015,6 +4015,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
 @property (nonatomic, strong) NSCache<NSString *, UIImage *> *thumbCache;
 @property (nonatomic, strong) NSDate *lastFileMtime;
 @property (nonatomic, assign) CGFloat lastContentHeight;
+@property (nonatomic, assign) BOOL isDropdownExpanded;
 - (void)reloadForce:(BOOL)force diskProjects:(NSArray<NSDictionary *> *)diskProjects;
 - (CGFloat)desiredHeightWithMaxHeight:(CGFloat)maxH;
 @end
@@ -4102,6 +4103,81 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     UIColor *navy = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
     UIColor *muted = [UIColor colorWithRed:0.557 green:0.573 blue:0.643 alpha:1.0];
     CGFloat totalH = 8.0; // top 2 + bottom 6
+
+    // Collapsible "Folders (N)" dropdown header bar
+    UIView *dropBar = [[UIView alloc] init];
+    dropBar.translatesAutoresizingMaskIntoConstraints = NO;
+    dropBar.backgroundColor = [UIColor whiteColor];
+    dropBar.layer.cornerRadius = 11.0;
+    dropBar.layer.borderWidth = 1.0;
+    dropBar.layer.borderColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08].CGColor;
+    [dropBar.heightAnchor constraintEqualToConstant:36.0].active = YES;
+    UITapGestureRecognizer *dropTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onTapDropdownToggle)];
+    [dropBar addGestureRecognizer:dropTap];
+
+    UIImageView *dropIcon = [[UIImageView alloc] init];
+    dropIcon.translatesAutoresizingMaskIntoConstraints = NO;
+    dropIcon.tintColor = navy;
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:13.0 weight:UIImageSymbolWeightSemibold];
+        dropIcon.image = [UIImage systemImageNamed:@"folder.fill" withConfiguration:cfg];
+    }
+    [dropBar addSubview:dropIcon];
+
+    UILabel *dropTitle = [[UILabel alloc] init];
+    dropTitle.translatesAutoresizingMaskIntoConstraints = NO;
+    dropTitle.font = AMThemeFont(13.5, UIFontWeightBold);
+    dropTitle.textColor = navy;
+    dropTitle.text = @"Folders";
+    [dropBar addSubview:dropTitle];
+
+    UILabel *dropCount = [[UILabel alloc] init];
+    dropCount.translatesAutoresizingMaskIntoConstraints = NO;
+    dropCount.backgroundColor = [UIColor colorWithRed:0.933 green:0.941 blue:0.969 alpha:1.0];
+    dropCount.textColor = navy;
+    dropCount.font = AMThemeFont(11.0, UIFontWeightBold);
+    dropCount.textAlignment = NSTextAlignmentCenter;
+    dropCount.layer.cornerRadius = 8.5;
+    dropCount.clipsToBounds = YES;
+    dropCount.text = [NSString stringWithFormat:@" %lu ", (unsigned long)self.folders.count];
+    [dropBar addSubview:dropCount];
+
+    UIImageView *dropChev = [[UIImageView alloc] init];
+    dropChev.translatesAutoresizingMaskIntoConstraints = NO;
+    dropChev.tintColor = muted;
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:12.0 weight:UIImageSymbolWeightBold];
+        dropChev.image = [UIImage systemImageNamed:(self.isDropdownExpanded ? @"chevron.up" : @"chevron.down") withConfiguration:cfg];
+    }
+    [dropBar addSubview:dropChev];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [dropIcon.leadingAnchor constraintEqualToAnchor:dropBar.leadingAnchor constant:12.0],
+        [dropIcon.centerYAnchor constraintEqualToAnchor:dropBar.centerYAnchor],
+        [dropIcon.widthAnchor constraintEqualToConstant:16.0],
+        [dropIcon.heightAnchor constraintEqualToConstant:16.0],
+
+        [dropTitle.leadingAnchor constraintEqualToAnchor:dropIcon.trailingAnchor constant:8.0],
+        [dropTitle.centerYAnchor constraintEqualToAnchor:dropBar.centerYAnchor],
+
+        [dropCount.leadingAnchor constraintEqualToAnchor:dropTitle.trailingAnchor constant:7.0],
+        [dropCount.centerYAnchor constraintEqualToAnchor:dropBar.centerYAnchor],
+        [dropCount.heightAnchor constraintEqualToConstant:17.0],
+        [dropCount.widthAnchor constraintGreaterThanOrEqualToConstant:22.0],
+
+        [dropChev.trailingAnchor constraintEqualToAnchor:dropBar.trailingAnchor constant:-12.0],
+        [dropChev.centerYAnchor constraintEqualToAnchor:dropBar.centerYAnchor],
+        [dropChev.widthAnchor constraintEqualToConstant:14.0],
+        [dropChev.heightAnchor constraintEqualToConstant:14.0],
+    ]];
+
+    [self.stackView addArrangedSubview:dropBar];
+    totalH += 36.0 + 6.0;
+
+    if (!self.isDropdownExpanded) {
+        self.lastContentHeight = totalH;
+        return;
+    }
 
     for (NSUInteger fi = 0; fi < self.folders.count; fi++) {
         NSDictionary *folder = self.folders[fi];
@@ -4322,6 +4398,11 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
         }
     }
     self.lastContentHeight = totalH;
+}
+
+- (void)onTapDropdownToggle {
+    self.isDropdownExpanded = !self.isDropdownExpanded;
+    [self rebuildUI];
 }
 
 - (void)onTapFolderCard:(UITapGestureRecognizer *)gr {
@@ -4638,6 +4719,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
         (void)action;
         NSString *name = ac.textFields.firstObject.text ?: @"";
         if (AMCreateProjectFolder(name, nil)) {
+            weakSelf.inlineFoldersView.isDropdownExpanded = YES;
             [weakSelf.inlineFoldersView reloadForce:YES diskProjects:weakSelf.cachedDiskProjects ?: @[]];
             [weakSelf tick];
         }
