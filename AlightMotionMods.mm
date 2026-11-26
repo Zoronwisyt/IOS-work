@@ -3054,6 +3054,7 @@ static void AMHook_effectCategoryViewWillAppear(id self, SEL _cmd, BOOL animated
 
 static BOOL gAMSearchModalOpen = NO;
 static BOOL gAMFoldersModalOpen = NO;
+static BOOL gAMImportModalOpen = NO;
 
 static UIWindow *AMKeyWindow(void) {
     UIApplication *app = [UIApplication sharedApplication];
@@ -3097,6 +3098,7 @@ static BOOL AMVCTreeContainsEditor(UIViewController *vc, NSInteger depth) {
         [clsName containsString:@"AMFolderDetailVC"] ||
         [clsName containsString:@"AMAssignFolderVC"] ||
         [clsName containsString:@"AMProjectMultiPickerVC"] ||
+        [clsName containsString:@"AMOriginalProjectsImporterVC"] ||
         [clsName containsString:@"Loading"] ||
         [clsName containsString:@"Splash"] ||
         [clsName containsString:@"Launch"]) {
@@ -3140,7 +3142,7 @@ static BOOL AMHomepageModalCovering(UIWindow *win, UIViewController *mainVC) {
 
 static BOOL AMIsOnHomepage(UIWindow *win) {
     if (!win || !win.rootViewController) return NO;
-    if (gAMSearchModalOpen || gAMFoldersModalOpen) return NO;
+    if (gAMSearchModalOpen || gAMFoldersModalOpen || gAMImportModalOpen) return NO;
     UIViewController *root = win.rootViewController;
     if ([root isKindOfClass:[UINavigationController class]]) {
         UINavigationController *nav = (UINavigationController *)root;
@@ -5824,11 +5826,960 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
 @end
 
 // ============================================================================
-// Unified Homepage Overlay Manager (Search, + Folder, Inline Folders, Assign)
+// Module 4B: Homepage Original Alight Motion / Batch Project Importer
+// ============================================================================
+
+static NSString *AMFindThumbnailInContainer(NSString *projPath, NSString * _Nullable containerRoot) {
+    if (projPath.length == 0) return nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *stem = [[projPath lastPathComponent] stringByDeletingPathExtension];
+    if (stem.length == 0) return nil;
+
+    NSArray<NSString *> *exts = @[@"jpg", @"jpeg", @"png", @"webp"];
+    NSMutableArray<NSString *> *dirs = [NSMutableArray array];
+    if (containerRoot.length > 0) {
+        [dirs addObject:[containerRoot stringByAppendingPathComponent:@"Library/Caches/projectThumbnails"]];
+        [dirs addObject:[containerRoot stringByAppendingPathComponent:@"Library/projectThumbnails"]];
+    }
+    NSString *parent = [projPath stringByDeletingLastPathComponent];
+    if (parent.length > 0) [dirs addObject:parent];
+
+    for (NSString *dir in dirs) {
+        for (NSString *ext in exts) {
+            NSString *cand = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%@", stem, ext]];
+            if ([fm fileExistsAtPath:cand]) return cand;
+        }
+        NSArray<NSString *> *files = [fm contentsOfDirectoryAtPath:dir error:nil];
+        for (NSString *fn in files) {
+            if ([fn hasPrefix:stem]) {
+                NSString *e = fn.pathExtension.lowercaseString;
+                if ([e isEqualToString:@"jpg"] || [e isEqualToString:@"jpeg"] ||
+                    [e isEqualToString:@"png"] || [e isEqualToString:@"webp"]) {
+                    return [dir stringByAppendingPathComponent:fn];
+                }
+            }
+        }
+    }
+    return nil;
+}
+
+static NSDictionary * _Nullable AMParseProjectFileEntry(NSString *fullPath, NSString * _Nullable containerRoot) {
+    if (fullPath.length == 0) return nil;
+    NSString *ext = fullPath.pathExtension.lowercaseString ?: @"";
+
+    NSString *title = nil;
+    NSString *meta = @"";
+    BOOL isAmproj = NO;
+
+    if ([ext isEqualToString:@"amproj"] || [ext isEqualToString:@"zip"]) {
+        NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:fullPath];
+        NSData *head = [fh readDataOfLength:4];
+        [fh closeFile];
+        if (head.length < 4) return nil;
+        const uint8_t *b = (const uint8_t *)head.bytes;
+        if (!(b[0] == 'P' && b[1] == 'K' && b[2] == 0x03 && b[3] == 0x04)) return nil;
+        title = [[fullPath lastPathComponent] stringByDeletingPathExtension];
+        meta = @".amproj package";
+        isAmproj = YES;
+    } else if ([ext isEqualToString:@"xml"] || ext.length == 0) {
+        NSDictionary *xinfo = AMReadSceneInfoXattr(fullPath);
+        if (xinfo && [xinfo[@"title"] length] > 0) {
+            title = xinfo[@"title"];
+            meta = xinfo[@"meta"] ?: @"";
+        } else {
+            NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:fullPath];
+            NSData *head = [fh readDataOfLength:16384];
+            [fh closeFile];
+            if (head.length < 16) return nil;
+            NSString *txt = [[NSString alloc] initWithData:head encoding:NSUTF8StringEncoding];
+            if (!txt || ![txt containsString:@"<scene"]) return nil;
+            NSRange sStart = [txt rangeOfString:@"<scene"];
+            NSRange sEnd = [txt rangeOfString:@">" options:0 range:NSMakeRange(sStart.location, txt.length - sStart.location)];
+            if (sEnd.location == NSNotFound) return nil;
+            NSString *tag = [txt substringWithRange:NSMakeRange(sStart.location, (sEnd.location - sStart.location) + 1)];
+            title = AMExtractXMLAttr(tag, @"title");
+            if (title.length == 0) {
+                title = [[fullPath lastPathComponent] stringByDeletingPathExtension];
+            }
+            NSString *w = AMExtractXMLAttr(tag, @"width");
+            NSString *h = AMExtractXMLAttr(tag, @"height");
+            NSString *fps = AMExtractXMLAttr(tag, @"fps");
+            NSMutableArray<NSString *> *parts = [NSMutableArray array];
+            if (w.length > 0 && h.length > 0) [parts addObject:[NSString stringWithFormat:@"%@x%@", w, h]];
+            if (fps.length > 0) [parts addObject:[NSString stringWithFormat:@"%@fps", fps]];
+            meta = parts.count > 0 ? [parts componentsJoinedByString:@"  •  "] : @"XML Project";
+        }
+    } else {
+        return nil;
+    }
+
+    if (title.length == 0) return nil;
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:fullPath error:nil];
+    NSDate *modDate = attrs[NSFileModificationDate] ?: [NSDate distantPast];
+    NSString *thumb = AMFindThumbnailInContainer(fullPath, containerRoot) ?: @"";
+
+    static NSDateFormatter *df = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        df = [[NSDateFormatter alloc] init];
+        df.dateStyle = NSDateFormatterMediumStyle;
+        df.timeStyle = NSDateFormatterNoStyle;
+    });
+    NSString *dateStr = [modDate isEqualToDate:[NSDate distantPast]] ? @"" : [df stringFromDate:modDate];
+    NSString *fullMeta = (dateStr.length > 0 && meta.length > 0 && ![meta containsString:dateStr])
+        ? [NSString stringWithFormat:@"%@  •  %@", meta, dateStr]
+        : (meta.length > 0 ? meta : dateStr);
+
+    return @{
+        @"title": title,
+        @"meta": fullMeta ?: @"Alight Motion Project",
+        @"path": fullPath,
+        @"thumb": thumb,
+        @"date": modDate,
+        @"isAmproj": @(isAmproj),
+        @"containerRoot": containerRoot ?: @""
+    };
+}
+
+static NSArray<NSDictionary *> *AMScanProjectsInDirectory(NSString *rootDir, NSString * _Nullable containerRoot) {
+    if (rootDir.length == 0) return @[];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSDictionary *> *results = [NSMutableArray array];
+    NSMutableSet<NSString *> *seenPaths = [NSMutableSet set];
+
+    NSSet<NSString *> *skipTopDirs = [NSSet setWithArray:@[
+        @"Caches", @"Preferences", @"Cookies", @"SplashBoard", @"Saved Application State",
+        @"HTTPStorages", @"WebKit", @"CustomEffects", @"ProjectFolders", @"Firebase",
+        @"Google", @"Amplitude", @"Logs", @"Crashlytics", @"com.apple.nsurlsessiond", @"Inbox"
+    ]];
+
+    NSDirectoryEnumerator<NSString *> *en = [fm enumeratorAtPath:rootDir];
+    NSString *rel = nil;
+    NSInteger scanned = 0;
+    while ((rel = [en nextObject]) != nil && scanned < 4000) {
+        scanned++;
+        NSString *firstComp = rel.pathComponents.firstObject ?: @"";
+        if ([skipTopDirs containsObject:firstComp]) {
+            [en skipDescendants];
+            continue;
+        }
+        NSString *full = [rootDir stringByAppendingPathComponent:rel];
+        if ([seenPaths containsObject:full]) continue;
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+
+        NSDictionary *entry = AMParseProjectFileEntry(full, containerRoot);
+        if (entry) {
+            [seenPaths addObject:full];
+            [results addObject:entry];
+        }
+    }
+
+    [results sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSDate *da = a[@"date"] ?: [NSDate distantPast];
+        NSDate *db = b[@"date"] ?: [NSDate distantPast];
+        return [db compare:da];
+    }];
+    return results;
+}
+
+// Attempts to locate the Original App Store Alight Motion container (succeeds on TrollStore / jailbroken devices;
+// reports sandboxBlocked=YES cleanly on stock non-jailbroken sideloads).
+static NSArray<NSDictionary *> *AMFindOriginalAlightMotionProjects(NSString **outContainerPath, BOOL *outSandboxBlocked) {
+    if (outContainerPath) *outContainerPath = nil;
+    if (outSandboxBlocked) *outSandboxBlocked = NO;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *appsRoot = @"/var/mobile/Containers/Data/Application";
+    NSError *err = nil;
+    NSArray<NSString *> *uuids = [fm contentsOfDirectoryAtPath:appsRoot error:&err];
+    if (!uuids || uuids.count == 0) {
+        if (outSandboxBlocked) *outSandboxBlocked = YES;
+        return @[];
+    }
+
+    NSString *myHome = [NSHomeDirectory() stringByStandardizingPath] ?: @"";
+    NSString *matchedContainer = nil;
+    NSMutableArray<NSDictionary *> *found = [NSMutableArray array];
+
+    for (NSString *u in uuids) {
+        NSString *cDir = [[appsRoot stringByAppendingPathComponent:u] stringByStandardizingPath];
+        if ([cDir isEqualToString:myHome]) continue;
+
+        NSString *metaPlist = [cDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:metaPlist];
+        NSString *bid = [meta[@"MCMMetadataIdentifier"] isKindOfClass:[NSString class]] ? meta[@"MCMMetadataIdentifier"] : @"";
+        BOOL isAlight = [bid isEqualToString:@"com.alightcreative.motion"] ||
+                        ([bid localizedCaseInsensitiveContainsString:@"alightcreative.motion"]);
+
+        if (!isAlight && bid.length > 0) continue;
+
+        NSString *libDir = [cDir stringByAppendingPathComponent:@"Library"];
+        if (![fm fileExistsAtPath:libDir]) continue;
+
+        NSArray<NSDictionary *> *libProjs = AMScanProjectsInDirectory(libDir, cDir);
+        if (libProjs.count > 0 || isAlight) {
+            matchedContainer = cDir;
+            [found addObjectsFromArray:libProjs];
+            NSString *docsDir = [cDir stringByAppendingPathComponent:@"Documents"];
+            if ([fm fileExistsAtPath:docsDir]) {
+                [found addObjectsFromArray:AMScanProjectsInDirectory(docsDir, cDir)];
+            }
+            if (isAlight) break;
+        }
+    }
+
+    if (outContainerPath) *outContainerPath = matchedContainer;
+    return found;
+}
+
+static NSString * _Nullable AMImportXMLProjectFileToLibrary(NSString *srcPath,
+                                                            NSString * _Nullable srcContainerRoot,
+                                                            NSString * _Nullable optionalThumbPath,
+                                                            NSError **outErr) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (srcPath.length == 0 || ![fm fileExistsAtPath:srcPath]) {
+        if (outErr) *outErr = [NSError errorWithDomain:@"AMProjectImport" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Source file not found."}];
+        return nil;
+    }
+
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:srcPath];
+    NSData *head = [fh readDataOfLength:16384];
+    [fh closeFile];
+    NSString *prefix = head ? [[NSString alloc] initWithData:head encoding:NSUTF8StringEncoding] : nil;
+    if (!prefix || ![prefix containsString:@"<scene"]) {
+        if (outErr) *outErr = [NSError errorWithDomain:@"AMProjectImport" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Not a valid Alight Motion <scene> XML project."}];
+        return nil;
+    }
+
+    NSString *libDir = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
+    if (libDir.length == 0) {
+        if (outErr) *outErr = [NSError errorWithDomain:@"AMProjectImport" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Library directory unavailable."}];
+        return nil;
+    }
+
+    NSString *newUUID = [[NSUUID UUID] UUIDString];
+    NSString *dstPath = [libDir stringByAppendingPathComponent:[newUUID stringByAppendingString:@".xml"]];
+    NSError *cpErr = nil;
+    if (![fm copyItemAtPath:srcPath toPath:dstPath error:&cpErr]) {
+        if (outErr) *outErr = cpErr;
+        return nil;
+    }
+
+    // Preserve com.alightcreative.motion.sceneinfo xattr if present on source
+    ssize_t xsz = getxattr(srcPath.UTF8String, "com.alightcreative.motion.sceneinfo", NULL, 0, 0, 0);
+    if (xsz > 0 && xsz <= 65536) {
+        NSMutableData *xbuf = [NSMutableData dataWithLength:(NSUInteger)xsz];
+        if (getxattr(srcPath.UTF8String, "com.alightcreative.motion.sceneinfo", xbuf.mutableBytes, (size_t)xsz, 0, 0) > 0) {
+            setxattr(dstPath.UTF8String, "com.alightcreative.motion.sceneinfo", xbuf.bytes, xbuf.length, 0, 0);
+        }
+    }
+
+    // Copy project thumbnail if available
+    NSString *thumbSrc = optionalThumbPath.length > 0 ? optionalThumbPath : AMFindThumbnailInContainer(srcPath, srcContainerRoot);
+    if (thumbSrc.length > 0 && [fm fileExistsAtPath:thumbSrc]) {
+        NSString *thumbDir = [libDir stringByAppendingPathComponent:@"Caches/projectThumbnails"];
+        [fm createDirectoryAtPath:thumbDir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *ext = thumbSrc.pathExtension.length > 0 ? thumbSrc.pathExtension : @"jpg";
+        NSString *thumbDst = [thumbDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%@", newUUID, ext]];
+        [fm removeItemAtPath:thumbDst error:nil];
+        [fm copyItemAtPath:thumbSrc toPath:thumbDst error:nil];
+    }
+
+    // Best-effort copy of referenced local media files when importing from another Alight Motion container
+    if (srcContainerRoot.length > 0) {
+        NSString *srcMediaDir = [srcContainerRoot stringByAppendingPathComponent:@"Library/media"];
+        if ([fm fileExistsAtPath:srcMediaDir]) {
+            NSString *fullXML = [NSString stringWithContentsOfFile:dstPath encoding:NSUTF8StringEncoding error:nil];
+            if (fullXML.length > 0) {
+                NSString *dstMediaDir = [libDir stringByAppendingPathComponent:@"media"];
+                [fm createDirectoryAtPath:dstMediaDir withIntermediateDirectories:YES attributes:nil error:nil];
+                NSArray<NSString *> *mediaFiles = [fm contentsOfDirectoryAtPath:srcMediaDir error:nil];
+                for (NSString *mf in mediaFiles) {
+                    if ([fullXML containsString:mf]) {
+                        NSString *ms = [srcMediaDir stringByAppendingPathComponent:mf];
+                        NSString *md = [dstMediaDir stringByAppendingPathComponent:mf];
+                        if (![fm fileExistsAtPath:md]) {
+                            [fm copyItemAtPath:ms toPath:md error:nil];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return dstPath;
+}
+
+static NSInteger AMImportInboxProjectsIfAny(void) {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (docs.length == 0) return 0;
+    NSString *inbox = [docs stringByAppendingPathComponent:@"Inbox"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *files = [fm contentsOfDirectoryAtPath:inbox error:nil];
+    if (files.count == 0) return 0;
+
+    NSInteger imported = 0;
+    for (NSString *fn in files) {
+        NSString *full = [inbox stringByAppendingPathComponent:fn];
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+        NSString *ext = fn.pathExtension.lowercaseString ?: @"";
+        if ([ext isEqualToString:@"xml"]) {
+            if (AMImportXMLProjectFileToLibrary(full, nil, nil, nil) != nil) {
+                imported++;
+                [fm removeItemAtPath:full error:nil];
+            }
+        }
+    }
+    return imported;
+}
+
+static void AMQueueSequentialAmprojImports(NSArray<NSURL *> *urls) {
+    if (urls.count == 0) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSURL *> *staged = [NSMutableArray array];
+    long long ts = (long long)[[NSDate date] timeIntervalSince1970];
+    NSUInteger idx = 0;
+    for (NSURL *u in urls) {
+        BOOL scoped = [u startAccessingSecurityScopedResource];
+        NSString *ext = u.pathExtension.length > 0 ? u.pathExtension : @"amproj";
+        NSString *dst = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"AMBatchImport_%lld_%lu.%@", ts, (unsigned long)idx++, ext]];
+        [fm removeItemAtPath:dst error:nil];
+        if ([fm copyItemAtPath:u.path toPath:dst error:nil]) {
+            [staged addObject:[NSURL fileURLWithPath:dst]];
+        }
+        if (scoped) [u stopAccessingSecurityScopedResource];
+    }
+    for (NSUInteger i = 0; i < staged.count; i++) {
+        NSURL *fileURL = staged[i];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 1.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            AMOpenLocalFileInApp(fileURL);
+        });
+    }
+}
+
+@interface AMOriginalProjectsImporterVC : UIViewController <UITableViewDataSource, UITableViewDelegate, UIDocumentPickerDelegate>
+@property (nonatomic, copy) void (^onProjectsImported)(NSInteger count);
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, strong) UILabel *statusTitleLabel;
+@property (nonatomic, strong) UILabel *statusBodyLabel;
+@property (nonatomic, strong) UIView *statusCard;
+@property (nonatomic, strong) UIButton *importSelectedButton;
+@property (nonatomic, strong) UILabel *emptyListLabel;
+@property (nonatomic, copy) NSArray<NSDictionary *> *candidateProjects;
+@property (nonatomic, strong) NSMutableSet<NSNumber *> *selectedIndices;
+@property (nonatomic, strong) NSCache<NSString *, UIImage *> *thumbCache;
+@property (nonatomic, assign) BOOL pickingFolderMode;
+@property (nonatomic, strong, nullable) NSURL *activeScopedFolderURL;
+@end
+
+@implementation AMOriginalProjectsImporterVC
+
+- (void)dealloc {
+    if (self.activeScopedFolderURL) {
+        [self.activeScopedFolderURL stopAccessingSecurityScopedResource];
+        self.activeScopedFolderURL = nil;
+    }
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    if (@available(iOS 13.0, *)) {
+        self.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
+    }
+    self.thumbCache = [[NSCache alloc] init];
+    self.selectedIndices = [NSMutableSet set];
+    self.candidateProjects = @[];
+
+    UIColor *bgColor = [UIColor colorWithRed:0.965 green:0.969 blue:0.984 alpha:1.0];
+    UIColor *navy = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+    UIColor *muted = [UIColor colorWithRed:0.45 green:0.47 blue:0.55 alpha:1.0];
+    self.view.backgroundColor = bgColor;
+    self.title = @"Import Projects";
+
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Close"
+                                                                             style:UIBarButtonItemStylePlain
+                                                                            target:self
+                                                                            action:@selector(onClose)];
+    self.navigationItem.leftBarButtonItem.tintColor = navy;
+
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Select All"
+                                                                              style:UIBarButtonItemStylePlain
+                                                                             target:self
+                                                                             action:@selector(onToggleSelectAll)];
+    self.navigationItem.rightBarButtonItem.tintColor = navy;
+
+    // Header container (status + 3 quick batch-import actions)
+    UIView *headerWrap = [[UIView alloc] init];
+    headerWrap.translatesAutoresizingMaskIntoConstraints = NO;
+    headerWrap.backgroundColor = bgColor;
+    [self.view addSubview:headerWrap];
+
+    self.statusCard = [[UIView alloc] init];
+    self.statusCard.translatesAutoresizingMaskIntoConstraints = NO;
+    self.statusCard.backgroundColor = [UIColor whiteColor];
+    self.statusCard.layer.cornerRadius = 14.0;
+    self.statusCard.layer.borderWidth = 1.0;
+    self.statusCard.layer.borderColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08].CGColor;
+    [headerWrap addSubview:self.statusCard];
+
+    self.statusTitleLabel = [[UILabel alloc] init];
+    self.statusTitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.statusTitleLabel.font = AMThemeFont(13.5, UIFontWeightBold);
+    self.statusTitleLabel.textColor = navy;
+    self.statusTitleLabel.numberOfLines = 1;
+    [self.statusCard addSubview:self.statusTitleLabel];
+
+    self.statusBodyLabel = [[UILabel alloc] init];
+    self.statusBodyLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.statusBodyLabel.font = AMThemeFont(12.0, UIFontWeightRegular);
+    self.statusBodyLabel.textColor = muted;
+    self.statusBodyLabel.numberOfLines = 0;
+    [self.statusCard addSubview:self.statusBodyLabel];
+
+    UIStackView *btnRow = [[UIStackView alloc] init];
+    btnRow.translatesAutoresizingMaskIntoConstraints = NO;
+    btnRow.axis = UILayoutConstraintAxisHorizontal;
+    btnRow.spacing = 8.0;
+    btnRow.distribution = UIStackViewDistributionFillEqually;
+    [headerWrap addSubview:btnRow];
+
+    UIButton *filesBtn = [self makeActionPill:@"Files (.xml/.amproj)" symbol:@"doc.on.doc" action:@selector(onTapPickFiles)];
+    UIButton *folderBtn = [self makeActionPill:@"Pick Folder" symbol:@"folder" action:@selector(onTapPickFolder)];
+    UIButton *linksBtn = [self makeActionPill:@"Alight Links" symbol:@"link" action:@selector(onTapBatchLinks)];
+    [btnRow addArrangedSubview:filesBtn];
+    [btnRow addArrangedSubview:folderBtn];
+    [btnRow addArrangedSubview:linksBtn];
+
+    // Table view for multi-selecting Original Alight Motion / Folder projects
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
+    self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.tableView.backgroundColor = bgColor;
+    self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
+    self.tableView.contentInset = UIEdgeInsetsMake(4.0, 0.0, 92.0, 0.0);
+    self.tableView.dataSource = self;
+    self.tableView.delegate = self;
+    [self.view addSubview:self.tableView];
+
+    self.emptyListLabel = [[UILabel alloc] init];
+    self.emptyListLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.emptyListLabel.font = AMThemeFont(13.0, UIFontWeightMedium);
+    self.emptyListLabel.textColor = muted;
+    self.emptyListLabel.textAlignment = NSTextAlignmentCenter;
+    self.emptyListLabel.numberOfLines = 0;
+    self.emptyListLabel.text = @"Tip: In Original Alight Motion, export projects as XML or Project Package to Files (or Share XML directly to this app), then pick them above.";
+    [self.view addSubview:self.emptyListLabel];
+
+    // Sticky bottom import button
+    self.importSelectedButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.importSelectedButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.importSelectedButton.backgroundColor = navy;
+    [self.importSelectedButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.importSelectedButton.titleLabel.font = AMThemeFont(15.0, UIFontWeightBold);
+    self.importSelectedButton.layer.cornerRadius = 24.0;
+    self.importSelectedButton.layer.shadowColor = [UIColor blackColor].CGColor;
+    self.importSelectedButton.layer.shadowOpacity = 0.18;
+    self.importSelectedButton.layer.shadowRadius = 10.0;
+    self.importSelectedButton.layer.shadowOffset = CGSizeMake(0, 4);
+    [self.importSelectedButton addTarget:self action:@selector(onTapImportSelected) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.importSelectedButton];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [headerWrap.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [headerWrap.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [headerWrap.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+
+        [self.statusCard.topAnchor constraintEqualToAnchor:headerWrap.topAnchor constant:10.0],
+        [self.statusCard.leadingAnchor constraintEqualToAnchor:headerWrap.leadingAnchor constant:16.0],
+        [self.statusCard.trailingAnchor constraintEqualToAnchor:headerWrap.trailingAnchor constant:-16.0],
+
+        [self.statusTitleLabel.topAnchor constraintEqualToAnchor:self.statusCard.topAnchor constant:11.0],
+        [self.statusTitleLabel.leadingAnchor constraintEqualToAnchor:self.statusCard.leadingAnchor constant:14.0],
+        [self.statusTitleLabel.trailingAnchor constraintEqualToAnchor:self.statusCard.trailingAnchor constant:-14.0],
+
+        [self.statusBodyLabel.topAnchor constraintEqualToAnchor:self.statusTitleLabel.bottomAnchor constant:4.0],
+        [self.statusBodyLabel.leadingAnchor constraintEqualToAnchor:self.statusCard.leadingAnchor constant:14.0],
+        [self.statusBodyLabel.trailingAnchor constraintEqualToAnchor:self.statusCard.trailingAnchor constant:-14.0],
+        [self.statusBodyLabel.bottomAnchor constraintEqualToAnchor:self.statusCard.bottomAnchor constant:-11.0],
+
+        [btnRow.topAnchor constraintEqualToAnchor:self.statusCard.bottomAnchor constant:10.0],
+        [btnRow.leadingAnchor constraintEqualToAnchor:headerWrap.leadingAnchor constant:16.0],
+        [btnRow.trailingAnchor constraintEqualToAnchor:headerWrap.trailingAnchor constant:-16.0],
+        [btnRow.heightAnchor constraintEqualToConstant:44.0],
+        [btnRow.bottomAnchor constraintEqualToAnchor:headerWrap.bottomAnchor constant:-8.0],
+
+        [self.tableView.topAnchor constraintEqualToAnchor:headerWrap.bottomAnchor],
+        [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+
+        [self.emptyListLabel.centerYAnchor constraintEqualToAnchor:self.tableView.centerYAnchor constant:-20.0],
+        [self.emptyListLabel.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:28.0],
+        [self.emptyListLabel.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-28.0],
+
+        [self.importSelectedButton.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:20.0],
+        [self.importSelectedButton.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-20.0],
+        [self.importSelectedButton.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-14.0],
+        [self.importSelectedButton.heightAnchor constraintEqualToConstant:48.0],
+    ]];
+
+    [self scanOriginalAppContainer];
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    if (self.isBeingDismissed || self.navigationController.isBeingDismissed) {
+        gAMImportModalOpen = NO;
+    }
+}
+
+- (UIButton *)makeActionPill:(NSString *)title symbol:(NSString *)sym action:(SEL)sel {
+    UIColor *navy = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.backgroundColor = [UIColor whiteColor];
+    b.tintColor = navy;
+    [b setTitleColor:navy forState:UIControlStateNormal];
+    b.titleLabel.font = AMThemeFont(11.5, UIFontWeightSemibold);
+    b.titleLabel.adjustsFontSizeToFitWidth = YES;
+    b.titleLabel.minimumScaleFactor = 0.8;
+    b.layer.cornerRadius = 12.0;
+    b.layer.borderWidth = 1.0;
+    b.layer.borderColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08].CGColor;
+    [b setTitle:[@" " stringByAppendingString:title] forState:UIControlStateNormal];
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:12.5 weight:UIImageSymbolWeightSemibold];
+        [b setImage:[UIImage systemImageNamed:sym withConfiguration:cfg] forState:UIControlStateNormal];
+    }
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)scanOriginalAppContainer {
+    NSString *container = nil;
+    BOOL sandboxBlocked = NO;
+    NSArray<NSDictionary *> *projs = AMFindOriginalAlightMotionProjects(&container, &sandboxBlocked);
+    self.candidateProjects = projs;
+    [self.selectedIndices removeAllObjects];
+
+    if (projs.count > 0) {
+        for (NSUInteger i = 0; i < projs.count; i++) {
+            [self.selectedIndices addObject:@(i)];
+        }
+        self.statusTitleLabel.text = [NSString stringWithFormat:@"Original Alight Motion Found (%lu projects)", (unsigned long)projs.count];
+        self.statusTitleLabel.textColor = [UIColor colorWithRed:0.07 green:0.55 blue:0.38 alpha:1.0];
+        self.statusBodyLabel.text = @"Select the projects you want below and tap Import Selected to copy them into this IPA.";
+    } else if (sandboxBlocked) {
+        self.statusTitleLabel.text = @"iOS Sandbox Active (Standard Sideload)";
+        self.statusTitleLabel.textColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+        self.statusBodyLabel.text = @"iOS blocks reading the App Store Alight Motion container directly. Export your projects as XML / Project Package (.amproj) or copy Alight Links, then batch-import below.";
+    } else {
+        self.statusTitleLabel.text = @"Original Alight Motion Not Found";
+        self.statusTitleLabel.textColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+        self.statusBodyLabel.text = @"No projects were found in another Alight Motion container. Use Files, Pick Folder, or Alight Links below.";
+    }
+
+    [self updateSelectionUI];
+    [self.tableView reloadData];
+}
+
+- (void)updateSelectionUI {
+    BOOL hasList = self.candidateProjects.count > 0;
+    self.emptyListLabel.hidden = hasList;
+    self.importSelectedButton.hidden = !hasList;
+    self.navigationItem.rightBarButtonItem.enabled = hasList;
+
+    NSUInteger selCount = self.selectedIndices.count;
+    if (hasList && selCount == self.candidateProjects.count) {
+        self.navigationItem.rightBarButtonItem.title = @"Clear";
+    } else {
+        self.navigationItem.rightBarButtonItem.title = @"Select All";
+    }
+
+    [self.importSelectedButton setTitle:[NSString stringWithFormat:@"Import Selected (%lu)", (unsigned long)selCount]
+                               forState:UIControlStateNormal];
+    self.importSelectedButton.enabled = (selCount > 0);
+    self.importSelectedButton.alpha = (selCount > 0) ? 1.0 : 0.45;
+}
+
+- (void)onClose {
+    gAMImportModalOpen = NO;
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)onToggleSelectAll {
+    if (self.candidateProjects.count == 0) return;
+    if (self.selectedIndices.count == self.candidateProjects.count) {
+        [self.selectedIndices removeAllObjects];
+    } else {
+        for (NSUInteger i = 0; i < self.candidateProjects.count; i++) {
+            [self.selectedIndices addObject:@(i)];
+        }
+    }
+    [self updateSelectionUI];
+    [self.tableView reloadData];
+}
+
+- (void)onTapPickFiles {
+    self.pickingFolderMode = NO;
+    UIDocumentPickerViewController *picker = nil;
+    if (@available(iOS 14.0, *)) {
+        NSArray<UTType *> *types = @[UTTypeXML, UTTypeZIP, UTTypeItem, UTTypeData];
+        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types asCopy:NO];
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.xml", @"public.zip-archive", @"public.item"]
+                                                                        inMode:UIDocumentPickerModeImport];
+#pragma clang diagnostic pop
+    }
+    picker.allowsMultipleSelection = YES;
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)onTapPickFolder {
+    self.pickingFolderMode = YES;
+    UIDocumentPickerViewController *picker = nil;
+    if (@available(iOS 14.0, *)) {
+        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeFolder] asCopy:NO];
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.folder"]
+                                                                        inMode:UIDocumentPickerModeOpen];
+#pragma clang diagnostic pop
+    }
+    picker.allowsMultipleSelection = NO;
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)onTapBatchLinks {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Batch Import Alight Links"
+                                                                message:@"Paste one or more alight.link / alightcreative.com/am/share URLs separated by spaces or commas."
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    NSString *clip = [UIPasteboard generalPasteboard].string ?: @"";
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"https://alight.link/...";
+        tf.keyboardType = UIKeyboardTypeURL;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        if ([clip localizedCaseInsensitiveContainsString:@"alight.link"] ||
+            [clip localizedCaseInsensitiveContainsString:@"alightcreative.com/am/share"]) {
+            tf.text = clip;
+        }
+    }];
+    __weak AMOriginalProjectsImporterVC *weakSelf = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Import" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        (void)a;
+        NSString *raw = ac.textFields.firstObject.text ?: @"";
+        NSCharacterSet *seps = [NSCharacterSet characterSetWithCharactersInString:@",\n\r \t"];
+        NSArray<NSString *> *tokens = [raw componentsSeparatedByCharactersInSet:seps];
+        NSMutableArray<NSURL *> *urls = [NSMutableArray array];
+        for (NSString *tok in tokens) {
+            NSString *t = [tok stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (t.length < 8) continue;
+            if ([t localizedCaseInsensitiveContainsString:@"alight.link"] ||
+                [t localizedCaseInsensitiveContainsString:@"alightcreative.com"]) {
+                NSURL *u = AMNormalizeAlightLink(t);
+                if (u) [urls addObject:u];
+            }
+        }
+        if (urls.count == 0) {
+            [weakSelf showMessage:@"No valid Alight Motion links found." title:@"Import Links"];
+            return;
+        }
+        gAMImportModalOpen = NO;
+        [weakSelf dismissViewControllerAnimated:YES completion:^{
+            for (NSUInteger i = 0; i < urls.count; i++) {
+                NSURL *u = urls[i];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    UIViewController *top = AMTopMostViewController();
+                    if (top) {
+                        AMHandleUserLinkFromVC(top, u, YES);
+                    } else {
+                        AMDispatchAlightLink(u);
+                    }
+                });
+            }
+        }];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    (void)controller;
+    if (urls.count == 0) return;
+
+    if (self.pickingFolderMode) {
+        NSURL *folderURL = urls.firstObject;
+        if (self.activeScopedFolderURL) {
+            [self.activeScopedFolderURL stopAccessingSecurityScopedResource];
+            self.activeScopedFolderURL = nil;
+        }
+        BOOL scoped = [folderURL startAccessingSecurityScopedResource];
+        if (scoped) self.activeScopedFolderURL = folderURL;
+
+        NSArray<NSDictionary *> *found = AMScanProjectsInDirectory(folderURL.path, nil);
+        self.candidateProjects = found;
+        [self.selectedIndices removeAllObjects];
+        for (NSUInteger i = 0; i < found.count; i++) {
+            [self.selectedIndices addObject:@(i)];
+        }
+        self.statusTitleLabel.text = [NSString stringWithFormat:@"Folder: %@ (%lu found)",
+                                      folderURL.lastPathComponent ?: @"Selected", (unsigned long)found.count];
+        self.statusTitleLabel.textColor = found.count > 0
+            ? [UIColor colorWithRed:0.07 green:0.55 blue:0.38 alpha:1.0]
+            : [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+        self.statusBodyLabel.text = found.count > 0
+            ? @"Select the projects you want and tap Import Selected below."
+            : @"No .xml or .amproj project files found in that folder.";
+        [self updateSelectionUI];
+        [self.tableView reloadData];
+        return;
+    }
+
+    // Multi-file direct import
+    NSInteger xmlImported = 0;
+    NSMutableArray<NSURL *> *amprojURLs = [NSMutableArray array];
+    NSInteger skipped = 0;
+
+    for (NSURL *u in urls) {
+        BOOL scoped = [u startAccessingSecurityScopedResource];
+        NSString *ext = u.pathExtension.lowercaseString ?: @"";
+        if ([ext isEqualToString:@"amproj"] || [ext isEqualToString:@"zip"]) {
+            [amprojURLs addObject:u];
+        } else {
+            if (AMImportXMLProjectFileToLibrary(u.path, nil, nil, nil) != nil) {
+                xmlImported++;
+            } else {
+                skipped++;
+            }
+        }
+        if (scoped) [u stopAccessingSecurityScopedResource];
+    }
+
+    if (xmlImported > 0 && self.onProjectsImported) {
+        self.onProjectsImported(xmlImported);
+    }
+
+    if (amprojURLs.count > 0) {
+        gAMImportModalOpen = NO;
+        [self dismissViewControllerAnimated:YES completion:^{
+            AMQueueSequentialAmprojImports(amprojURLs);
+        }];
+        return;
+    }
+
+    NSString *msg = [NSString stringWithFormat:@"Imported %ld XML project(s) into this IPA.%@\n\nSwitch tabs or reopen the app if the native project grid does not refresh immediately.",
+                     (long)xmlImported,
+                     skipped > 0 ? [NSString stringWithFormat:@" (%ld file(s) skipped)", (long)skipped] : @""];
+    [self showMessage:msg title:xmlImported > 0 ? @"Import Complete" : @"Nothing Imported"];
+}
+
+- (void)onTapImportSelected {
+    if (self.selectedIndices.count == 0) return;
+
+    NSInteger xmlImported = 0;
+    NSInteger failed = 0;
+    NSMutableArray<NSURL *> *amprojURLs = [NSMutableArray array];
+
+    NSArray<NSNumber *> *sortedIdx = [[self.selectedIndices allObjects] sortedArrayUsingSelector:@selector(compare:)];
+    for (NSNumber *n in sortedIdx) {
+        NSUInteger i = n.unsignedIntegerValue;
+        if (i >= self.candidateProjects.count) continue;
+        NSDictionary *proj = self.candidateProjects[i];
+        NSString *path = proj[@"path"];
+        if (path.length == 0) continue;
+
+        if ([proj[@"isAmproj"] boolValue]) {
+            [amprojURLs addObject:[NSURL fileURLWithPath:path]];
+        } else {
+            NSString *cRoot = [proj[@"containerRoot"] length] > 0 ? proj[@"containerRoot"] : nil;
+            NSString *thumb = [proj[@"thumb"] length] > 0 ? proj[@"thumb"] : nil;
+            if (AMImportXMLProjectFileToLibrary(path, cRoot, thumb, nil) != nil) {
+                xmlImported++;
+            } else {
+                failed++;
+            }
+        }
+    }
+
+    if (xmlImported > 0 && self.onProjectsImported) {
+        self.onProjectsImported(xmlImported);
+    }
+
+    if (amprojURLs.count > 0) {
+        gAMImportModalOpen = NO;
+        [self dismissViewControllerAnimated:YES completion:^{
+            AMQueueSequentialAmprojImports(amprojURLs);
+        }];
+        return;
+    }
+
+    NSString *msg = [NSString stringWithFormat:@"Imported %ld project(s) into this IPA.%@\n\nOpen them right away from Search/Folders, or switch tabs / reopen the app to refresh the native grid.",
+                     (long)xmlImported,
+                     failed > 0 ? [NSString stringWithFormat:@" (%ld failed)", (long)failed] : @""];
+    __weak AMOriginalProjectsImporterVC *weakSelf = self;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:xmlImported > 0 ? @"Import Complete" : @"Import Failed"
+                                                                message:msg
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Done" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        (void)a;
+        if (xmlImported > 0) [weakSelf onClose];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)showMessage:(NSString *)msg title:(NSString *)title {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
+                                                                message:msg
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    (void)tableView; (void)section;
+    return self.candidateProjects.count;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    (void)tableView; (void)indexPath;
+    return 76.0;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"AMOrigImportCell"];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"AMOrigImportCell"];
+        cell.backgroundColor = [UIColor clearColor];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+        UIView *card = [[UIView alloc] init];
+        card.tag = 301;
+        card.translatesAutoresizingMaskIntoConstraints = NO;
+        card.backgroundColor = [UIColor whiteColor];
+        card.layer.cornerRadius = 14.0;
+        card.layer.borderWidth = 1.0;
+        card.layer.borderColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.07].CGColor;
+        [cell.contentView addSubview:card];
+
+        UIImageView *thumb = [[UIImageView alloc] init];
+        thumb.tag = 302;
+        thumb.translatesAutoresizingMaskIntoConstraints = NO;
+        thumb.backgroundColor = [UIColor colorWithRed:0.933 green:0.941 blue:0.969 alpha:1.0];
+        thumb.layer.cornerRadius = 9.0;
+        thumb.clipsToBounds = YES;
+        [card addSubview:thumb];
+
+        UILabel *titleLbl = [[UILabel alloc] init];
+        titleLbl.tag = 303;
+        titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
+        titleLbl.font = AMThemeFont(14.5, UIFontWeightBold);
+        titleLbl.textColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+        [card addSubview:titleLbl];
+
+        UILabel *metaLbl = [[UILabel alloc] init];
+        metaLbl.tag = 304;
+        metaLbl.translatesAutoresizingMaskIntoConstraints = NO;
+        metaLbl.font = AMThemeFont(11.5, UIFontWeightRegular);
+        metaLbl.textColor = [UIColor colorWithRed:0.45 green:0.47 blue:0.55 alpha:1.0];
+        [card addSubview:metaLbl];
+
+        UIImageView *checkIV = [[UIImageView alloc] init];
+        checkIV.tag = 305;
+        checkIV.translatesAutoresizingMaskIntoConstraints = NO;
+        checkIV.contentMode = UIViewContentModeScaleAspectFit;
+        [card addSubview:checkIV];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [card.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:4.0],
+            [card.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-4.0],
+            [card.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16.0],
+            [card.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16.0],
+
+            [thumb.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:10.0],
+            [thumb.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+            [thumb.widthAnchor constraintEqualToConstant:48.0],
+            [thumb.heightAnchor constraintEqualToConstant:48.0],
+
+            [titleLbl.leadingAnchor constraintEqualToAnchor:thumb.trailingAnchor constant:12.0],
+            [titleLbl.trailingAnchor constraintEqualToAnchor:checkIV.leadingAnchor constant:-10.0],
+            [titleLbl.topAnchor constraintEqualToAnchor:card.topAnchor constant:14.0],
+
+            [metaLbl.leadingAnchor constraintEqualToAnchor:titleLbl.leadingAnchor],
+            [metaLbl.trailingAnchor constraintEqualToAnchor:titleLbl.trailingAnchor],
+            [metaLbl.topAnchor constraintEqualToAnchor:titleLbl.bottomAnchor constant:3.0],
+
+            [checkIV.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14.0],
+            [checkIV.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+            [checkIV.widthAnchor constraintEqualToConstant:24.0],
+            [checkIV.heightAnchor constraintEqualToConstant:24.0],
+        ]];
+    }
+
+    NSDictionary *p = self.candidateProjects[indexPath.row];
+    UIImageView *thumb = [cell.contentView viewWithTag:302];
+    UILabel *titleLbl = [cell.contentView viewWithTag:303];
+    UILabel *metaLbl = [cell.contentView viewWithTag:304];
+    UIImageView *checkIV = [cell.contentView viewWithTag:305];
+
+    titleLbl.text = p[@"title"] ?: @"Untitled";
+    metaLbl.text = p[@"meta"] ?: @"";
+
+    NSString *tp = p[@"thumb"];
+    UIImage *img = nil;
+    if (tp.length > 0) {
+        img = [self.thumbCache objectForKey:tp];
+        if (!img) {
+            img = [UIImage imageWithContentsOfFile:tp];
+            if (img) [self.thumbCache setObject:img forKey:tp];
+        }
+    }
+    if (img) {
+        thumb.contentMode = UIViewContentModeScaleAspectFill;
+        thumb.image = img;
+    } else {
+        thumb.contentMode = UIViewContentModeCenter;
+        if (@available(iOS 13.0, *)) {
+            thumb.image = [UIImage systemImageNamed:[p[@"isAmproj"] boolValue] ? @"shippingbox" : @"film.stack"];
+            thumb.tintColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.65];
+        }
+    }
+
+    BOOL sel = [self.selectedIndices containsObject:@(indexPath.row)];
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:20.0 weight:UIImageSymbolWeightSemibold];
+        checkIV.image = [UIImage systemImageNamed:(sel ? @"checkmark.circle.fill" : @"circle") withConfiguration:cfg];
+        checkIV.tintColor = sel ? AMAccentGreenColor() : [UIColor colorWithRed:0.75 green:0.77 blue:0.83 alpha:1.0];
+    }
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    NSNumber *key = @(indexPath.row);
+    if ([self.selectedIndices containsObject:key]) {
+        [self.selectedIndices removeObject:key];
+    } else {
+        [self.selectedIndices addObject:key];
+    }
+    [self updateSelectionUI];
+    [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+}
+
+@end
+
+// ============================================================================
+// Unified Homepage Overlay Manager (Search, Import, + Folder, Inline Folders, Assign)
 // ============================================================================
 
 @interface AMHomepageSearchOverlayManager : NSObject
 @property (nonatomic, strong, nullable) UIButton *searchButton;
+@property (nonatomic, strong, nullable) UIButton *importProjectsButton;
 @property (nonatomic, strong, nullable) UIButton *foldersButton;
 @property (nonatomic, strong, nullable) UIButton *assignFolderButton;
 @property (nonatomic, strong, nullable) AMHomepageFoldersInlineView *inlineFoldersView;
@@ -5856,12 +6807,25 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
 - (void)start {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self.pollTimer) return;
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(onAppDidBecomeActive)
+                                                     name:UIApplicationDidBecomeActiveNotification
+                                                   object:nil];
+        [self onAppDidBecomeActive];
         self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:0.35
                                                           target:self
                                                         selector:@selector(tick)
                                                         userInfo:nil
                                                          repeats:YES];
     });
+}
+
+- (void)onAppDidBecomeActive {
+    NSInteger imported = AMImportInboxProjectsIfAny();
+    if (imported > 0) {
+        [self refreshProjectCacheIfNeeded:YES];
+        [self.inlineFoldersView reloadForce:YES diskProjects:self.cachedDiskProjects ?: @[]];
+    }
 }
 
 - (void)refreshProjectCacheIfNeeded:(BOOL)force {
@@ -5894,6 +6858,24 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
         }
         [btn addTarget:self action:@selector(onTapSearch) forControlEvents:UIControlEventTouchUpInside];
         self.searchButton = btn;
+    }
+
+    if (!self.importProjectsButton) {
+        UIButton *ibtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        ibtn.accessibilityLabel = @"Import Projects";
+        ibtn.backgroundColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08];
+        ibtn.tintColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+        ibtn.layer.cornerRadius = 17.0;
+        ibtn.layer.borderWidth = 0.5;
+        ibtn.layer.borderColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08].CGColor;
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.5 weight:UIImageSymbolWeightSemibold];
+            [ibtn setImage:[UIImage systemImageNamed:@"square.and.arrow.down" withConfiguration:cfg] forState:UIControlStateNormal];
+        } else {
+            [ibtn setTitle:@"+" forState:UIControlStateNormal];
+        }
+        [ibtn addTarget:self action:@selector(onTapImportProjects) forControlEvents:UIControlEventTouchUpInside];
+        self.importProjectsButton = ibtn;
     }
 
     if (!self.foldersButton) {
@@ -5946,7 +6928,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
         self.inlineFoldersView = [[AMHomepageFoldersInlineView alloc] initWithFrame:CGRectZero];
     }
 
-    for (UIView *v in @[self.inlineFoldersView, self.searchButton, self.foldersButton, self.assignFolderButton]) {
+    for (UIView *v in @[self.inlineFoldersView, self.importProjectsButton, self.searchButton, self.foldersButton, self.assignFolderButton]) {
         if (v.superview != hostView) [hostView addSubview:v];
         [hostView bringSubviewToFront:v];
     }
@@ -5957,6 +6939,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     if (!win) return;
     if (!AMIsOnHomepage(win)) {
         self.searchButton.hidden = YES;
+        self.importProjectsButton.hidden = YES;
         self.foldersButton.hidden = YES;
         self.assignFolderButton.hidden = YES;
         self.inlineFoldersView.hidden = YES;
@@ -5986,6 +6969,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
 
     if (probe.isSelectionMode) {
         self.searchButton.hidden = YES;
+        self.importProjectsButton.hidden = YES;
         self.foldersButton.hidden = YES;
         self.inlineFoldersView.hidden = YES;
 
@@ -6008,6 +6992,10 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     CGFloat sy = win.safeAreaInsets.top + 8.0;
     self.searchButton.frame = [hostView convertRect:CGRectMake(sx, sy, size, size) fromView:win];
     self.searchButton.hidden = NO;
+
+    CGFloat ix = sx - 8.0 - size;
+    self.importProjectsButton.frame = [hostView convertRect:CGRectMake(ix, sy, size, size) fromView:win];
+    self.importProjectsButton.hidden = NO;
 
     if (probe.hasYourProjects) {
         CGFloat midY = CGRectGetMidY(probe.yourProjectsFrame);
@@ -6048,6 +7036,25 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     gAMSearchModalOpen = YES;
     AMProjectSearchVC *vc = [[AMProjectSearchVC alloc] init];
     vc.allProjects = self.cachedDiskProjects ?: @[];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    if (@available(iOS 13.0, *)) {
+        nav.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
+    }
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    [top presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)onTapImportProjects {
+    UIViewController *top = AMTopMostViewController();
+    if (!top) return;
+    gAMImportModalOpen = YES;
+    AMOriginalProjectsImporterVC *vc = [[AMOriginalProjectsImporterVC alloc] init];
+    __weak AMHomepageSearchOverlayManager *weakSelf = self;
+    vc.onProjectsImported = ^(NSInteger count) {
+        (void)count;
+        [weakSelf refreshProjectCacheIfNeeded:YES];
+        [weakSelf.inlineFoldersView reloadForce:YES diskProjects:weakSelf.cachedDiskProjects ?: @[]];
+    };
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     if (@available(iOS 13.0, *)) {
         nav.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
