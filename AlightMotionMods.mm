@@ -2064,7 +2064,7 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
     ed.isCreating = YES;
     ed.isUserCategory = YES;
     ed.modalPresentationStyle = UIModalPresentationPageSheet;
-    __weak typeof(self) weakSelf = self;
+    __weak AMEffectCategoriesManagerVC *weakSelf = self;
     ed.onSaved = ^{
         [weakSelf reloadLists];
     };
@@ -2231,7 +2231,7 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
         }
     }
     ed.modalPresentationStyle = UIModalPresentationPageSheet;
-    __weak typeof(self) weakSelf = self;
+    __weak AMEffectCategoriesManagerVC *weakSelf = self;
     ed.onSaved = ^{
         [weakSelf reloadLists];
     };
