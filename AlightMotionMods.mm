@@ -8,10 +8,12 @@
 //    Supports direct sign-in-free Firebase Storage `projectfiles.zip` download for
 //    any alightcreative.com/am/share/u/<uid>/p/<pid> or alight.link URL (even >100MB),
 //    plus native dispatch (with client sign-in/size gates bypassed).
-// 3. Custom XML Effects Importer: `+` button in Effects -> Other category.
-//    Creates each custom effect with a unique `com.alightcreative.effects.custom_*`
-//    ID and its own selectable box in `Other` (auto-wraps raw GLSL or normalizes
-//    `<effect>` XML, strips hidden flags, and renders custom PNG thumbnails).
+// 3. Custom Effect Category & XML Effects Importer: dedicated `Custom` effect
+//    category bar in Effects (injected into EffectCategory.all) with `+` button
+//    inside Effects -> Custom. Creates each custom effect with a unique
+//    `com.alightcreative.effects.custom_*` ID and `category="custom"` (auto-wraps
+//    raw GLSL or normalizes `<effect>` XML, strips hidden flags, migrates prior
+//    `category="other"` custom XMLs, and renders custom PNG thumbnails).
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -812,7 +814,7 @@ static NSString *AMXmlEscapeAttr(NSString *s) {
 }
 
 // Prepares valid Alight Motion <effect> XML so VisualEffectParser always registers
-// it as its own standalone box inside category="other" (usable on any layer).
+// it as its own standalone box inside category="custom" (usable on any layer).
 static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSString *slug, NSError **outError) {
     NSString *trimmed = [rawXML stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) {
@@ -829,7 +831,7 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
         if ([trimmed containsString:@"void main"] || [trimmed containsString:@"gl_FragColor"]) {
             NSString *wrapped = [NSString stringWithFormat:
                 @"<?xml version='1.0' encoding='UTF-8' ?>\n"
-                @"<effect id=\"com.alightcreative.effects.custom_%@\" compat=\"acScreenNorm-y\" name=\"%@\" desc=\"Custom Effect\" category=\"other\" tags=\"custom\" thumb=\"thumb/copy-bg.webp\">\n"
+                @"<effect id=\"com.alightcreative.effects.custom_%@\" compat=\"acScreenNorm-y\" name=\"%@\" desc=\"Custom Effect\" category=\"custom\" tags=\"custom\" thumb=\"thumb/copy-bg.webp\">\n"
                 @"    <params>\n"
                 @"        <texture id=\"inputImg\" srcType=\"content\" />\n"
                 @"    </params>\n"
@@ -886,7 +888,7 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
     // Always assign a unique com.alightcreative.effects.custom_<slug> ID so it gets its own box
     // and never collides with a built-in effect
     setAttr(@"id", [NSString stringWithFormat:@"com.alightcreative.effects.custom_%@", slug]);
-    setAttr(@"category", @"other");
+    setAttr(@"category", @"custom");
     setAttr(@"name", displayName);
     setAttr(@"desc", @"Custom Effect");
     setAttr(@"tags", @"custom");
@@ -913,6 +915,211 @@ static void AMSaveCustomThumbMap(NSDictionary<NSString *, NSString *> *map) {
     [map writeToFile:mapPath atomically:YES];
 }
 
+static intptr_t AMMainBinarySlide(void);
+
+// ============================================================================
+// Module 3A: Inject Dedicated "Custom" Effect Category Bar (EffectCategory.all)
+// Verified against AlightMotion 6.2.60 (build 869) ARM64:
+//   - 0x10330acb0: swift_once predicate for EffectCategory.all
+//   - 0x100466580: EffectCategory.all initializer (13 x 0x38-byte elements)
+//   - 0x1033e5650: global pointer to _ContiguousArrayStorage<EffectCategory>
+//   - 0x10045b298: Effect type metadata accessor (catOff +0x48, expOff +0x44)
+//   - 0x1025b7bb8: Swift._stringCompareWithSmolCheck
+//   - 0x1025bb380: swift_allocObject
+//   - 0x1025bb41c: swift_bridgeObjectRetain
+//   - 0x1025bb824: swift_retain
+//   - 0x1025bb7e8: swift_once
+// ============================================================================
+
+struct AMEffectCategoryEntry {
+    int64_t  catId;      // +0x00 (0 = Other, 500 = Experimental, 113 = Custom)
+    uint64_t nameLo;     // +0x08 Swift String
+    uint64_t nameHi;     // +0x10
+    uint64_t thumbLo;    // +0x18 Swift String?
+    uint64_t thumbHi;    // +0x20
+    void    *filterFn;   // +0x28 (Effect) -> Bool
+    void    *filterCtx;  // +0x30 closure context (NULL for thin fn)
+};
+static_assert(sizeof(AMEffectCategoryEntry) == 0x38, "EffectCategory size mismatch");
+
+struct AMSwiftArrayHeader {
+    void    *isa;              // +0x00
+    uint64_t refCounts;        // +0x08
+    int64_t  count;            // +0x10
+    int64_t  capacityAndFlags; // +0x18
+};
+static_assert(sizeof(AMSwiftArrayHeader) == 0x20, "Swift array header size mismatch");
+
+static uint8_t AMCustomCategoryFilter(void *effectPtr) {
+    if (!effectPtr) return 0;
+    intptr_t slide = AMMainBinarySlide();
+    typedef void *(*AMMetaFn)(uintptr_t);
+    typedef uint8_t (*AMStrEqFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint8_t);
+
+    AMMetaFn getEffectMeta = (AMMetaFn)(0x10045b298ULL + slide);
+    uint8_t *meta = (uint8_t *)getEffectMeta(0);
+    if (!meta) return 0;
+
+    int32_t catOff = *(int32_t *)(meta + 0x48);
+    int32_t expOff = *(int32_t *)(meta + 0x44);
+    uint64_t strLo = *(uint64_t *)((uint8_t *)effectPtr + catOff);
+    uint64_t strHi = *(uint64_t *)((uint8_t *)effectPtr + catOff + 8);
+
+    // Swift 5 small inline ASCII string "custom" (6 bytes: 'c','u','s','t','o','m')
+    const uint64_t kCustomLo = 0x00006d6f74737563ULL;
+    const uint64_t kCustomHi = 0xe600000000000000ULL;
+
+    BOOL matched = (strLo == kCustomLo && strHi == kCustomHi);
+    if (!matched) {
+        AMStrEqFn strEq = (AMStrEqFn)(0x1025b7bb8ULL + slide);
+        matched = (strEq(strLo, strHi, kCustomLo, kCustomHi, 0) & 1) != 0;
+    }
+    if (!matched) return 0;
+    uint8_t isExp = *((uint8_t *)effectPtr + expOff);
+    return (uint8_t)((isExp ^ 1) & 1);
+}
+
+static void AMMigrateCustomEffectXMLCategories(void) {
+    NSString *dir = AMCustomEffectsDir();
+    NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+    for (NSString *fn in files) {
+        if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] != NSOrderedSame) continue;
+        NSString *p = [dir stringByAppendingPathComponent:fn];
+        NSString *xml = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+        if (!xml) continue;
+        if ([xml rangeOfString:@"category=\"other\"" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            NSString *updated = [xml stringByReplacingOccurrencesOfString:@"category=\"other\""
+                                                               withString:@"category=\"custom\""
+                                                                  options:NSCaseInsensitiveSearch
+                                                                    range:NSMakeRange(0, xml.length)];
+            [updated writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    }
+}
+
+static void AMInstallCustomEffectCategoryIfNeeded(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        AMMigrateCustomEffectXMLCategories();
+
+        intptr_t slide = AMMainBinarySlide();
+        uintptr_t *swiftOncePred = (uintptr_t *)(0x10330acb0ULL + slide);
+        void (*initCategories)(void *) = (void (*)(void *))(0x100466580ULL + slide);
+        void (*swiftOnce)(uintptr_t *, void (*)(void *), void *) =
+            (void (*)(uintptr_t *, void (*)(void *), void *))(0x1025bb7e8ULL + slide);
+        void *(*swiftAllocObject)(void *, size_t, size_t) =
+            (void *(*)(void *, size_t, size_t))(0x1025bb380ULL + slide);
+        void *(*swiftBridgeRetain)(void *) =
+            (void *(*)(void *))(0x1025bb41cULL + slide);
+        void *(*swiftRetain)(void *) =
+            (void *(*)(void *))(0x1025bb824ULL + slide);
+
+        // Ensure original 13-element EffectCategory.all array is initialized first
+        swiftOnce(swiftOncePred, initCategories, NULL);
+
+        void **globalSlot = (void **)(0x1033e5650ULL + slide);
+        AMSwiftArrayHeader *origHdr = (AMSwiftArrayHeader *)(*globalSlot);
+        if (!origHdr || origHdr->count < 1 || origHdr->count > 64) return;
+
+        // Guard against duplicate insertion
+        AMEffectCategoryEntry *origItems = (AMEffectCategoryEntry *)((uint8_t *)origHdr + sizeof(AMSwiftArrayHeader));
+        for (int64_t i = 0; i < origHdr->count; ++i) {
+            if (origItems[i].catId == 0x71) return;
+        }
+
+        int64_t origCount = origHdr->count;
+        int64_t newCount = origCount + 1;
+        size_t newBytes = sizeof(AMSwiftArrayHeader) + (size_t)newCount * sizeof(AMEffectCategoryEntry);
+
+        AMSwiftArrayHeader *newHdr = (AMSwiftArrayHeader *)swiftAllocObject(origHdr->isa, newBytes, 7);
+        if (!newHdr) return;
+        newHdr->count = newCount;
+        newHdr->capacityAndFlags = newCount << 1;
+
+        AMEffectCategoryEntry *newItems = (AMEffectCategoryEntry *)((uint8_t *)newHdr + sizeof(AMSwiftArrayHeader));
+
+        // Insert "Custom" right before Experimental (id == 500), i.e. right after "Other"
+        int64_t insertIdx = origCount;
+        for (int64_t i = 0; i < origCount; ++i) {
+            if (origItems[i].catId == 500) {
+                insertIdx = i;
+                break;
+            }
+        }
+
+        int64_t dst = 0;
+        for (int64_t i = 0; i < origCount; ++i) {
+            if (i == insertIdx) {
+                AMEffectCategoryEntry customEntry;
+                customEntry.catId = 0x71; // 113: unique, non-zero (excluded by Other), != 500 (always visible)
+                customEntry.nameLo = 0x00006d6f74737543ULL; // Swift small ASCII String "Custom" (6 bytes)
+                customEntry.nameHi = 0xe600000000000000ULL;
+                customEntry.thumbLo = 0;
+                customEntry.thumbHi = 0;
+                customEntry.filterFn = (void *)&AMCustomCategoryFilter;
+                customEntry.filterCtx = NULL;
+                newItems[dst++] = customEntry;
+            }
+            AMEffectCategoryEntry e = origItems[i];
+            if (e.nameHi) swiftBridgeRetain((void *)e.nameHi);
+            if (e.thumbHi) swiftBridgeRetain((void *)e.thumbHi);
+            if (e.filterCtx) swiftRetain(e.filterCtx);
+            newItems[dst++] = e;
+        }
+        if (insertIdx == origCount) {
+            AMEffectCategoryEntry customEntry;
+            customEntry.catId = 0x71;
+            customEntry.nameLo = 0x00006d6f74737543ULL;
+            customEntry.nameHi = 0xe600000000000000ULL;
+            customEntry.thumbLo = 0;
+            customEntry.thumbHi = 0;
+            customEntry.filterFn = (void *)&AMCustomCategoryFilter;
+            customEntry.filterCtx = NULL;
+            newItems[dst++] = customEntry;
+        }
+
+        // Publish new array globally (intentionally keep origHdr retained for safety)
+        *globalSlot = newHdr;
+    });
+}
+
+static UILabel *AMFindFirstLabelInView(UIView *v);
+static IMP gOrigEffectMainWillDisplayCell = NULL;
+static const void *kAMCustomCatGradKey = &kAMCustomCatGradKey;
+
+static void AMHook_effectMainWillDisplayCell(id self, SEL _cmd, UICollectionView *cv, UICollectionViewCell *cell, NSIndexPath *indexPath) {
+    AMInstallCustomEffectCategoryIfNeeded();
+    if (gOrigEffectMainWillDisplayCell) {
+        ((void (*)(id, SEL, UICollectionView *, UICollectionViewCell *, NSIndexPath *))gOrigEffectMainWillDisplayCell)(self, _cmd, cv, cell, indexPath);
+    }
+    if (!cell) return;
+    UILabel *titleLbl = nil;
+    SEL titleSel = NSSelectorFromString(@"titleLabel");
+    if ([cell respondsToSelector:titleSel]) {
+        titleLbl = ((UILabel *(*)(id, SEL))objc_msgSend)(cell, titleSel);
+    }
+    if (!titleLbl) titleLbl = AMFindFirstLabelInView(cell.contentView);
+    BOOL isCustom = (titleLbl.text && [titleLbl.text caseInsensitiveCompare:@"Custom"] == NSOrderedSame);
+    CAGradientLayer *grad = objc_getAssociatedObject(cell, kAMCustomCatGradKey);
+    if (isCustom) {
+        if (!grad) {
+            grad = [CAGradientLayer layer];
+            grad.colors = @[
+                (id)[UIColor colorWithRed:0.15 green:0.20 blue:0.35 alpha:1.0].CGColor,
+                (id)[UIColor colorWithRed:0.12 green:0.30 blue:0.28 alpha:1.0].CGColor,
+            ];
+            grad.startPoint = CGPointMake(0.0, 0.0);
+            grad.endPoint = CGPointMake(1.0, 1.0);
+            [cell.contentView.layer insertSublayer:grad atIndex:0];
+            objc_setAssociatedObject(cell, kAMCustomCatGradKey, grad, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        grad.hidden = NO;
+        grad.frame = cell.contentView.bounds;
+    } else if (grad) {
+        grad.hidden = YES;
+    }
+}
+
 static IMP gOrigURLsForResources = NULL;
 
 static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd, NSString *ext, NSString *subpath) {
@@ -923,6 +1130,7 @@ static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd,
     if (self == [NSBundle mainBundle] &&
         ext && [ext caseInsensitiveCompare:@"xml"] == NSOrderedSame &&
         subpath && [subpath isEqualToString:@"BuiltinEffects"]) {
+        AMInstallCustomEffectCategoryIfNeeded();
         NSString *dir = AMCustomEffectsDir();
         NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
         if (files.count > 0) {
@@ -1295,7 +1503,7 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
     }
     self.xmlTextView.text =
         @"<?xml version='1.0' encoding='UTF-8' ?>\n"
-        @"<effect id=\"com.alightcreative.effects.custom_invert\" compat=\"acScreenNorm-y\" name=\"Custom Invert\" desc=\"Inverts layer colors\" category=\"other\" tags=\"custom\" thumb=\"thumb/copy-bg.webp\">\n"
+        @"<effect id=\"com.alightcreative.effects.custom_invert\" compat=\"acScreenNorm-y\" name=\"Custom Invert\" desc=\"Inverts layer colors\" category=\"custom\" tags=\"custom\" thumb=\"thumb/copy-bg.webp\">\n"
         @"    <params>\n"
         @"        <texture id=\"inputImg\" srcType=\"content\" />\n"
         @"        <spinner id=\"strength\" default=\"1.0\" min=\"0.0\" max=\"1.0\" step=\"0.01\" label=\"Strength\" type=\"percent\" />\n"
@@ -1425,7 +1633,7 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
 
     [self reloadInstalledList];
     UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Custom Effect Created"
-                                                                  message:[NSString stringWithFormat:@"'%@' is saved. Reopen Alight Motion so its own effect box loads in Effects > Other, then tap it to apply to any layer.", name]
+                                                                  message:[NSString stringWithFormat:@"'%@' is saved. Reopen Alight Motion so its own effect box loads in Effects > Custom, then tap it to apply to any layer.", name]
                                                            preferredStyle:UIAlertControllerStyleAlert];
     [done addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:^(__kindof UIAlertAction * _Nonnull a) {
         (void)a;
@@ -1443,23 +1651,23 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
 static IMP gOrigEffectCatViewWillAppear = NULL;
 static const void *kAMImportPlusBtnKey = &kAMImportPlusBtnKey;
 
-static BOOL AMViewHierarchyContainsOtherTitle(UIView *v, NSInteger depth) {
+static BOOL AMViewHierarchyContainsCustomTitle(UIView *v, NSInteger depth) {
     if (!v || depth > 5) return NO;
     if ([v isKindOfClass:[UILabel class]]) {
         NSString *t = ((UILabel *)v).text;
-        if (t && [t caseInsensitiveCompare:@"Other"] == NSOrderedSame) return YES;
+        if (t && [t caseInsensitiveCompare:@"Custom"] == NSOrderedSame) return YES;
     }
     for (UIView *sub in v.subviews) {
-        if (AMViewHierarchyContainsOtherTitle(sub, depth + 1)) return YES;
+        if (AMViewHierarchyContainsCustomTitle(sub, depth + 1)) return YES;
     }
     return NO;
 }
 
-static BOOL AMIsOtherEffectCategoryVC(UIViewController *vc) {
-    if (vc.title && [vc.title caseInsensitiveCompare:@"Other"] == NSOrderedSame) return YES;
-    if (vc.navigationItem.title && [vc.navigationItem.title caseInsensitiveCompare:@"Other"] == NSOrderedSame) return YES;
-    if (vc.navigationController && AMViewHierarchyContainsOtherTitle(vc.navigationController.navigationBar, 0)) return YES;
-    if (AMViewHierarchyContainsOtherTitle(vc.view, 0)) return YES;
+static BOOL AMIsCustomEffectCategoryVC(UIViewController *vc) {
+    if (vc.title && [vc.title caseInsensitiveCompare:@"Custom"] == NSOrderedSame) return YES;
+    if (vc.navigationItem.title && [vc.navigationItem.title caseInsensitiveCompare:@"Custom"] == NSOrderedSame) return YES;
+    if (vc.navigationController && AMViewHierarchyContainsCustomTitle(vc.navigationController.navigationBar, 0)) return YES;
+    if (AMViewHierarchyContainsCustomTitle(vc.view, 0)) return YES;
     return NO;
 }
 
@@ -1486,9 +1694,9 @@ static void AMHook_effectCategoryViewWillAppear(id self, SEL _cmd, BOOL animated
 
     UIViewController *vc = (UIViewController *)self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        BOOL isOther = AMIsOtherEffectCategoryVC(vc);
+        BOOL isCustom = AMIsCustomEffectCategoryVC(vc);
         UIButton *existing = objc_getAssociatedObject(vc, kAMImportPlusBtnKey);
-        if (!isOther) {
+        if (!isCustom) {
             if (existing) existing.hidden = YES;
             return;
         }
@@ -2583,6 +2791,11 @@ static void AlightMotionModsInit(void) {
                     (IMP)AMHook_URLsForResourcesWithExtension,
                     &gOrigURLsForResources);
 
+    AMSwizzleMethod(@"_TtC12AlightMotion18EffectPickerMainVC",
+                    @"collectionView:willDisplayCell:forItemAtIndexPath:",
+                    (IMP)AMHook_effectMainWillDisplayCell,
+                    &gOrigEffectMainWillDisplayCell);
+
     AMSwizzleMethod(@"_TtC12AlightMotion22EffectPickerCategoryVC",
                     @"viewWillAppear:",
                     (IMP)AMHook_effectCategoryViewWillAppear,
@@ -2592,6 +2805,10 @@ static void AlightMotionModsInit(void) {
                     @"collectionView:willDisplayCell:forItemAtIndexPath:",
                     (IMP)AMHook_effectCatWillDisplayCell,
                     &gOrigEffectCatWillDisplayCell);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AMInstallCustomEffectCategoryIfNeeded();
+    });
 
     [[AMHomepageSearchOverlayManager shared] start];
 }
