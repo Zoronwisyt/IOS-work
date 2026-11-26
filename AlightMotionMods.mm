@@ -2074,7 +2074,7 @@ typedef NS_ENUM(NSInteger, AMProjectSortMode) {
 
 - (void)rebuildFilterMenu {
     if (@available(iOS 14.0, *)) {
-        __weak typeof(self) weakSelf = self;
+        __weak AMProjectSearchVC *weakSelf = self;
         UIAction *(^mk)(NSString *, AMProjectSortMode) = ^UIAction *(NSString *title, AMProjectSortMode mode) {
             UIAction *a = [UIAction actionWithTitle:title image:nil identifier:nil handler:^(__kindof UIAction * _Nonnull action) {
                 (void)action;
