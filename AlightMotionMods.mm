@@ -2632,6 +2632,7 @@ static CGFloat gActiveSpeedBase = 1.0;
 static NSArray<NSDictionary *> *gActiveSpeedKeyframes = nil;
 static BOOL gInSpeedRampScale = NO;
 static const void *kAMCompTrackSrcInfoAssocKey = &kAMCompTrackSrcInfoAssocKey;
+static const void *kAMCompTrackRampedAssocKey = &kAMCompTrackRampedAssocKey;
 
 static void *AMGetRawIvarPtr(id obj, const char *ivarName) {
     if (!obj || !ivarName) return NULL;
@@ -2864,7 +2865,6 @@ static double AMEvaluateActiveSpeedAtNormU(double u, double clipDurationSec) {
     NSArray<NSDictionary *> *kfs = gActiveSpeedKeyframes;
     if (kfs.count >= 2) {
         double tSec = u * MAX(0.01, clipDurationSec);
-        // Find segment [k, k+1]
         NSDictionary *first = kfs.firstObject;
         NSDictionary *last = kfs.lastObject;
         if (tSec <= [first[@"t"] doubleValue]) return MAX(0.1, [first[@"speed"] doubleValue]);
@@ -2883,7 +2883,11 @@ static double AMEvaluateActiveSpeedAtNormU(double u, double clipDurationSec) {
                 double eased = AMEvalCubicBezierYForX(segCurve, localU);
                 double s0 = [kfs[i][@"speed"] doubleValue];
                 double s1 = [kfs[i + 1][@"speed"] doubleValue];
-                double spd = s0 + (s1 - s0) * eased;
+                double baseSeg = s0 + (s1 - s0) * eased;
+                // Multiply by the Cubic Bezier slope (dy/dx) so the curve always ramps pace
+                // even when both keyframes share the same base speed (e.g. 1.00x -> 1.00x).
+                double slope = AMComputeSpeedMultiplierAtProgress(segCurve, localU);
+                double spd = baseSeg * slope;
                 if (spd < 0.1) spd = 0.1;
                 if (spd > 8.0) spd = 8.0;
                 return spd;
@@ -2904,43 +2908,22 @@ static BOOL AMIsCurveNonLinear(AMSpeedBezierCurve c) {
     return (fabs(c.x1 - c.y1) > 0.02 || fabs(c.x2 - c.y2) > 0.02);
 }
 
-static BOOL AMHook_compTrackInsertTimeRange(id self, SEL _cmd, CMTimeRange timeRange, AVAssetTrack *track, CMTime startTime, NSError **outError) {
-    BOOL ok = gOrigCompTrackInsertTimeRange
-        ? ((BOOL (*)(id, SEL, CMTimeRange, AVAssetTrack *, CMTime, NSError **))gOrigCompTrackInsertTimeRange)(self, _cmd, timeRange, track, startTime, outError)
-        : NO;
-    if (ok && !gInSpeedRampScale && track) {
-        NSDictionary *info = @{
-            @"track": track,
-            @"srcStart": [NSValue valueWithCMTime:timeRange.start],
-            @"srcDur": [NSValue valueWithCMTime:timeRange.duration],
-            @"atTime": [NSValue valueWithCMTime:startTime],
-        };
-        objc_setAssociatedObject(self, kAMCompTrackSrcInfoAssocKey, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    return ok;
+static BOOL AMHasActiveSpeedRamp(void) {
+    if (gActiveSpeedKeyframes.count >= 2) return YES;
+    if (gActiveSpeedCurveEnabled && AMIsCurveNonLinear(gActiveSpeedCurve)) return YES;
+    return NO;
 }
 
-static void AMHook_compTrackScaleTimeRange(id self, SEL _cmd, CMTimeRange timeRange, CMTime duration) {
-    BOOL hasRamp = (!gInSpeedRampScale) &&
-                   (gActiveSpeedKeyframes.count >= 2 || (gActiveSpeedCurveEnabled && AMIsCurveNonLinear(gActiveSpeedCurve)));
-    NSDictionary *info = hasRamp ? objc_getAssociatedObject(self, kAMCompTrackSrcInfoAssocKey) : nil;
-    AVAssetTrack *srcTrack = info[@"track"];
-    if (!hasRamp || !srcTrack || CMTIME_IS_INVALID(duration) || CMTimeGetSeconds(duration) <= 0.05) {
-        if (gOrigCompTrackScaleTimeRange) {
-            ((void (*)(id, SEL, CMTimeRange, CMTime))gOrigCompTrackScaleTimeRange)(self, _cmd, timeRange, duration);
-        }
-        return;
-    }
-
-    CMTime srcStart = [info[@"srcStart"] CMTimeValue];
-    CMTime srcDur = [info[@"srcDur"] CMTimeValue];
-    double srcDurSec = CMTimeGetSeconds(srcDur);
-    double targetTotalSec = CMTimeGetSeconds(duration);
+static BOOL AMInsertRampedSegments(AVMutableCompositionTrack *compTrack,
+                                   CMTimeRange srcTimeRange,
+                                   AVAssetTrack *srcTrack,
+                                   CMTime atTime,
+                                   CMTime targetTotalDur,
+                                   NSError **outError) {
+    double srcDurSec = CMTimeGetSeconds(srcTimeRange.duration);
+    double targetTotalSec = CMTimeGetSeconds(targetTotalDur);
     if (!isfinite(srcDurSec) || srcDurSec <= 0.05 || !isfinite(targetTotalSec) || targetTotalSec <= 0.05) {
-        if (gOrigCompTrackScaleTimeRange) {
-            ((void (*)(id, SEL, CMTimeRange, CMTime))gOrigCompTrackScaleTimeRange)(self, _cmd, timeRange, duration);
-        }
-        return;
+        return NO;
     }
 
     const int kSegments = 32;
@@ -2952,42 +2935,92 @@ static void AMHook_compTrackScaleTimeRange(id self, SEL _cmd, CMTimeRange timeRa
         weights[i] = 1.0 / MAX(0.1, spd);
         weightSum += weights[i];
     }
-    if (weightSum <= 0.0) {
-        if (gOrigCompTrackScaleTimeRange) {
-            ((void (*)(id, SEL, CMTimeRange, CMTime))gOrigCompTrackScaleTimeRange)(self, _cmd, timeRange, duration);
-        }
-        return;
-    }
+    if (weightSum <= 0.0) return NO;
 
-    gInSpeedRampScale = YES;
-    AVMutableCompositionTrack *compTrack = (AVMutableCompositionTrack *)self;
-    [compTrack removeTimeRange:timeRange];
-
-    CMTimeScale ts = (duration.timescale > 0) ? duration.timescale : 600;
-    CMTime cursor = timeRange.start;
+    CMTimeScale ts = (targetTotalDur.timescale > 0) ? targetTotalDur.timescale : 600;
+    CMTime cursor = atTime;
     double segSrcSec = srcDurSec / (double)kSegments;
-    double srcStartSec = CMTimeGetSeconds(srcStart);
+    double srcStartSec = CMTimeGetSeconds(srcTimeRange.start);
+    BOOL anyOk = NO;
 
     for (int i = 0; i < kSegments; i++) {
         double s0 = srcStartSec + i * segSrcSec;
         double s1 = (i == kSegments - 1) ? (srcStartSec + srcDurSec) : (srcStartSec + (i + 1) * segSrcSec);
         CMTime segStart = CMTimeMakeWithSeconds(s0, ts);
         CMTime segDur = CMTimeMakeWithSeconds(MAX(0.002, s1 - s0), ts);
-        CMTimeRange srcRange = CMTimeRangeMake(segStart, segDur);
+        CMTimeRange segRange = CMTimeRangeMake(segStart, segDur);
 
         double dstSec = targetTotalSec * (weights[i] / weightSum);
         CMTime dstDur = CMTimeMakeWithSeconds(MAX(0.002, dstSec), ts);
 
-        NSError *err = nil;
         BOOL inserted = ((BOOL (*)(id, SEL, CMTimeRange, AVAssetTrack *, CMTime, NSError **))gOrigCompTrackInsertTimeRange)(
-            compTrack, @selector(insertTimeRange:ofTrack:atTime:error:), srcRange, srcTrack, cursor, &err);
+            compTrack, @selector(insertTimeRange:ofTrack:atTime:error:), segRange, srcTrack, cursor, outError);
         if (inserted) {
+            anyOk = YES;
             CMTimeRange insertedRange = CMTimeRangeMake(cursor, segDur);
-            ((void (*)(id, SEL, CMTimeRange, CMTime))gOrigCompTrackScaleTimeRange)(
-                compTrack, _cmd, insertedRange, dstDur);
+            if (gOrigCompTrackScaleTimeRange) {
+                ((void (*)(id, SEL, CMTimeRange, CMTime))gOrigCompTrackScaleTimeRange)(
+                    compTrack, @selector(scaleTimeRange:toDuration:), insertedRange, dstDur);
+            }
             cursor = CMTimeAdd(cursor, dstDur);
         }
     }
+    return anyOk;
+}
+
+static BOOL AMHook_compTrackInsertTimeRange(id self, SEL _cmd, CMTimeRange timeRange, AVAssetTrack *track, CMTime startTime, NSError **outError) {
+    if (!gInSpeedRampScale && track && AMHasActiveSpeedRamp() && CMTimeGetSeconds(timeRange.duration) > 0.05) {
+        gInSpeedRampScale = YES;
+        BOOL ok = AMInsertRampedSegments((AVMutableCompositionTrack *)self, timeRange, track, startTime, timeRange.duration, outError);
+        gInSpeedRampScale = NO;
+        if (ok) {
+            objc_setAssociatedObject(self, kAMCompTrackRampedAssocKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return YES;
+        }
+    }
+    BOOL ok = gOrigCompTrackInsertTimeRange
+        ? ((BOOL (*)(id, SEL, CMTimeRange, AVAssetTrack *, CMTime, NSError **))gOrigCompTrackInsertTimeRange)(self, _cmd, timeRange, track, startTime, outError)
+        : NO;
+    if (ok && !gInSpeedRampScale && track) {
+        NSDictionary *info = @{
+            @"track": track,
+            @"srcStart": [NSValue valueWithCMTime:timeRange.start],
+            @"srcDur": [NSValue valueWithCMTime:timeRange.duration],
+            @"atTime": [NSValue valueWithCMTime:startTime],
+        };
+        objc_setAssociatedObject(self, kAMCompTrackSrcInfoAssocKey, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAMCompTrackRampedAssocKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return ok;
+}
+
+static void AMHook_compTrackScaleTimeRange(id self, SEL _cmd, CMTimeRange timeRange, CMTime duration) {
+    // If insertTimeRange already built the 32 ramped segments, calling original scaleTimeRange:toDuration:
+    // scales all 32 segments proportionally to the new baseSpeed duration — preserving the exact ramp curve!
+    NSNumber *alreadyRamped = objc_getAssociatedObject(self, kAMCompTrackRampedAssocKey);
+    if (alreadyRamped.boolValue || gInSpeedRampScale || !AMHasActiveSpeedRamp()) {
+        if (gOrigCompTrackScaleTimeRange) {
+            ((void (*)(id, SEL, CMTimeRange, CMTime))gOrigCompTrackScaleTimeRange)(self, _cmd, timeRange, duration);
+        }
+        return;
+    }
+
+    NSDictionary *info = objc_getAssociatedObject(self, kAMCompTrackSrcInfoAssocKey);
+    AVAssetTrack *srcTrack = info[@"track"];
+    if (!srcTrack || CMTIME_IS_INVALID(duration) || CMTimeGetSeconds(duration) <= 0.05) {
+        if (gOrigCompTrackScaleTimeRange) {
+            ((void (*)(id, SEL, CMTimeRange, CMTime))gOrigCompTrackScaleTimeRange)(self, _cmd, timeRange, duration);
+        }
+        return;
+    }
+
+    CMTime srcStart = [info[@"srcStart"] CMTimeValue];
+    CMTime srcDur = [info[@"srcDur"] CMTimeValue];
+    gInSpeedRampScale = YES;
+    AVMutableCompositionTrack *compTrack = (AVMutableCompositionTrack *)self;
+    [compTrack removeTimeRange:timeRange];
+    NSError *err = nil;
+    AMInsertRampedSegments(compTrack, CMTimeRangeMake(srcStart, srcDur), srcTrack, timeRange.start, duration, &err);
     gInSpeedRampScale = NO;
 }
 
@@ -3088,12 +3121,21 @@ static void AMTriggerSpeedCompositionRebuild(UIViewController *speedVC, double t
     if (targetSpeed < 0.10) targetSpeed = 0.10;
     if (targetSpeed > 8.00) targetSpeed = 8.00;
     int64_t milli = (int64_t)llround(targetSpeed * 1000.0);
-    // Nudge by 1 milliSpeed if unchanged so Alight Motion rebuilds AVMutableComposition via our scaleTimeRange hook
-    int64_t nudge = (milli > 110) ? (milli - 1) : (milli + 1);
+    // Nudge speed on a 60ms delay so Alight Motion's debouncer actually rebuilds AVMutableComposition
+    // through our 32-segment insertTimeRange/scaleTimeRange hook, then restore exact milliSpeed.
+    int64_t nudge = (milli > 110) ? (milli - 5) : (milli + 5);
     AMCallEditSpeedVMSetSpeed(vmPtr, nudge);
-    AMCallEditSpeedVMSetSpeed(vmPtr, milli);
     AMCallEditSpeedVMRefreshUI(vmPtr);
-    AMForceImmediatePreviewRedraw();
+    __weak UIViewController *weakSpeedVC = speedVC;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIViewController *strongVC = weakSpeedVC;
+        if (!strongVC) return;
+        void *vm2 = AMGetRawIvarPtr(strongVC, "vm");
+        if (!vm2) return;
+        AMCallEditSpeedVMSetSpeed(vm2, milli);
+        AMCallEditSpeedVMRefreshUI(vm2);
+        AMForceImmediatePreviewRedraw();
+    });
 }
 
 static CGFloat AMComputeSpeedMultiplierAtProgress(AMSpeedBezierCurve c, CGFloat u) {
@@ -3735,8 +3777,7 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
     double now = AMCurrentPlayheadSeconds();
     BOOL onKf = (AMFindKeyframeIndexNearTime(kfs, now, 0.03) != NSNotFound);
 
-    UIImage *kfIcon = [UIImage imageNamed:(onKf ? @"ic_keyframe_sign_select" : @"ic_keyframe_sign")]
-                   ?: [UIImage imageNamed:@"ic_keyframe"]
+    UIImage *kfIcon = [UIImage imageNamed:@"ic_keyframe"]
                    ?: [UIImage systemImageNamed:(onKf ? @"diamond.fill" : @"diamond")];
     if (kfIcon) {
         [kfBtn setImage:[kfIcon imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
@@ -3901,8 +3942,8 @@ static void AMEnsureSpeedGraphButton(UIViewController *speedVC) {
         [existingToolbar removeFromSuperview];
         [targetHost addSubview:existingToolbar];
         [NSLayoutConstraint activateConstraints:@[
-            [existingToolbar.trailingAnchor constraintEqualToAnchor:targetHost.trailingAnchor constant:-14.0],
-            [existingToolbar.topAnchor constraintEqualToAnchor:targetHost.topAnchor constant:4.0],
+            [existingToolbar.trailingAnchor constraintEqualToAnchor:targetHost.trailingAnchor constant:-20.0],
+            [existingToolbar.topAnchor constraintEqualToAnchor:targetHost.topAnchor constant:16.0],
             [existingToolbar.heightAnchor constraintEqualToConstant:32.0],
         ]];
     }
@@ -3996,8 +4037,8 @@ static void AMEnsureSpeedGraphButton(UIViewController *speedVC) {
             [nextBtn.heightAnchor constraintEqualToConstant:28.0],
             [btn.widthAnchor constraintEqualToConstant:30.0],
             [btn.heightAnchor constraintEqualToConstant:30.0],
-            [toolbar.trailingAnchor constraintEqualToAnchor:hostView.trailingAnchor constant:-14.0],
-            [toolbar.topAnchor constraintEqualToAnchor:hostView.topAnchor constant:4.0],
+            [toolbar.trailingAnchor constraintEqualToAnchor:hostView.trailingAnchor constant:-20.0],
+            [toolbar.topAnchor constraintEqualToAnchor:hostView.topAnchor constant:16.0],
             [toolbar.heightAnchor constraintEqualToConstant:32.0],
         ]];
 
