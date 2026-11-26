@@ -333,11 +333,11 @@ static NSData *AMSynthesizeProjectDownloadJSON(NSData *reqBody) {
     if (uid.length == 0 || pid.length == 0) return nil;
     BOOL lite = [d[@"liteVersion"] respondsToSelector:@selector(boolValue)] ? [d[@"liteVersion"] boolValue] : NO;
     NSString *fileName = lite ? @"projectfiles-lite.zip" : @"projectfiles.zip";
-    NSString *gsUri = [NSString stringWithFormat:@"gs://alight-creative.appspot.com/share/u/%@/p/%@/%@", uid, pid, fileName];
+    NSString *storagePath = [NSString stringWithFormat:@"share/u/%@/p/%@/%@", uid, pid, fileName];
     NSDictionary *synth = @{
         @"result": @{
             @"result": @"success",
-            @"downloadUri": gsUri
+            @"downloadUri": storagePath
         }
     };
     return [NSJSONSerialization dataWithJSONObject:synth options:0 error:nil];
