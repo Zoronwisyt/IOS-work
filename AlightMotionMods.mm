@@ -1535,6 +1535,614 @@ static void AMHook_effectCategoryViewWillAppear(id self, SEL _cmd, BOOL animated
 }
 
 // ============================================================================
+// Module 4: Project Folders (Group Projects into Named Folders on Projects Tab)
+// ============================================================================
+
+static NSString *AMProjectFoldersFilePath(void) {
+    NSArray<NSString *> *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *dir = [docs.firstObject stringByAppendingPathComponent:@"ProjectFolders"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return [dir stringByAppendingPathComponent:@"folders.json"];
+}
+
+static NSMutableArray<NSMutableDictionary *> *AMLoadProjectFolders(void) {
+    NSData *data = [NSData dataWithContentsOfFile:AMProjectFoldersFilePath()];
+    if (data.length > 0) {
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+        if ([obj isKindOfClass:[NSMutableArray class]]) {
+            return (NSMutableArray<NSMutableDictionary *> *)obj;
+        }
+    }
+    return [NSMutableArray array];
+}
+
+static void AMSaveProjectFolders(NSArray<NSDictionary *> *folders) {
+    NSData *data = [NSJSONSerialization dataWithJSONObject:(folders ?: @[]) options:NSJSONWritingPrettyPrinted error:nil];
+    if (data) {
+        [data writeToFile:AMProjectFoldersFilePath() atomically:YES];
+    }
+}
+
+static UIColor *AMColorFromHex(NSString *hex) {
+    unsigned int rgb = 0x1D1E2C;
+    if (hex.length > 0) {
+        NSString *clean = [hex stringByReplacingOccurrencesOfString:@"#" withString:@""];
+        NSScanner *sc = [NSScanner scannerWithString:clean];
+        [sc scanHexInt:&rgb];
+    }
+    return [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0
+                           green:((rgb >> 8) & 0xFF) / 255.0
+                            blue:(rgb & 0xFF) / 255.0
+                           alpha:1.0];
+}
+
+static NSArray<NSString *> *AMFolderPaletteHexes(void) {
+    return @[@"#1D1E2C", @"#6366F1", @"#10B981", @"#F59E0B", @"#EF4444", @"#EC4899", @"#0EA5E9"];
+}
+
+static UIWindow *AMKeyWindow(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in app.connectedScenes) {
+            if (scene.activationState != UISceneActivationStateForegroundActive) continue;
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                UIWindowScene *ws = (UIWindowScene *)scene;
+                for (UIWindow *w in ws.windows) {
+                    if (w.isKeyWindow) return w;
+                }
+                if (ws.windows.firstObject) return ws.windows.firstObject;
+            }
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return app.keyWindow ?: app.windows.firstObject;
+#pragma clang diagnostic pop
+}
+
+static UIViewController *AMTopMostViewController(void) {
+    UIViewController *vc = AMKeyWindow().rootViewController;
+    while (vc.presentedViewController) {
+        vc = vc.presentedViewController;
+    }
+    return vc;
+}
+
+static BOOL AMStringLooksLikeProjectMetadata(NSString *s) {
+    if (s.length == 0 || s.length > 90) return YES;
+    NSString *low = s.lowercaseString;
+    static NSSet<NSString *> *chrome = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        chrome = [NSSet setWithArray:@[
+            @"your projects", @"projects", @"your templates", @"elements", @"cloud",
+            @"home", @"tutorials", @"templates", @"upload", @"new", @"alight motion",
+            @"folders", @"folder", @"all", @"edit", @"select", @"cancel", @"done",
+            @"upload an xml file from your device"
+        ]];
+    });
+    if ([chrome containsObject:low]) return YES;
+    if ([low hasSuffix:@"fps"] || [low hasSuffix:@"mb"] || [low hasSuffix:@"kb"] || [low hasSuffix:@"gb"]) return YES;
+    if ([low rangeOfString:@"^\\d+x\\d+$" options:NSRegularExpressionSearch].location != NSNotFound) return YES;
+    if ([low rangeOfString:@"^\\d{2}:\\d{2}(:\\d{2})?$" options:NSRegularExpressionSearch].location != NSNotFound) return YES;
+    return NO;
+}
+
+// Finds the view rendering the "Your projects" section header (SwiftUI label or accessibility element)
+static UIView *AMFindYourProjectsHeaderView(UIView *v, NSInteger depth) {
+    if (!v || v.hidden || v.alpha < 0.05 || depth > 14) return nil;
+    if ([v isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)v).text;
+        if (t && [t.lowercaseString isEqualToString:@"your projects"]) return v;
+    }
+    NSString *acc = v.accessibilityLabel;
+    if (acc && [acc.lowercaseString isEqualToString:@"your projects"]) return v;
+    for (UIView *sub in v.subviews) {
+        UIView *hit = AMFindYourProjectsHeaderView(sub, depth + 1);
+        if (hit) return hit;
+    }
+    return nil;
+}
+
+static void AMCollectVisibleProjectNamesInView(UIView *v, NSMutableOrderedSet<NSString *> *out, NSInteger depth) {
+    if (!v || v.hidden || v.alpha < 0.05 || depth > 16) return;
+    if ([v isKindOfClass:[UILabel class]]) {
+        NSString *t = [((UILabel *)v).text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (!AMStringLooksLikeProjectMetadata(t)) {
+            [out addObject:t];
+        }
+    } else if (v.accessibilityLabel.length > 0 && v.subviews.count == 0) {
+        NSString *t = [v.accessibilityLabel stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (!AMStringLooksLikeProjectMetadata(t)) {
+            [out addObject:t];
+        }
+    }
+    for (UIView *sub in v.subviews) {
+        AMCollectVisibleProjectNamesInView(sub, out, depth + 1);
+    }
+}
+
+static NSArray<NSString *> *AMDiscoverAllProjectNames(void) {
+    NSMutableOrderedSet<NSString *> *names = [NSMutableOrderedSet orderedSet];
+    UIWindow *win = AMKeyWindow();
+    if (win) {
+        AMCollectVisibleProjectNamesInView(win, names, 0);
+    }
+    // Also include any project names already stored in folders so they remain manageable
+    for (NSDictionary *f in AMLoadProjectFolders()) {
+        NSArray *projs = f[@"projects"];
+        if ([projs isKindOfClass:[NSArray class]]) {
+            for (id p in projs) {
+                if ([p isKindOfClass:[NSString class]] && ((NSString *)p).length > 0) {
+                    [names addObject:p];
+                }
+            }
+        }
+    }
+    return [names array];
+}
+
+// Forward declarations
+@class AMProjectFoldersVC;
+
+@interface AMFolderDetailVC : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, copy) NSString *folderId;
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, strong) NSMutableArray<NSString *> *projects;
+@property (nonatomic, copy) NSString *folderName;
+@property (nonatomic, copy) NSString *folderColorHex;
+@property (nonatomic, copy, nullable) void (^onFoldersChanged)(void);
+@end
+
+@implementation AMFolderDetailVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor colorWithRed:0.961 green:0.965 blue:0.980 alpha:1.0]; // #F5F6FA
+    [self reloadFolderData];
+
+    self.title = self.folderName ?: @"Folder";
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"+ Add"
+                                                                              style:UIBarButtonItemStyleDone
+                                                                             target:self
+                                                                             action:@selector(onTapAddProjects)];
+    self.navigationItem.rightBarButtonItem.tintColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
+    self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.tableView.backgroundColor = self.view.backgroundColor;
+    self.tableView.dataSource = self;
+    self.tableView.delegate = self;
+    [self.view addSubview:self.tableView];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.tableView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+    ]];
+}
+
+- (void)reloadFolderData {
+    NSMutableArray<NSMutableDictionary *> *all = AMLoadProjectFolders();
+    for (NSMutableDictionary *f in all) {
+        if ([f[@"id"] isEqualToString:self.folderId]) {
+            self.folderName = f[@"name"] ?: @"Folder";
+            self.folderColorHex = f[@"colorHex"] ?: @"#1D1E2C";
+            NSArray *p = [f[@"projects"] isKindOfClass:[NSArray class]] ? f[@"projects"] : @[];
+            self.projects = [p mutableCopy];
+            break;
+        }
+    }
+    if (!self.projects) self.projects = [NSMutableArray array];
+    self.title = self.folderName;
+}
+
+- (void)saveCurrentProjects {
+    NSMutableArray<NSMutableDictionary *> *all = AMLoadProjectFolders();
+    for (NSMutableDictionary *f in all) {
+        if ([f[@"id"] isEqualToString:self.folderId]) {
+            f[@"projects"] = [self.projects copy];
+            break;
+        }
+    }
+    AMSaveProjectFolders(all);
+    if (self.onFoldersChanged) self.onFoldersChanged();
+}
+
+- (void)onTapAddProjects {
+    NSArray<NSString *> *discovered = AMDiscoverAllProjectNames();
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Add Project to Folder"
+                                                                   message:@"Pick a project from Your projects or type a project name."
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSString *name in discovered) {
+        if ([self.projects containsObject:name]) continue;
+        [sheet addAction:[UIAlertAction actionWithTitle:name style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+            (void)a;
+            if (![self.projects containsObject:name]) {
+                [self.projects addObject:name];
+                [self saveCurrentProjects];
+                [self.tableView reloadData];
+            }
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Type Project Name..." style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+        (void)a;
+        [self promptManualProjectName];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    if (sheet.popoverPresentationController) {
+        sheet.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItem;
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)promptManualProjectName {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Add Project by Name"
+                                                                message:@"Enter the exact project name to group into this folder."
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull tf) {
+        tf.placeholder = @"e.g. New Project 207";
+    }];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Add" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+        (void)a;
+        NSString *n = [ac.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (n.length > 0 && ![self.projects containsObject:n]) {
+            [self.projects addObject:n];
+            [self saveCurrentProjects];
+            [self.tableView reloadData];
+        }
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    (void)tableView; (void)section;
+    return self.projects.count > 0 ? self.projects.count : 1;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"ProjCell"];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"ProjCell"];
+    }
+    if (self.projects.count == 0) {
+        cell.textLabel.text = @"No projects in this folder yet";
+        cell.detailTextLabel.text = @"Tap + Add in the top right to group projects here.";
+        cell.textLabel.textColor = [UIColor colorWithWhite:0.45 alpha:1.0];
+        cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.60 alpha:1.0];
+        cell.imageView.image = nil;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        return cell;
+    }
+    NSString *name = self.projects[indexPath.row];
+    cell.textLabel.text = name;
+    cell.textLabel.font = AMThemeFont(15.0, UIFontWeightSemibold);
+    cell.textLabel.textColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+    cell.detailTextLabel.text = @"Swipe left to remove from folder";
+    cell.detailTextLabel.font = AMThemeFont(12.0, UIFontWeightRegular);
+    cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
+    if (@available(iOS 13.0, *)) {
+        cell.imageView.image = [UIImage systemImageNamed:@"film.stack"];
+        cell.imageView.tintColor = AMColorFromHex(self.folderColorHex);
+    }
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    return cell;
+}
+
+- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
+    (void)tableView; (void)indexPath;
+    return self.projects.count > 0;
+}
+
+- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
+    (void)tableView;
+    if (editingStyle == UITableViewCellEditingStyleDelete && indexPath.row < (NSInteger)self.projects.count) {
+        [self.projects removeObjectAtIndex:indexPath.row];
+        [self saveCurrentProjects];
+        [self.tableView reloadData];
+    }
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+}
+
+@end
+
+@interface AMProjectFoldersVC : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, strong) NSMutableArray<NSMutableDictionary *> *folders;
+@property (nonatomic, copy, nullable) void (^onFoldersChanged)(void);
+@end
+
+@implementation AMProjectFoldersVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor colorWithRed:0.961 green:0.965 blue:0.980 alpha:1.0]; // #F5F6FA
+    self.title = @"Project Folders";
+    self.folders = AMLoadProjectFolders();
+
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Close"
+                                                                             style:UIBarButtonItemStylePlain
+                                                                            target:self
+                                                                            action:@selector(onClose)];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"+ New"
+                                                                              style:UIBarButtonItemStyleDone
+                                                                             target:self
+                                                                             action:@selector(onNewFolder)];
+    UIColor *navy = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+    self.navigationItem.leftBarButtonItem.tintColor = navy;
+    self.navigationItem.rightBarButtonItem.tintColor = navy;
+
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
+    self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.tableView.backgroundColor = self.view.backgroundColor;
+    self.tableView.dataSource = self;
+    self.tableView.delegate = self;
+    [self.view addSubview:self.tableView];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.tableView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+    ]];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    self.folders = AMLoadProjectFolders();
+    [self.tableView reloadData];
+}
+
+- (void)onClose {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)onNewFolder {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"New Folder"
+                                                                message:@"Name your project folder."
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull tf) {
+        tf.placeholder = @"e.g. Shake Packs, Edits, Presets";
+        tf.autocapitalizationType = UITextAutocapitalizationTypeWords;
+    }];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Create" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+        (void)a;
+        NSString *name = [ac.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (name.length == 0) return;
+        NSArray<NSString *> *palette = AMFolderPaletteHexes();
+        NSString *colorHex = palette[self.folders.count % palette.count];
+        NSMutableDictionary *folder = [@{
+            @"id": [[NSUUID UUID] UUIDString],
+            @"name": name,
+            @"colorHex": colorHex,
+            @"projects": [NSMutableArray array]
+        } mutableCopy];
+        [self.folders addObject:folder];
+        AMSaveProjectFolders(self.folders);
+        if (self.onFoldersChanged) self.onFoldersChanged();
+        [self.tableView reloadData];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)renameFolderAtIndex:(NSInteger)idx {
+    if (idx < 0 || idx >= (NSInteger)self.folders.count) return;
+    NSMutableDictionary *f = self.folders[idx];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Rename Folder"
+                                                                message:nil
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull tf) {
+        tf.text = f[@"name"];
+        tf.autocapitalizationType = UITextAutocapitalizationTypeWords;
+    }];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+        (void)a;
+        NSString *name = [ac.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (name.length == 0) return;
+        f[@"name"] = name;
+        AMSaveProjectFolders(self.folders);
+        if (self.onFoldersChanged) self.onFoldersChanged();
+        [self.tableView reloadData];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    (void)tableView; (void)section;
+    return self.folders.count > 0 ? self.folders.count : 1;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"FolderCell"];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"FolderCell"];
+    }
+    if (self.folders.count == 0) {
+        cell.textLabel.text = @"No folders yet";
+        cell.detailTextLabel.text = @"Tap + New to create a folder and group your projects.";
+        cell.textLabel.textColor = [UIColor colorWithWhite:0.45 alpha:1.0];
+        cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.60 alpha:1.0];
+        cell.imageView.image = nil;
+        cell.accessoryType = UITableViewCellAccessoryNone;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        return cell;
+    }
+    NSDictionary *f = self.folders[indexPath.row];
+    NSArray *projs = [f[@"projects"] isKindOfClass:[NSArray class]] ? f[@"projects"] : @[];
+    cell.textLabel.text = f[@"name"] ?: @"Folder";
+    cell.textLabel.font = AMThemeFont(16.0, UIFontWeightSemibold);
+    cell.textLabel.textColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"%lu %@", (unsigned long)projs.count, projs.count == 1 ? @"project" : @"projects"];
+    cell.detailTextLabel.font = AMThemeFont(12.0, UIFontWeightRegular);
+    cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.50 alpha:1.0];
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:20.0 weight:UIImageSymbolWeightMedium];
+        cell.imageView.image = [UIImage systemImageNamed:@"folder.fill" withConfiguration:cfg];
+        cell.imageView.tintColor = AMColorFromHex(f[@"colorHex"]);
+    }
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (self.folders.count == 0) return;
+    NSDictionary *f = self.folders[indexPath.row];
+    AMFolderDetailVC *detail = [[AMFolderDetailVC alloc] init];
+    detail.folderId = f[@"id"];
+    detail.onFoldersChanged = self.onFoldersChanged;
+    [self.navigationController pushViewController:detail animated:YES];
+}
+
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+    (void)tableView;
+    if (self.folders.count == 0) return nil;
+    UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
+                                                                      title:@"Delete"
+                                                                    handler:^(UIContextualAction * _Nonnull action, UIView * _Nonnull sourceView, void (^ _Nonnull completionHandler)(BOOL)) {
+        (void)action; (void)sourceView;
+        if (indexPath.row < (NSInteger)self.folders.count) {
+            [self.folders removeObjectAtIndex:indexPath.row];
+            AMSaveProjectFolders(self.folders);
+            if (self.onFoldersChanged) self.onFoldersChanged();
+            [self.tableView reloadData];
+        }
+        completionHandler(YES);
+    }];
+    UIContextualAction *ren = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
+                                                                      title:@"Rename"
+                                                                    handler:^(UIContextualAction * _Nonnull action, UIView * _Nonnull sourceView, void (^ _Nonnull completionHandler)(BOOL)) {
+        (void)action; (void)sourceView;
+        [self renameFolderAtIndex:indexPath.row];
+        completionHandler(YES);
+    }];
+    ren.backgroundColor = [UIColor colorWithRed:0.388 green:0.400 blue:0.945 alpha:1.0];
+    return [UISwipeActionsConfiguration configurationWithActions:@[del, ren]];
+}
+
+@end
+
+@interface AMProjectFoldersOverlayManager : NSObject
+@property (nonatomic, strong, nullable) UIButton *foldersPill;
+@property (nonatomic, strong, nullable) NSTimer *pollTimer;
++ (instancetype)shared;
+- (void)start;
+- (void)refreshPillBadge;
+@end
+
+@implementation AMProjectFoldersOverlayManager
+
++ (instancetype)shared {
+    static AMProjectFoldersOverlayManager *inst = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        inst = [[AMProjectFoldersOverlayManager alloc] init];
+    });
+    return inst;
+}
+
+- (void)start {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.pollTimer) return;
+        self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                                          target:self
+                                                        selector:@selector(tick)
+                                                        userInfo:nil
+                                                         repeats:YES];
+    });
+}
+
+- (void)ensurePillInWindow:(UIWindow *)win {
+    if (!self.foldersPill) {
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+        btn.backgroundColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0]; // #1D1E2C matching selected "Projects" pill
+        btn.tintColor = [UIColor whiteColor];
+        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        btn.titleLabel.font = AMThemeFont(13.0, UIFontWeightSemibold);
+        btn.layer.cornerRadius = 15.0;
+        btn.layer.shadowColor = [UIColor blackColor].CGColor;
+        btn.layer.shadowOpacity = 0.12;
+        btn.layer.shadowRadius = 6.0;
+        btn.layer.shadowOffset = CGSizeMake(0, 2);
+        btn.contentEdgeInsets = UIEdgeInsetsMake(6, 12, 6, 12);
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:12.0 weight:UIImageSymbolWeightSemibold];
+            [btn setImage:[UIImage systemImageNamed:@"folder.fill" withConfiguration:cfg] forState:UIControlStateNormal];
+            btn.imageEdgeInsets = UIEdgeInsetsMake(0, -4, 0, 4);
+        }
+        [btn addTarget:self action:@selector(onTapFoldersPill) forControlEvents:UIControlEventTouchUpInside];
+        self.foldersPill = btn;
+        [self refreshPillBadge];
+    }
+    if (self.foldersPill.superview != win) {
+        [win addSubview:self.foldersPill];
+    }
+    [win bringSubviewToFront:self.foldersPill];
+}
+
+- (void)refreshPillBadge {
+    if (!self.foldersPill) return;
+    NSUInteger count = AMLoadProjectFolders().count;
+    NSString *title = count > 0 ? [NSString stringWithFormat:@" Folders (%lu)", (unsigned long)count] : @" Folders";
+    [UIView performWithoutAnimation:^{
+        [self.foldersPill setTitle:title forState:UIControlStateNormal];
+        [self.foldersPill sizeToFit];
+    }];
+}
+
+- (void)tick {
+    UIWindow *win = AMKeyWindow();
+    if (!win) return;
+    UIViewController *top = AMTopMostViewController();
+    // Hide when a modal sheet (like our own folders sheet or settings) is presented
+    if (top != win.rootViewController) {
+        self.foldersPill.hidden = YES;
+        return;
+    }
+    UIView *hdr = AMFindYourProjectsHeaderView(win, 0);
+    if (!hdr) {
+        self.foldersPill.hidden = YES;
+        return;
+    }
+    [self ensurePillInWindow:win];
+    [self refreshPillBadge];
+    CGRect hdrFrame = [hdr convertRect:hdr.bounds toView:win];
+    CGSize pillSize = self.foldersPill.bounds.size;
+    if (pillSize.width < 84.0) pillSize.width = 84.0;
+    if (pillSize.height < 30.0) pillSize.height = 30.0;
+    CGFloat x = win.bounds.size.width - pillSize.width - 16.0;
+    CGFloat y = CGRectGetMidY(hdrFrame) - (pillSize.height * 0.5);
+    if (y < win.safeAreaInsets.top + 8.0) {
+        self.foldersPill.hidden = YES;
+        return;
+    }
+    self.foldersPill.frame = CGRectMake(x, y, pillSize.width, pillSize.height);
+    self.foldersPill.hidden = NO;
+}
+
+- (void)onTapFoldersPill {
+    UIViewController *top = AMTopMostViewController();
+    if (!top) return;
+    AMProjectFoldersVC *vc = [[AMProjectFoldersVC alloc] init];
+    vc.onFoldersChanged = ^{
+        [[AMProjectFoldersOverlayManager shared] refreshPillBadge];
+    };
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    [top presentViewController:nav animated:YES completion:nil];
+}
+
+@end
+
+// ============================================================================
 // Constructor: Install All Hooks Safely on Launch
 // ============================================================================
 
@@ -1603,4 +2211,6 @@ static void AlightMotionModsInit(void) {
                     @"collectionView:willDisplayCell:forItemAtIndexPath:",
                     (IMP)AMHook_effectCatWillDisplayCell,
                     &gOrigEffectCatWillDisplayCell);
+
+    [[AMProjectFoldersOverlayManager shared] start];
 }
