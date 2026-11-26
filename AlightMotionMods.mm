@@ -4002,10 +4002,416 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
 // Unified Homepage Overlay Manager (Search, Folders Pill, Assign Folder)
 // ============================================================================
 
+// ============================================================================
+// Inline Expandable Folders View (Right Under "Your projects")
+// ============================================================================
+
+@interface AMHomepageFoldersInlineView : UIView
+@property (nonatomic, strong) UIScrollView *scrollView;
+@property (nonatomic, strong) UIStackView *stackView;
+@property (nonatomic, strong) NSMutableArray<NSMutableDictionary *> *folders;
+@property (nonatomic, strong) NSMutableSet<NSString *> *expandedFolderIds;
+@property (nonatomic, copy) NSArray<NSDictionary *> *diskProjects;
+@property (nonatomic, strong) NSCache<NSString *, UIImage *> *thumbCache;
+@property (nonatomic, strong) NSDate *lastFileMtime;
+@property (nonatomic, assign) CGFloat lastContentHeight;
+- (void)reloadForce:(BOOL)force diskProjects:(NSArray<NSDictionary *> *)diskProjects;
+- (CGFloat)desiredHeightWithMaxHeight:(CGFloat)maxH;
+@end
+
+@implementation AMHomepageFoldersInlineView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor colorWithRed:0.965 green:0.969 blue:0.984 alpha:1.0]; // #F6F7FB
+        self.clipsToBounds = YES;
+        self.expandedFolderIds = [NSMutableSet set];
+        self.thumbCache = [[NSCache alloc] init];
+
+        self.scrollView = [[UIScrollView alloc] init];
+        self.scrollView.translatesAutoresizingMaskIntoConstraints = NO;
+        self.scrollView.showsVerticalScrollIndicator = YES;
+        self.scrollView.alwaysBounceVertical = NO;
+        [self addSubview:self.scrollView];
+
+        self.stackView = [[UIStackView alloc] init];
+        self.stackView.translatesAutoresizingMaskIntoConstraints = NO;
+        self.stackView.axis = UILayoutConstraintAxisVertical;
+        self.stackView.spacing = 6.0;
+        [self.scrollView addSubview:self.stackView];
+
+        UIView *divider = [[UIView alloc] init];
+        divider.translatesAutoresizingMaskIntoConstraints = NO;
+        divider.backgroundColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08];
+        [self addSubview:divider];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [self.scrollView.topAnchor constraintEqualToAnchor:self.topAnchor],
+            [self.scrollView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+            [self.scrollView.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+            [self.scrollView.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-1.0],
+
+            [self.stackView.topAnchor constraintEqualToAnchor:self.scrollView.topAnchor constant:2.0],
+            [self.stackView.leadingAnchor constraintEqualToAnchor:self.scrollView.leadingAnchor constant:16.0],
+            [self.stackView.trailingAnchor constraintEqualToAnchor:self.scrollView.trailingAnchor constant:-16.0],
+            [self.stackView.bottomAnchor constraintEqualToAnchor:self.scrollView.bottomAnchor constant:-6.0],
+            [self.stackView.widthAnchor constraintEqualToAnchor:self.scrollView.widthAnchor constant:-32.0],
+
+            [divider.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16.0],
+            [divider.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16.0],
+            [divider.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+            [divider.heightAnchor constraintEqualToConstant:1.0],
+        ]];
+    }
+    return self;
+}
+
+- (void)reloadForce:(BOOL)force diskProjects:(NSArray<NSDictionary *> *)diskProjects {
+    if (diskProjects) self.diskProjects = diskProjects;
+
+    NSString *path = AMProjectFoldersFilePath();
+    NSDate *mtime = nil;
+    if (path.length > 0) {
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+        mtime = attrs[NSFileModificationDate];
+    }
+    if (!force && self.folders != nil) {
+        if ((mtime == nil && self.lastFileMtime == nil) || (mtime && self.lastFileMtime && [mtime isEqualToDate:self.lastFileMtime])) {
+            return;
+        }
+    }
+    self.lastFileMtime = mtime;
+    self.folders = AMLoadProjectFolders();
+    [self rebuildUI];
+}
+
+- (CGFloat)desiredHeightWithMaxHeight:(CGFloat)maxH {
+    if (self.folders.count == 0) return 0.0;
+    CGFloat h = self.lastContentHeight;
+    if (h <= 0.0) h = 56.0;
+    return MIN(h, maxH);
+}
+
+- (void)rebuildUI {
+    for (UIView *sub in [self.stackView.arrangedSubviews copy]) {
+        [self.stackView removeArrangedSubview:sub];
+        [sub removeFromSuperview];
+    }
+
+    UIColor *navy = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+    UIColor *muted = [UIColor colorWithRed:0.557 green:0.573 blue:0.643 alpha:1.0];
+    CGFloat totalH = 8.0; // top 2 + bottom 6
+
+    for (NSUInteger fi = 0; fi < self.folders.count; fi++) {
+        NSDictionary *folder = self.folders[fi];
+        NSString *fid = folder[@"id"] ?: @"";
+        BOOL isExpanded = [self.expandedFolderIds containsObject:fid];
+        NSArray *projs = [folder[@"projects"] isKindOfClass:[NSArray class]] ? folder[@"projects"] : @[];
+
+        // Folder Header Card
+        UIView *card = [[UIView alloc] init];
+        card.translatesAutoresizingMaskIntoConstraints = NO;
+        card.backgroundColor = [UIColor whiteColor];
+        card.layer.cornerRadius = 12.0;
+        card.layer.borderWidth = 1.0;
+        card.layer.borderColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08].CGColor;
+        card.layer.shadowColor = [UIColor blackColor].CGColor;
+        card.layer.shadowOpacity = 0.04;
+        card.layer.shadowRadius = 6.0;
+        card.layer.shadowOffset = CGSizeMake(0, 2);
+        card.tag = (NSInteger)fi;
+        [card.heightAnchor constraintEqualToConstant:46.0].active = YES;
+
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onTapFolderCard:)];
+        [card addGestureRecognizer:tap];
+
+        UIView *iconBg = [[UIView alloc] init];
+        iconBg.translatesAutoresizingMaskIntoConstraints = NO;
+        iconBg.backgroundColor = AMColorFromHex(folder[@"colorHex"]);
+        iconBg.layer.cornerRadius = 8.0;
+        [card addSubview:iconBg];
+
+        UIImageView *iconIV = [[UIImageView alloc] init];
+        iconIV.translatesAutoresizingMaskIntoConstraints = NO;
+        iconIV.tintColor = [UIColor whiteColor];
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:13.0 weight:UIImageSymbolWeightSemibold];
+            iconIV.image = [UIImage systemImageNamed:@"folder.fill" withConfiguration:cfg];
+        }
+        [iconBg addSubview:iconIV];
+
+        UILabel *nameLbl = [[UILabel alloc] init];
+        nameLbl.translatesAutoresizingMaskIntoConstraints = NO;
+        nameLbl.font = AMThemeFont(14.0, UIFontWeightBold);
+        nameLbl.textColor = navy;
+        nameLbl.text = folder[@"name"] ?: @"Folder";
+        [card addSubview:nameLbl];
+
+        UILabel *countBadge = [[UILabel alloc] init];
+        countBadge.translatesAutoresizingMaskIntoConstraints = NO;
+        countBadge.backgroundColor = [UIColor colorWithRed:0.933 green:0.941 blue:0.969 alpha:1.0];
+        countBadge.textColor = navy;
+        countBadge.font = AMThemeFont(11.0, UIFontWeightBold);
+        countBadge.textAlignment = NSTextAlignmentCenter;
+        countBadge.layer.cornerRadius = 9.0;
+        countBadge.clipsToBounds = YES;
+        countBadge.text = [NSString stringWithFormat:@" %lu ", (unsigned long)projs.count];
+        [card addSubview:countBadge];
+
+        UIButton *moreBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        moreBtn.translatesAutoresizingMaskIntoConstraints = NO;
+        moreBtn.tintColor = muted;
+        moreBtn.tag = (NSInteger)fi;
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.0 weight:UIImageSymbolWeightSemibold];
+            [moreBtn setImage:[UIImage systemImageNamed:@"ellipsis" withConfiguration:cfg] forState:UIControlStateNormal];
+        } else {
+            [moreBtn setTitle:@"..." forState:UIControlStateNormal];
+        }
+        [moreBtn addTarget:self action:@selector(onTapFolderMore:) forControlEvents:UIControlEventTouchUpInside];
+        [card addSubview:moreBtn];
+
+        UIImageView *chev = [[UIImageView alloc] init];
+        chev.translatesAutoresizingMaskIntoConstraints = NO;
+        chev.tintColor = muted;
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:12.0 weight:UIImageSymbolWeightBold];
+            chev.image = [UIImage systemImageNamed:(isExpanded ? @"chevron.down" : @"chevron.right") withConfiguration:cfg];
+        }
+        [card addSubview:chev];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [iconBg.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:10.0],
+            [iconBg.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+            [iconBg.widthAnchor constraintEqualToConstant:28.0],
+            [iconBg.heightAnchor constraintEqualToConstant:28.0],
+
+            [iconIV.centerXAnchor constraintEqualToAnchor:iconBg.centerXAnchor],
+            [iconIV.centerYAnchor constraintEqualToAnchor:iconBg.centerYAnchor],
+            [iconIV.widthAnchor constraintEqualToConstant:15.0],
+            [iconIV.heightAnchor constraintEqualToConstant:15.0],
+
+            [nameLbl.leadingAnchor constraintEqualToAnchor:iconBg.trailingAnchor constant:10.0],
+            [nameLbl.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+
+            [countBadge.leadingAnchor constraintEqualToAnchor:nameLbl.trailingAnchor constant:8.0],
+            [countBadge.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+            [countBadge.heightAnchor constraintEqualToConstant:18.0],
+            [countBadge.widthAnchor constraintGreaterThanOrEqualToConstant:22.0],
+
+            [chev.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12.0],
+            [chev.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+            [chev.widthAnchor constraintEqualToConstant:14.0],
+            [chev.heightAnchor constraintEqualToConstant:14.0],
+
+            [moreBtn.trailingAnchor constraintEqualToAnchor:chev.leadingAnchor constant:-6.0],
+            [moreBtn.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+            [moreBtn.widthAnchor constraintEqualToConstant:28.0],
+            [moreBtn.heightAnchor constraintEqualToConstant:28.0],
+
+            [nameLbl.trailingAnchor constraintLessThanOrEqualToAnchor:moreBtn.leadingAnchor constant:-36.0],
+        ]];
+
+        [self.stackView addArrangedSubview:card];
+        totalH += 46.0 + 6.0;
+
+        if (isExpanded) {
+            if (projs.count == 0) {
+                UILabel *emptyLbl = [[UILabel alloc] init];
+                emptyLbl.translatesAutoresizingMaskIntoConstraints = NO;
+                emptyLbl.text = @"  Empty — hold a project & tap Assign Folder";
+                emptyLbl.font = AMThemeFont(12.0, UIFontWeightMedium);
+                emptyLbl.textColor = muted;
+                [emptyLbl.heightAnchor constraintEqualToConstant:30.0].active = YES;
+                [self.stackView addArrangedSubview:emptyLbl];
+                totalH += 30.0 + 6.0;
+            } else {
+                for (NSUInteger pi = 0; pi < projs.count; pi++) {
+                    NSDictionary *resolved = AMResolveFolderProject(projs[pi], self.diskProjects ?: @[]);
+                    UIView *pRow = [[UIView alloc] init];
+                    pRow.translatesAutoresizingMaskIntoConstraints = NO;
+                    pRow.backgroundColor = [UIColor whiteColor];
+                    pRow.layer.cornerRadius = 11.0;
+                    pRow.layer.borderWidth = 1.0;
+                    pRow.layer.borderColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.06].CGColor;
+                    pRow.tag = (NSInteger)((fi << 16) | (pi & 0xFFFF));
+                    [pRow.heightAnchor constraintEqualToConstant:54.0].active = YES;
+
+                    UITapGestureRecognizer *pTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onTapAssignedProject:)];
+                    [pRow addGestureRecognizer:pTap];
+
+                    UIImageView *thumbIV = [[UIImageView alloc] init];
+                    thumbIV.translatesAutoresizingMaskIntoConstraints = NO;
+                    thumbIV.backgroundColor = [UIColor colorWithRed:0.933 green:0.941 blue:0.969 alpha:1.0];
+                    thumbIV.layer.cornerRadius = 8.0;
+                    thumbIV.clipsToBounds = YES;
+                    [pRow addSubview:thumbIV];
+
+                    NSString *thumbPath = resolved[@"thumb"];
+                    UIImage *img = nil;
+                    if (thumbPath.length > 0) {
+                        img = [self.thumbCache objectForKey:thumbPath];
+                        if (!img) {
+                            img = [UIImage imageWithContentsOfFile:thumbPath];
+                            if (img) [self.thumbCache setObject:img forKey:thumbPath];
+                        }
+                    }
+                    if (img) {
+                        thumbIV.contentMode = UIViewContentModeScaleAspectFill;
+                        thumbIV.image = img;
+                    } else {
+                        thumbIV.contentMode = UIViewContentModeCenter;
+                        if (@available(iOS 13.0, *)) {
+                            thumbIV.image = [UIImage systemImageNamed:@"film.stack"];
+                            thumbIV.tintColor = navy;
+                        }
+                    }
+
+                    UILabel *pTitle = [[UILabel alloc] init];
+                    pTitle.translatesAutoresizingMaskIntoConstraints = NO;
+                    pTitle.font = AMThemeFont(13.5, UIFontWeightBold);
+                    pTitle.textColor = navy;
+                    pTitle.text = resolved[@"title"];
+                    [pRow addSubview:pTitle];
+
+                    UILabel *pMeta = [[UILabel alloc] init];
+                    pMeta.translatesAutoresizingMaskIntoConstraints = NO;
+                    pMeta.font = AMThemeFont(11.0, UIFontWeightRegular);
+                    pMeta.textColor = muted;
+                    pMeta.text = resolved[@"meta"];
+                    [pRow addSubview:pMeta];
+
+                    UIButton *remBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+                    remBtn.translatesAutoresizingMaskIntoConstraints = NO;
+                    remBtn.tintColor = muted;
+                    remBtn.tag = (NSInteger)((fi << 16) | (pi & 0xFFFF));
+                    if (@available(iOS 13.0, *)) {
+                        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:15.0 weight:UIImageSymbolWeightMedium];
+                        [remBtn setImage:[UIImage systemImageNamed:@"xmark.circle.fill" withConfiguration:cfg] forState:UIControlStateNormal];
+                    } else {
+                        [remBtn setTitle:@"×" forState:UIControlStateNormal];
+                    }
+                    [remBtn addTarget:self action:@selector(onTapRemoveProject:) forControlEvents:UIControlEventTouchUpInside];
+                    [pRow addSubview:remBtn];
+
+                    [NSLayoutConstraint activateConstraints:@[
+                        [thumbIV.leadingAnchor constraintEqualToAnchor:pRow.leadingAnchor constant:16.0],
+                        [thumbIV.centerYAnchor constraintEqualToAnchor:pRow.centerYAnchor],
+                        [thumbIV.widthAnchor constraintEqualToConstant:38.0],
+                        [thumbIV.heightAnchor constraintEqualToConstant:38.0],
+
+                        [pTitle.leadingAnchor constraintEqualToAnchor:thumbIV.trailingAnchor constant:10.0],
+                        [pTitle.trailingAnchor constraintEqualToAnchor:remBtn.leadingAnchor constant:-6.0],
+                        [pTitle.topAnchor constraintEqualToAnchor:pRow.topAnchor constant:9.0],
+
+                        [pMeta.leadingAnchor constraintEqualToAnchor:pTitle.leadingAnchor],
+                        [pMeta.trailingAnchor constraintEqualToAnchor:pTitle.trailingAnchor],
+                        [pMeta.topAnchor constraintEqualToAnchor:pTitle.bottomAnchor constant:2.0],
+
+                        [remBtn.trailingAnchor constraintEqualToAnchor:pRow.trailingAnchor constant:-10.0],
+                        [remBtn.centerYAnchor constraintEqualToAnchor:pRow.centerYAnchor],
+                        [remBtn.widthAnchor constraintEqualToConstant:26.0],
+                        [remBtn.heightAnchor constraintEqualToConstant:26.0],
+                    ]];
+
+                    [self.stackView addArrangedSubview:pRow];
+                    totalH += 54.0 + 6.0;
+                }
+            }
+        }
+    }
+    self.lastContentHeight = totalH;
+}
+
+- (void)onTapFolderCard:(UITapGestureRecognizer *)gr {
+    NSInteger idx = gr.view.tag;
+    if (idx < 0 || idx >= (NSInteger)self.folders.count) return;
+    NSString *fid = self.folders[idx][@"id"];
+    if (fid.length == 0) return;
+    if ([self.expandedFolderIds containsObject:fid]) {
+        [self.expandedFolderIds removeObject:fid];
+    } else {
+        [self.expandedFolderIds addObject:fid];
+    }
+    [self rebuildUI];
+}
+
+- (void)onTapFolderMore:(UIButton *)sender {
+    NSInteger idx = sender.tag;
+    if (idx < 0 || idx >= (NSInteger)self.folders.count) return;
+    NSMutableDictionary *f = self.folders[idx];
+    UIViewController *top = AMTopMostViewController();
+    if (!top) return;
+
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:f[@"name"]
+                                                                   message:nil
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak AMHomepageFoldersInlineView *weakSelf = self;
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Rename Folder" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        (void)a;
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Rename Folder" message:nil preferredStyle:UIAlertControllerStyleAlert];
+        [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) { tf.text = f[@"name"]; }];
+        [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+            (void)act;
+            NSString *n = [ac.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (n.length > 0) {
+                f[@"name"] = n;
+                AMSaveProjectFolders(weakSelf.folders);
+                [weakSelf reloadForce:YES diskProjects:nil];
+            }
+        }]];
+        [top presentViewController:ac animated:YES completion:nil];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Delete Folder" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        (void)a;
+        if (idx < (NSInteger)weakSelf.folders.count) {
+            [weakSelf.folders removeObjectAtIndex:idx];
+            AMSaveProjectFolders(weakSelf.folders);
+            [weakSelf reloadForce:YES diskProjects:nil];
+        }
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [top presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)onTapAssignedProject:(UITapGestureRecognizer *)gr {
+    NSUInteger fi = (NSUInteger)(gr.view.tag >> 16);
+    NSUInteger pi = (NSUInteger)(gr.view.tag & 0xFFFF);
+    if (fi >= self.folders.count) return;
+    NSArray *projs = self.folders[fi][@"projects"];
+    if (pi >= projs.count) return;
+    NSDictionary *resolved = AMResolveFolderProject(projs[pi], self.diskProjects ?: @[]);
+    NSString *path = resolved[@"path"];
+    if (path.length == 0) return;
+    if (!AMOpenLocalProjectInMainVC(path)) {
+        AMOpenLocalFileInApp([NSURL fileURLWithPath:path]);
+    }
+}
+
+- (void)onTapRemoveProject:(UIButton *)sender {
+    NSUInteger fi = (NSUInteger)(sender.tag >> 16);
+    NSUInteger pi = (NSUInteger)(sender.tag & 0xFFFF);
+    if (fi >= self.folders.count) return;
+    NSMutableArray *projs = self.folders[fi][@"projects"];
+    if (pi >= projs.count) return;
+    [projs removeObjectAtIndex:pi];
+    AMSaveProjectFolders(self.folders);
+    [self reloadForce:YES diskProjects:nil];
+}
+
+@end
+
+// ============================================================================
+// Unified Homepage Overlay Manager (Search, + Folder, Inline Folders, Assign)
+// ============================================================================
+
 @interface AMHomepageSearchOverlayManager : NSObject
 @property (nonatomic, strong, nullable) UIButton *searchButton;
 @property (nonatomic, strong, nullable) UIButton *foldersButton;
 @property (nonatomic, strong, nullable) UIButton *assignFolderButton;
+@property (nonatomic, strong, nullable) AMHomepageFoldersInlineView *inlineFoldersView;
 @property (nonatomic, strong, nullable) NSTimer *pollTimer;
 @property (nonatomic, strong) NSMutableSet<NSString *> *trackedSelectedTitles;
 @property (nonatomic, copy) NSArray<NSDictionary *> *cachedDiskProjects;
@@ -4072,7 +4478,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
 
     if (!self.foldersButton) {
         UIButton *fbtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        fbtn.accessibilityLabel = @"Project Folders";
+        fbtn.accessibilityLabel = @"Create Folder";
         fbtn.backgroundColor = [UIColor whiteColor];
         fbtn.tintColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
         [fbtn setTitleColor:[UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0] forState:UIControlStateNormal];
@@ -4084,12 +4490,12 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
         fbtn.layer.shadowOpacity = 0.05;
         fbtn.layer.shadowRadius = 6.0;
         fbtn.layer.shadowOffset = CGSizeMake(0, 2);
-        [fbtn setTitle:@" Folders" forState:UIControlStateNormal];
+        [fbtn setTitle:@" + Folder" forState:UIControlStateNormal];
         if (@available(iOS 13.0, *)) {
             UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:13.0 weight:UIImageSymbolWeightSemibold];
-            [fbtn setImage:[UIImage systemImageNamed:@"folder.fill" withConfiguration:cfg] forState:UIControlStateNormal];
+            [fbtn setImage:[UIImage systemImageNamed:@"folder.badge.plus" withConfiguration:cfg] forState:UIControlStateNormal];
         }
-        [fbtn addTarget:self action:@selector(onTapFolders) forControlEvents:UIControlEventTouchUpInside];
+        [fbtn addTarget:self action:@selector(onTapCreateFolder) forControlEvents:UIControlEventTouchUpInside];
         self.foldersButton = fbtn;
     }
 
@@ -4116,9 +4522,13 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
         self.assignFolderButton = abtn;
     }
 
-    for (UIButton *b in @[self.searchButton, self.foldersButton, self.assignFolderButton]) {
-        if (b.superview != win) [win addSubview:b];
-        [win bringSubviewToFront:b];
+    if (!self.inlineFoldersView) {
+        self.inlineFoldersView = [[AMHomepageFoldersInlineView alloc] initWithFrame:CGRectZero];
+    }
+
+    for (UIView *v in @[self.inlineFoldersView, self.searchButton, self.foldersButton, self.assignFolderButton]) {
+        if (v.superview != win) [win addSubview:v];
+        [win bringSubviewToFront:v];
     }
 }
 
@@ -4129,6 +4539,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
         self.searchButton.hidden = YES;
         self.foldersButton.hidden = YES;
         self.assignFolderButton.hidden = YES;
+        self.inlineFoldersView.hidden = YES;
         return;
     }
 
@@ -4142,6 +4553,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     if (probe.isSelectionMode) {
         self.searchButton.hidden = YES;
         self.foldersButton.hidden = YES;
+        self.inlineFoldersView.hidden = YES;
 
         CGFloat w = 164.0;
         CGFloat h = 42.0;
@@ -4168,17 +4580,30 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
         CGFloat minVisY = win.safeAreaInsets.top + 58.0;
         CGFloat maxVisY = win.bounds.size.height - win.safeAreaInsets.bottom - 75.0;
         if (midY > minVisY && midY < maxVisY) {
-            CGFloat fw = 94.0;
+            CGFloat fw = 102.0;
             CGFloat fh = 30.0;
             CGFloat fx = win.bounds.size.width - 16.0 - fw;
             CGFloat fy = midY - (fh * 0.5);
             self.foldersButton.frame = CGRectMake(fx, fy, fw, fh);
             self.foldersButton.hidden = NO;
+
+            [self.inlineFoldersView reloadForce:NO diskProjects:self.cachedDiskProjects ?: @[]];
+            CGFloat topY = CGRectGetMaxY(probe.yourProjectsFrame) + 6.0;
+            CGFloat maxH = MAX(0.0, (win.bounds.size.height - win.safeAreaInsets.bottom - 78.0) - topY);
+            CGFloat h = [self.inlineFoldersView desiredHeightWithMaxHeight:maxH];
+            if (h > 10.0) {
+                self.inlineFoldersView.frame = CGRectMake(0.0, topY, win.bounds.size.width, h);
+                self.inlineFoldersView.hidden = NO;
+            } else {
+                self.inlineFoldersView.hidden = YES;
+            }
         } else {
             self.foldersButton.hidden = YES;
+            self.inlineFoldersView.hidden = YES;
         }
     } else {
         self.foldersButton.hidden = YES;
+        self.inlineFoldersView.hidden = YES;
     }
 }
 
@@ -4197,17 +4622,27 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     [top presentViewController:nav animated:YES completion:nil];
 }
 
-- (void)onTapFolders {
+- (void)onTapCreateFolder {
     UIViewController *top = AMTopMostViewController();
     if (!top) return;
-    gAMFoldersModalOpen = YES;
-    AMProjectFoldersVC *vc = [[AMProjectFoldersVC alloc] init];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-    if (@available(iOS 13.0, *)) {
-        nav.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
-    }
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    [top presentViewController:nav animated:YES completion:nil];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"New Folder"
+                                                                message:@"Create a folder to group your projects right under Your projects."
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"Folder name (e.g. Edits, Shakes)";
+        tf.autocapitalizationType = UITextAutocapitalizationTypeWords;
+    }];
+    __weak AMHomepageSearchOverlayManager *weakSelf = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Create" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        (void)action;
+        NSString *name = ac.textFields.firstObject.text ?: @"";
+        if (AMCreateProjectFolder(name, nil)) {
+            [weakSelf.inlineFoldersView reloadForce:YES diskProjects:weakSelf.cachedDiskProjects ?: @[]];
+            [weakSelf tick];
+        }
+    }]];
+    [top presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)onTapAssignFolder {
