@@ -2788,8 +2788,9 @@ static void AMWriteStrongObjectIvar(id obj, const char *ivarName, id value) {
     Ivar iv = class_getInstanceVariable([obj class], ivarName);
     if (!iv) return;
     ptrdiff_t off = ivar_getOffset(iv);
-    id __strong *slot = (id __strong *)((uint8_t *)(__bridge void *)obj + off);
-    *slot = value;
+    void **slot = (void **)((uint8_t *)(__bridge void *)obj + off);
+    if (*slot) CFRelease(*slot);
+    *slot = value ? (void *)CFBridgingRetain(value) : NULL;
 }
 
 static void *AMSwiftArrayStorageForObj(id obj, const char *ivarName) {
@@ -2837,7 +2838,7 @@ static BOOL AMWouldCreateParentCycle(uint64_t childId,
 
 static void AMMultiParentEditCallback(void *scenePtr) {
     if (!scenePtr || !gAMMultiParentCtx.selectedIds || gAMMultiParentCtx.selectedCount == 0) return;
-    intptr_t slide = AMSlide();
+    intptr_t slide = AMMainBinarySlide();
 
     typedef void *(*MetaFn)(uintptr_t);
     typedef void *(*CopyFn)(void *, void *, void *);
@@ -2935,6 +2936,7 @@ static int64_t AMReadHolderCurrentTime(id holder, intptr_t slide) {
 }
 
 static void AMOnTapMultiParent(id self, SEL _cmd, UIButton *sender) {
+    (void)_cmd;
     id holder = AMReadObjectIvar(self, "holder");
     if (!holder) return;
 
@@ -2975,8 +2977,10 @@ static void AMHook_multiSelectorNavViewDidLoad(id self, SEL _cmd) {
     btn.tag = kAMMultiParentBtnTag;
     btn.translatesAutoresizingMaskIntoConstraints = NO;
     UIImage *img = [UIImage imageNamed:@"ic_parent_of_layer"];
-    if (!img && @available(iOS 13.0, *)) {
-        img = [UIImage systemImageNamed:@"square.on.square.dashed"];
+    if (!img) {
+        if (@available(iOS 13.0, *)) {
+            img = [UIImage systemImageNamed:@"square.on.square.dashed"];
+        }
     }
     if (img) {
         img = [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
@@ -3014,7 +3018,7 @@ static void AMHook_layerParentingDidSelectRow(id self, SEL _cmd, UITableView *ta
         return;
     }
 
-    intptr_t slide = AMSlide();
+    intptr_t slide = AMMainBinarySlide();
     BOOL hasParent = NO;
     uint64_t targetParentId = 0;
 
