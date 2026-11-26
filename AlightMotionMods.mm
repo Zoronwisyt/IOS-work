@@ -1736,7 +1736,69 @@ static void AMScanSQLiteForProjects(NSString *dbPath,
 }
 
 // Reads Alight Motion's `com.alightcreative.motion.sceneinfo` extended attribute (JSON or plist)
-static NSDictionary<NSString *, NSString *> *AMReadSceneInfoXattr(NSString *filePath) {
+static NSString *AMFindThumbnailForProjectPath(NSString *projPath) {
+    if (projPath.length == 0) return nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *stem = [[projPath lastPathComponent] stringByDeletingPathExtension];
+    if (stem.length == 0) return nil;
+
+    NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
+    NSArray<NSString *> *exts = @[@"jpg", @"jpeg", @"png", @"webp"];
+    NSMutableArray<NSString *> *dirs = [NSMutableArray array];
+    if (lib) {
+        [dirs addObject:[lib stringByAppendingPathComponent:@"Caches/projectThumbnails"]];
+        [dirs addObject:[lib stringByAppendingPathComponent:@"projectThumbnails"]];
+    }
+    NSString *parent = [projPath stringByDeletingLastPathComponent];
+    if (parent.length > 0) [dirs addObject:parent];
+
+    for (NSString *dir in dirs) {
+        for (NSString *ext in exts) {
+            NSString *cand = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%@", stem, ext]];
+            if ([fm fileExistsAtPath:cand]) return cand;
+        }
+        // Also check prefix match (e.g., <uuid>_thumb.jpg or <uuid>.xml.jpg)
+        NSArray<NSString *> *files = [fm contentsOfDirectoryAtPath:dir error:nil];
+        for (NSString *fn in files) {
+            if ([fn hasPrefix:stem]) {
+                NSString *e = fn.pathExtension.lowercaseString;
+                if ([e isEqualToString:@"jpg"] || [e isEqualToString:@"jpeg"] || [e isEqualToString:@"png"] || [e isEqualToString:@"webp"]) {
+                    return [dir stringByAppendingPathComponent:fn];
+                }
+            }
+        }
+    }
+    return nil;
+}
+
+static NSDictionary *AMMakeProjectEntry(NSString *title, NSString *meta, NSString *filePath) {
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:filePath error:nil];
+    NSDate *modDate = attrs[NSFileModificationDate] ?: [NSDate distantPast];
+    NSString *thumb = AMFindThumbnailForProjectPath(filePath) ?: @"";
+
+    static NSDateFormatter *df = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        df = [[NSDateFormatter alloc] init];
+        df.dateStyle = NSDateFormatterMediumStyle;
+        df.timeStyle = NSDateFormatterNoStyle;
+    });
+    NSString *dateStr = [modDate isEqualToDate:[NSDate distantPast]] ? @"" : [df stringFromDate:modDate];
+    NSString *fullMeta = (dateStr.length > 0 && meta.length > 0)
+        ? [NSString stringWithFormat:@"%@  •  %@", meta, dateStr]
+        : (meta.length > 0 ? meta : dateStr);
+
+    return @{
+        @"title": title ?: @"",
+        @"meta": fullMeta ?: @"Alight Motion Project",
+        @"path": filePath ?: @"",
+        @"thumb": thumb,
+        @"date": modDate
+    };
+}
+
+// Reads Alight Motion's `com.alightcreative.motion.sceneinfo` extended attribute (JSON or plist)
+static NSDictionary *AMReadSceneInfoXattr(NSString *filePath) {
     const char *path = filePath.UTF8String;
     if (!path) return nil;
     ssize_t sz = getxattr(path, "com.alightcreative.motion.sceneinfo", NULL, 0, 0, 0);
@@ -1763,16 +1825,13 @@ static NSDictionary<NSString *, NSString *> *AMReadSceneInfoXattr(NSString *file
     if (d[@"fps"]) {
         [parts addObject:[NSString stringWithFormat:@"%@fps", d[@"fps"]]];
     }
-    NSString *meta = parts.count > 0 ? [parts componentsJoinedByString:@"  •  "] : @"Alight Motion Project";
-    return @{@"title": title, @"meta": meta, @"path": filePath};
+    NSString *meta = parts.count > 0 ? [parts componentsJoinedByString:@"  •  "] : @"";
+    return AMMakeProjectEntry(title, meta, filePath);
 }
 
-// Scans Alight Motion's real local project storage:
-//   1. NSLibraryDirectory (`Library/` — where Alight Motion stores project `.xml` files
-//      with `com.alightcreative.motion.sceneinfo` xattrs and `<scene title="...">` headers)
-//   2. NSDocumentDirectory (`Documents/` — user-imported `.amproj` / `.xml` files)
-static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDisk(void) {
-    NSMutableArray<NSDictionary<NSString *, NSString *> *> *results = [NSMutableArray array];
+// Scans Alight Motion's real local project storage (`Library/` + `Documents/`)
+static NSArray<NSDictionary *> *AMLoadUserProjectsFromDisk(void) {
+    NSMutableArray<NSDictionary *> *results = [NSMutableArray array];
     NSMutableSet<NSString *> *seenPaths = [NSMutableSet set];
     NSMutableSet<NSString *> *seenTitles = [NSMutableSet set];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -1807,11 +1866,8 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
             if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
 
             NSString *ext = rel.pathExtension.lowercaseString;
-            NSString *fnameLow = rel.lastPathComponent.lowercaseString;
-
-            // 1. Check `com.alightcreative.motion.sceneinfo` xattr first (fast, authoritative)
             if ([ext isEqualToString:@"xml"] || ext.length == 0 || [ext isEqualToString:@"amproj"]) {
-                NSDictionary<NSString *, NSString *> *xinfo = AMReadSceneInfoXattr(full);
+                NSDictionary *xinfo = AMReadSceneInfoXattr(full);
                 if (xinfo) {
                     NSString *t = xinfo[@"title"];
                     if (t.length > 0 && ![seenTitles containsObject:t]) {
@@ -1823,16 +1879,11 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
                 }
             }
 
-            // 2. Parse `.xml` (or extensionless XML) for `<scene ... title="..." ...>`
             if ([ext isEqualToString:@"xml"] || ext.length == 0) {
                 NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:full];
                 NSData *head = [fh readDataOfLength:8192];
                 [fh closeFile];
                 if (head.length < 16) continue;
-                if (memcmp(head.bytes, "SQLite format 3", 15) == 0) {
-                    AMScanSQLiteForProjects(full, results, seenTitles);
-                    continue;
-                }
                 NSString *txt = [[NSString alloc] initWithData:head encoding:NSUTF8StringEncoding];
                 if (!txt || ![txt containsString:@"<scene"]) continue;
                 NSRange sStart = [txt rangeOfString:@"<scene"];
@@ -1850,36 +1901,35 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
                 NSMutableArray<NSString *> *parts = [NSMutableArray array];
                 if (w.length > 0 && h.length > 0) [parts addObject:[NSString stringWithFormat:@"%@x%@", w, h]];
                 if (fps.length > 0) [parts addObject:[NSString stringWithFormat:@"%@fps", fps]];
-                NSString *meta = parts.count > 0 ? [parts componentsJoinedByString:@"  •  "] : @"Alight Motion Project";
-                [results addObject:@{@"title": title, @"meta": meta, @"path": full}];
-            } else if ([ext isEqualToString:@"sqlite"] || [ext isEqualToString:@"sqlite3"] || [ext isEqualToString:@"db"]) {
-                if ([fnameLow containsString:@"remoteconfig"] || [fnameLow containsString:@"vng_vision"] ||
-                    [fnameLow containsString:@"google"] || [fnameLow containsString:@"firebase"] ||
-                    [fnameLow containsString:@"amplitude"] || [fnameLow containsString:@"cache"]) {
-                    continue;
-                }
-                AMScanSQLiteForProjects(full, results, seenTitles);
+                NSString *meta = parts.count > 0 ? [parts componentsJoinedByString:@"  •  "] : @"";
+                [results addObject:AMMakeProjectEntry(title, meta, full)];
             } else if ([ext isEqualToString:@"amproj"]) {
                 NSString *title = [[rel lastPathComponent] stringByDeletingPathExtension];
                 if (title.length == 0 || [seenTitles containsObject:title]) continue;
                 [seenTitles addObject:title];
                 [seenPaths addObject:full];
-                [results addObject:@{@"title": title, @"meta": @"Alight Motion Package (.amproj)", @"path": full}];
+                [results addObject:AMMakeProjectEntry(title, @".amproj", full)];
             }
         }
     }
-
-    [results sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-        return [a[@"title"] localizedCaseInsensitiveCompare:b[@"title"]];
-    }];
     return results;
 }
 
+typedef NS_ENUM(NSInteger, AMProjectSortMode) {
+    AMProjectSortDateNewest = 0,
+    AMProjectSortDateOldest = 1,
+    AMProjectSortNameAsc    = 2,
+    AMProjectSortNameDesc   = 3
+};
+
 @interface AMProjectSearchVC : UIViewController <UITableViewDataSource, UITableViewDelegate, UITextFieldDelegate>
-@property (nonatomic, copy) NSArray<NSDictionary<NSString *, NSString *> *> *allProjects;
-@property (nonatomic, strong) NSArray<NSDictionary<NSString *, NSString *> *> *filteredProjects;
+@property (nonatomic, copy) NSArray<NSDictionary *> *allProjects;
+@property (nonatomic, strong) NSArray<NSDictionary *> *filteredProjects;
 @property (nonatomic, strong) UITextField *searchField;
+@property (nonatomic, strong) UIButton *filterButton;
 @property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, assign) AMProjectSortMode sortMode;
+@property (nonatomic, strong) NSCache<NSString *, UIImage *> *thumbCache;
 @end
 
 @implementation AMProjectSearchVC
@@ -1889,13 +1939,15 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
     if (@available(iOS 13.0, *)) {
         self.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
     }
+    self.thumbCache = [[NSCache alloc] init];
+    self.sortMode = AMProjectSortDateNewest;
+
     UIColor *bgColor = [UIColor colorWithRed:0.965 green:0.969 blue:0.984 alpha:1.0]; // #F6F7FB
     UIColor *navy = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];    // #1D1E2C
     UIColor *muted = [UIColor colorWithRed:0.557 green:0.573 blue:0.643 alpha:1.0];   // #8E92A4
 
     self.view.backgroundColor = bgColor;
     self.title = @"Search Projects";
-    self.filteredProjects = self.allProjects ?: @[];
 
     if (@available(iOS 13.0, *)) {
         UINavigationBarAppearance *app = [[UINavigationBarAppearance alloc] init];
@@ -1917,7 +1969,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
     closeItem.tintColor = navy;
     self.navigationItem.leftBarButtonItem = closeItem;
 
-    // Alight Motion-styled rounded white search bar card
+    // Rounded white search bar
     UIView *searchBox = [[UIView alloc] init];
     searchBox.translatesAutoresizingMaskIntoConstraints = NO;
     searchBox.backgroundColor = [UIColor whiteColor];
@@ -1953,6 +2005,33 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
     [self.searchField addTarget:self action:@selector(onSearchTextChanged:) forControlEvents:UIControlEventEditingChanged];
     [searchBox addSubview:self.searchField];
 
+    // Filter / Sort button right next to the search bar
+    self.filterButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.filterButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.filterButton.accessibilityLabel = @"Filter Projects";
+    self.filterButton.backgroundColor = [UIColor whiteColor];
+    self.filterButton.tintColor = navy;
+    self.filterButton.layer.cornerRadius = 14.0;
+    self.filterButton.layer.borderWidth = 1.0;
+    self.filterButton.layer.borderColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08].CGColor;
+    self.filterButton.layer.shadowColor = [UIColor blackColor].CGColor;
+    self.filterButton.layer.shadowOpacity = 0.04;
+    self.filterButton.layer.shadowRadius = 8.0;
+    self.filterButton.layer.shadowOffset = CGSizeMake(0, 2);
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:17.0 weight:UIImageSymbolWeightMedium];
+        [self.filterButton setImage:[UIImage systemImageNamed:@"line.3.horizontal.decrease.circle" withConfiguration:cfg] forState:UIControlStateNormal];
+    } else {
+        [self.filterButton setTitle:@"Sort" forState:UIControlStateNormal];
+    }
+    if (@available(iOS 14.0, *)) {
+        self.filterButton.showsMenuAsPrimaryAction = YES;
+        [self rebuildFilterMenu];
+    } else {
+        [self.filterButton addTarget:self action:@selector(onTapFilterFallback) forControlEvents:UIControlEventTouchUpInside];
+    }
+    [self.view addSubview:self.filterButton];
+
     self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
     self.tableView.backgroundColor = bgColor;
@@ -1966,8 +2045,13 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
     [NSLayoutConstraint activateConstraints:@[
         [searchBox.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8.0],
         [searchBox.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16.0],
-        [searchBox.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16.0],
+        [searchBox.trailingAnchor constraintEqualToAnchor:self.filterButton.leadingAnchor constant:-10.0],
         [searchBox.heightAnchor constraintEqualToConstant:46.0],
+
+        [self.filterButton.topAnchor constraintEqualToAnchor:searchBox.topAnchor],
+        [self.filterButton.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16.0],
+        [self.filterButton.widthAnchor constraintEqualToConstant:46.0],
+        [self.filterButton.heightAnchor constraintEqualToConstant:46.0],
 
         [mag.leadingAnchor constraintEqualToAnchor:searchBox.leadingAnchor constant:14.0],
         [mag.centerYAnchor constraintEqualToAnchor:searchBox.centerYAnchor],
@@ -1984,6 +2068,76 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
         [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
     ]];
+
+    [self applyFilterAndSort];
+}
+
+- (void)rebuildFilterMenu {
+    if (@available(iOS 14.0, *)) {
+        __weak typeof(self) weakSelf = self;
+        UIAction *(^mk)(NSString *, AMProjectSortMode) = ^UIAction *(NSString *title, AMProjectSortMode mode) {
+            UIAction *a = [UIAction actionWithTitle:title image:nil identifier:nil handler:^(__kindof UIAction * _Nonnull action) {
+                (void)action;
+                weakSelf.sortMode = mode;
+                [weakSelf rebuildFilterMenu];
+                [weakSelf applyFilterAndSort];
+            }];
+            a.state = (self.sortMode == mode) ? UIMenuElementStateOn : UIMenuElementStateOff;
+            return a;
+        };
+        self.filterButton.menu = [UIMenu menuWithTitle:@"Filter & Sort" children:@[
+            mk(@"Date (Newest First)", AMProjectSortDateNewest),
+            mk(@"Date (Oldest First)", AMProjectSortDateOldest),
+            mk(@"Name (A → Z)", AMProjectSortNameAsc),
+            mk(@"Name (Z → A)", AMProjectSortNameDesc),
+        ]];
+    }
+}
+
+- (void)onTapFilterFallback {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Filter & Sort" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    void (^addOpt)(NSString *, AMProjectSortMode) = ^(NSString *t, AMProjectSortMode m) {
+        [ac addAction:[UIAlertAction actionWithTitle:t style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+            (void)a;
+            self.sortMode = m;
+            [self applyFilterAndSort];
+        }]];
+    };
+    addOpt(@"Date (Newest First)", AMProjectSortDateNewest);
+    addOpt(@"Date (Oldest First)", AMProjectSortDateOldest);
+    addOpt(@"Name (A → Z)", AMProjectSortNameAsc);
+    addOpt(@"Name (Z → A)", AMProjectSortNameDesc);
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)applyFilterAndSort {
+    NSString *q = [self.searchField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSMutableArray<NSDictionary *> *list = [NSMutableArray array];
+    for (NSDictionary *item in (self.allProjects ?: @[])) {
+        NSString *title = item[@"title"] ?: @"";
+        if (q.length == 0 || [title localizedCaseInsensitiveContainsString:q]) {
+            [list addObject:item];
+        }
+    }
+    AMProjectSortMode mode = self.sortMode;
+    [list sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        if (mode == AMProjectSortNameAsc) {
+            return [a[@"title"] localizedCaseInsensitiveCompare:b[@"title"]];
+        } else if (mode == AMProjectSortNameDesc) {
+            return [b[@"title"] localizedCaseInsensitiveCompare:a[@"title"]];
+        } else if (mode == AMProjectSortDateOldest) {
+            NSDate *da = a[@"date"] ?: [NSDate distantPast];
+            NSDate *db = b[@"date"] ?: [NSDate distantPast];
+            return [da compare:db];
+        } else {
+            NSDate *da = a[@"date"] ?: [NSDate distantPast];
+            NSDate *db = b[@"date"] ?: [NSDate distantPast];
+            return [db compare:da];
+        }
+    }];
+    self.filteredProjects = list;
+    [self.tableView reloadData];
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -2005,20 +2159,8 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
 }
 
 - (void)onSearchTextChanged:(UITextField *)tf {
-    NSString *q = [tf.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (q.length == 0) {
-        self.filteredProjects = self.allProjects ?: @[];
-    } else {
-        NSMutableArray *hits = [NSMutableArray array];
-        for (NSDictionary *item in self.allProjects) {
-            NSString *title = item[@"title"] ?: @"";
-            if ([title localizedCaseInsensitiveContainsString:q]) {
-                [hits addObject:item];
-            }
-        }
-        self.filteredProjects = hits;
-    }
-    [self.tableView reloadData];
+    (void)tf;
+    [self applyFilterAndSort];
 }
 
 - (BOOL)textFieldShouldReturn:(UITextField *)textField {
@@ -2033,7 +2175,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
 
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
     (void)tableView; (void)indexPath;
-    return 76.0;
+    return 82.0;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -2055,18 +2197,14 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
         card.layer.shadowOffset = CGSizeMake(0, 2);
         [cell.contentView addSubview:card];
 
-        UIView *iconBg = [[UIView alloc] init];
-        iconBg.tag = 102;
-        iconBg.translatesAutoresizingMaskIntoConstraints = NO;
-        iconBg.backgroundColor = [UIColor colorWithRed:0.933 green:0.941 blue:0.969 alpha:1.0]; // #EEF0F7
-        iconBg.layer.cornerRadius = 10.0;
-        [card addSubview:iconBg];
-
-        UIImageView *iv = [[UIImageView alloc] init];
-        iv.tag = 103;
-        iv.translatesAutoresizingMaskIntoConstraints = NO;
-        iv.contentMode = UIViewContentModeScaleAspectFit;
-        [iconBg addSubview:iv];
+        UIImageView *thumbIV = [[UIImageView alloc] init];
+        thumbIV.tag = 103;
+        thumbIV.translatesAutoresizingMaskIntoConstraints = NO;
+        thumbIV.backgroundColor = [UIColor colorWithRed:0.933 green:0.941 blue:0.969 alpha:1.0]; // #EEF0F7
+        thumbIV.layer.cornerRadius = 10.0;
+        thumbIV.clipsToBounds = YES;
+        thumbIV.contentMode = UIViewContentModeScaleAspectFill;
+        [card addSubview:thumbIV];
 
         UILabel *titleLbl = [[UILabel alloc] init];
         titleLbl.tag = 104;
@@ -2088,47 +2226,59 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
             [card.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16.0],
             [card.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16.0],
 
-            [iconBg.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12.0],
-            [iconBg.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
-            [iconBg.widthAnchor constraintEqualToConstant:42.0],
-            [iconBg.heightAnchor constraintEqualToConstant:42.0],
+            [thumbIV.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:10.0],
+            [thumbIV.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+            [thumbIV.widthAnchor constraintEqualToConstant:54.0],
+            [thumbIV.heightAnchor constraintEqualToConstant:54.0],
 
-            [iv.centerXAnchor constraintEqualToAnchor:iconBg.centerXAnchor],
-            [iv.centerYAnchor constraintEqualToAnchor:iconBg.centerYAnchor],
-            [iv.widthAnchor constraintEqualToConstant:20.0],
-            [iv.heightAnchor constraintEqualToConstant:20.0],
-
-            [titleLbl.leadingAnchor constraintEqualToAnchor:iconBg.trailingAnchor constant:12.0],
+            [titleLbl.leadingAnchor constraintEqualToAnchor:thumbIV.trailingAnchor constant:12.0],
             [titleLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14.0],
-            [titleLbl.topAnchor constraintEqualToAnchor:card.topAnchor constant:14.0],
+            [titleLbl.topAnchor constraintEqualToAnchor:card.topAnchor constant:16.0],
 
             [metaLbl.leadingAnchor constraintEqualToAnchor:titleLbl.leadingAnchor],
             [metaLbl.trailingAnchor constraintEqualToAnchor:titleLbl.trailingAnchor],
-            [metaLbl.topAnchor constraintEqualToAnchor:titleLbl.bottomAnchor constant:3.0],
+            [metaLbl.topAnchor constraintEqualToAnchor:titleLbl.bottomAnchor constant:4.0],
         ]];
     }
 
-    UIImageView *iv = (UIImageView *)[cell.contentView viewWithTag:103];
+    UIImageView *thumbIV = (UIImageView *)[cell.contentView viewWithTag:103];
     UILabel *titleLbl = (UILabel *)[cell.contentView viewWithTag:104];
     UILabel *metaLbl = (UILabel *)[cell.contentView viewWithTag:105];
 
     if (self.filteredProjects.count == 0) {
         titleLbl.text = self.allProjects.count == 0 ? @"No local projects found" : @"No matching projects";
         metaLbl.text = self.allProjects.count == 0 ? @"Create or import a project first" : @"Try a different search term";
+        thumbIV.contentMode = UIViewContentModeCenter;
         if (@available(iOS 13.0, *)) {
-            iv.image = [UIImage systemImageNamed:@"magnifyingglass"];
-            iv.tintColor = [UIColor colorWithRed:0.557 green:0.573 blue:0.643 alpha:1.0];
+            thumbIV.image = [UIImage systemImageNamed:@"magnifyingglass"];
+            thumbIV.tintColor = [UIColor colorWithRed:0.557 green:0.573 blue:0.643 alpha:1.0];
         }
         return cell;
     }
 
-    NSDictionary<NSString *, NSString *> *item = self.filteredProjects[indexPath.row];
+    NSDictionary *item = self.filteredProjects[indexPath.row];
     titleLbl.text = item[@"title"];
     metaLbl.text = item[@"meta"];
-    if (@available(iOS 13.0, *)) {
-        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:18.0 weight:UIImageSymbolWeightMedium];
-        iv.image = [UIImage systemImageNamed:@"film.stack" withConfiguration:cfg];
-        iv.tintColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+
+    NSString *thumbPath = item[@"thumb"];
+    UIImage *img = nil;
+    if (thumbPath.length > 0) {
+        img = [self.thumbCache objectForKey:thumbPath];
+        if (!img) {
+            img = [UIImage imageWithContentsOfFile:thumbPath];
+            if (img) [self.thumbCache setObject:img forKey:thumbPath];
+        }
+    }
+    if (img) {
+        thumbIV.contentMode = UIViewContentModeScaleAspectFill;
+        thumbIV.image = img;
+    } else {
+        thumbIV.contentMode = UIViewContentModeCenter;
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:20.0 weight:UIImageSymbolWeightMedium];
+            thumbIV.image = [UIImage systemImageNamed:@"film.stack" withConfiguration:cfg];
+            thumbIV.tintColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+        }
     }
     return cell;
 }
@@ -2136,11 +2286,11 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (self.filteredProjects.count == 0) return;
-    NSDictionary<NSString *, NSString *> *item = self.filteredProjects[indexPath.row];
+    NSDictionary *item = self.filteredProjects[indexPath.row];
     NSString *path = item[@"path"];
     gAMSearchModalOpen = NO;
     [self dismissViewControllerAnimated:YES completion:^{
-        if (path.length > 0 && [path.pathExtension.lowercaseString isEqualToString:@"amproj"]) {
+        if (path.length > 0) {
             AMOpenLocalFileInApp([NSURL fileURLWithPath:path]);
         }
     }];
@@ -2217,7 +2367,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
 }
 
 - (void)onTapSearch {
-    NSArray<NSDictionary<NSString *, NSString *> *> *projects = AMLoadUserProjectsFromDisk();
+    NSArray<NSDictionary *> *projects = AMLoadUserProjectsFromDisk();
     UIViewController *top = AMTopMostViewController();
     if (!top) return;
     AMProjectSearchVC *vc = [[AMProjectSearchVC alloc] init];
