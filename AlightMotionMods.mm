@@ -2914,7 +2914,7 @@ static BOOL AMIsRowRadioDotSelectedInWindow(UIWindow *win, CGRect rowWinFrame) {
 static AMHomepageProbeInfo AMProbeHomepageAndTrackSelection(UIWindow *win,
                                                             NSSet<NSString *> *knownTitles,
                                                             NSMutableSet<NSString *> *trackedSelectedTitles) {
-    AMHomepageProbeInfo info;
+    __block AMHomepageProbeInfo info;
     memset(&info, 0, sizeof(info));
     if (!win) return info;
 
