@@ -2744,8 +2744,10 @@ static BOOL AMOpenLocalProjectInMainVC(NSString *projectPath) {
 
 static const NSInteger kAMMultiParentBtnTag = 0x414D5052; // 'AMPR'
 static const void *kAMMultiParentNavKey = &kAMMultiParentNavKey;
+static const void *kAMMultiParentFirstIdKey = &kAMMultiParentFirstIdKey;
 
 static IMP gOrigMultiSelectorNavViewDidLoad = NULL;
+static IMP gOrigLayerParentingWillDisplayCell = NULL;
 static IMP gOrigLayerParentingDidSelectRow = NULL;
 
 @interface AMMultiParentPopoverDelegate : NSObject <UIPopoverPresentationControllerDelegate>
@@ -2774,23 +2776,43 @@ typedef struct {
 
 static AMMultiParentEditContext gAMMultiParentCtx;
 
-static id AMReadObjectIvar(id obj, const char *ivarName) {
-    if (!obj || !ivarName) return nil;
-    Ivar iv = class_getInstanceVariable([obj class], ivarName);
-    if (!iv) return nil;
+static void *AMSwiftWeakLoadHolder(id navVC, intptr_t slide) {
+    if (!navVC) return NULL;
+    Ivar iv = class_getInstanceVariable([navVC class], "holder");
+    if (!iv) return NULL;
     ptrdiff_t off = ivar_getOffset(iv);
-    void *ptr = *(void **)((uint8_t *)(__bridge void *)obj + off);
-    return (__bridge id)ptr;
+    void *weakSlot = (uint8_t *)(__bridge void *)navVC + off;
+    typedef void *(*WeakLoadStrongFn)(void *);
+    return ((WeakLoadStrongFn)(0x1025bba7cULL + slide))(weakSlot);
 }
 
-static void AMWriteStrongObjectIvar(id obj, const char *ivarName, id value) {
-    if (!obj || !ivarName) return;
-    Ivar iv = class_getInstanceVariable([obj class], ivarName);
-    if (!iv) return;
-    ptrdiff_t off = ivar_getOffset(iv);
-    void **slot = (void **)((uint8_t *)(__bridge void *)obj + off);
-    if (*slot) CFRelease(*slot);
-    *slot = value ? (void *)CFBridgingRetain(value) : NULL;
+static void AMSwiftRetain(void *obj, intptr_t slide) {
+    if (!obj) return;
+    typedef void *(*RetainFn)(void *);
+    ((RetainFn)(0x1025bb824ULL + slide))(obj);
+}
+
+static void AMSwiftRelease(void *obj, intptr_t slide) {
+    if (!obj) return;
+    typedef void (*ReleaseFn)(void *);
+    ((ReleaseFn)(0x1025bb80cULL + slide))(obj);
+}
+
+static void *AMHolderGetSelectedIdsArray(void *holder, intptr_t slide) {
+    if (!holder) return NULL;
+    void *selectedArr = NULL;
+    uintptr_t getSelectedFn = (uintptr_t)(0x1003959f0ULL + slide);
+    __asm__ volatile(
+        "mov x20, %1\n"
+        "blr %2\n"
+        "mov %0, x0\n"
+        : "=r"(selectedArr)
+        : "r"(holder), "r"(getSelectedFn)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+          "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+          "x16", "x17", "x20", "memory"
+    );
+    return selectedArr;
 }
 
 static void *AMSwiftArrayStorageForObj(id obj, const char *ivarName) {
@@ -2920,9 +2942,9 @@ static void AMMultiParentEditCallback(void *scenePtr) {
     free(sceneCopy);
 }
 
-static int64_t AMReadHolderCurrentTime(id holder, intptr_t slide) {
+static int64_t AMReadHolderCurrentTime(void *holder, intptr_t slide) {
     if (!holder) return 0;
-    uint8_t *h = (uint8_t *)(__bridge void *)holder;
+    uint8_t *h = (uint8_t *)holder;
     ptrdiff_t flagOff = *(ptrdiff_t *)(0x1033e54d0ULL + slide);
     ptrdiff_t t1Off = *(ptrdiff_t *)(0x1033e54e8ULL + slide);
     ptrdiff_t t2Off = *(ptrdiff_t *)(0x1033e5500ULL + slide);
@@ -2937,23 +2959,56 @@ static int64_t AMReadHolderCurrentTime(id holder, intptr_t slide) {
 
 static void AMOnTapMultiParent(id self, SEL _cmd, UIButton *sender) {
     (void)_cmd;
-    id holder = AMReadObjectIvar(self, "holder");
+    intptr_t slide = AMMainBinarySlide();
+    void *holder = AMSwiftWeakLoadHolder(self, slide);
     if (!holder) return;
 
-    UIStoryboard *sb = [UIStoryboard storyboardWithName:@"LayerParentingVC" bundle:nil];
-    UIViewController *lpvc = [sb instantiateInitialViewController];
-    if (!lpvc) {
-        Class lpCls = NSClassFromString(@"_TtC12AlightMotion16LayerParentingVC");
-        if (!lpCls) return;
-        lpvc = [[lpCls alloc] initWithNibName:nil bundle:nil];
+    // Grab first selected layer ID so LayerParentingVC.willDisplayCell can populate cells
+    uint64_t firstSelId = 0;
+    BOOL hasFirstSel = NO;
+    void *selArr = AMHolderGetSelectedIdsArray(holder, slide);
+    if (selArr) {
+        int64_t cnt = *(int64_t *)((uint8_t *)selArr + 0x10);
+        if (cnt > 0) {
+            firstSelId = *(const uint64_t *)((uint8_t *)selArr + 0x20);
+            hasFirstSel = YES;
+        }
+        typedef void (*BridgeReleaseFn)(void *);
+        ((BridgeReleaseFn)(0x1025bb404ULL + slide))(selArr);
     }
-    if (!lpvc) return;
 
-    AMWriteStrongObjectIvar(lpvc, "holder", holder);
+    // Instantiate LayerParentingVC via native factory 0x10099e2c0(x0=holder, x20=LayerParentingVC.Type)
+    typedef void *(*MetaFn)(uintptr_t);
+    void *lpMeta = ((MetaFn)(0x10085e230ULL + slide))(0);
+    void *lpvcRaw = NULL;
+    if (lpMeta) {
+        AMSwiftRetain(holder, slide);
+        uintptr_t factoryFn = (uintptr_t)(0x10099e2c0ULL + slide);
+        __asm__ volatile(
+            "mov x0, %1\n"
+            "mov x20, %2\n"
+            "blr %3\n"
+            "mov %0, x0\n"
+            : "=r"(lpvcRaw)
+            : "r"(holder), "r"(lpMeta), "r"(factoryFn)
+            : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+              "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+              "x16", "x17", "x20", "memory"
+        );
+        AMSwiftRelease(holder, slide);
+    }
+    AMSwiftRelease(holder, slide);
+
+    if (!lpvcRaw) return;
+    UIViewController *lpvc = (__bridge_transfer UIViewController *)lpvcRaw;
+
     objc_setAssociatedObject(lpvc, kAMMultiParentNavKey, self, OBJC_ASSOCIATION_ASSIGN);
+    if (hasFirstSel) {
+        objc_setAssociatedObject(lpvc, kAMMultiParentFirstIdKey, @(firstSelId), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
 
     lpvc.modalPresentationStyle = UIModalPresentationPopover;
-    lpvc.preferredContentSize = CGSizeMake(300.0, 360.0);
+    lpvc.preferredContentSize = CGSizeMake(280.0, 340.0);
     UIPopoverPresentationController *pop = lpvc.popoverPresentationController;
     if (pop && sender) {
         pop.sourceView = sender;
@@ -2973,6 +3028,34 @@ static void AMHook_multiSelectorNavViewDidLoad(id self, SEL _cmd) {
     if (![stack isKindOfClass:[UIStackView class]]) return;
     if ([stack viewWithTag:kAMMultiParentBtnTag]) return;
 
+    // Locate the first group button (onTapGroup:) so the 3 group icons stay together
+    // and the multi-parent button sits directly to the left of them.
+    NSUInteger groupIdx = NSNotFound;
+    UIButton *groupBtn = nil;
+    NSArray<UIView *> *arranged = stack.arrangedSubviews;
+    for (NSUInteger i = 0; i < arranged.count; i++) {
+        UIView *v = arranged[i];
+        if ([v isKindOfClass:[UIButton class]]) {
+            UIButton *b = (UIButton *)v;
+            NSArray<NSString *> *actions = [b actionsForTarget:self forControlEvent:UIControlEventTouchUpInside];
+            if ([actions containsObject:@"onTapGroup:"]) {
+                groupIdx = i;
+                groupBtn = b;
+                break;
+            }
+        }
+    }
+    if (groupIdx == NSNotFound) {
+        for (NSUInteger i = 0; i < arranged.count; i++) {
+            if ([arranged[i] isKindOfClass:[UIButton class]]) {
+                groupIdx = i;
+                groupBtn = (UIButton *)arranged[i];
+                break;
+            }
+        }
+    }
+    if (groupIdx == NSNotFound) groupIdx = 0;
+
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
     btn.tag = kAMMultiParentBtnTag;
     btn.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2986,27 +3069,65 @@ static void AMHook_multiSelectorNavViewDidLoad(id self, SEL _cmd) {
         img = [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
         [btn setImage:img forState:UIControlStateNormal];
     }
-    btn.tintColor = [UIColor blackColor];
+    btn.tintColor = groupBtn.tintColor ?: [UIColor blackColor];
     btn.imageView.contentMode = UIViewContentModeScaleAspectFit;
+    [btn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [btn setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
 
-    UIView *refView = stack.arrangedSubviews.firstObject;
-    if (refView && refView.bounds.size.width > 0 && refView.bounds.size.height > 0) {
+    [btn addTarget:self action:@selector(am_onTapMultiParent:) forControlEvents:UIControlEventTouchUpInside];
+    [stack insertArrangedSubview:btn atIndex:groupIdx];
+
+    if (groupBtn) {
         [NSLayoutConstraint activateConstraints:@[
-            [btn.widthAnchor constraintEqualToConstant:refView.bounds.size.width],
-            [btn.heightAnchor constraintEqualToConstant:refView.bounds.size.height]
+            [btn.widthAnchor constraintEqualToAnchor:groupBtn.widthAnchor],
+            [btn.heightAnchor constraintEqualToAnchor:groupBtn.heightAnchor]
         ]];
     } else {
         [NSLayoutConstraint activateConstraints:@[
-            [btn.widthAnchor constraintEqualToConstant:28.0],
-            [btn.heightAnchor constraintEqualToConstant:28.0]
+            [btn.widthAnchor constraintEqualToConstant:30.0],
+            [btn.heightAnchor constraintEqualToConstant:30.0]
         ]];
     }
+}
 
-    [btn addTarget:self action:@selector(am_onTapMultiParent:) forControlEvents:UIControlEventTouchUpInside];
+static void AMHook_layerParentingWillDisplayCell(id self, SEL _cmd, UITableView *tableView, UITableViewCell *cell, NSIndexPath *indexPath) {
+    id navVC = objc_getAssociatedObject(self, kAMMultiParentNavKey);
+    NSNumber *firstIdNum = objc_getAssociatedObject(self, kAMMultiParentFirstIdKey);
+    if (!navVC || !firstIdNum) {
+        if (gOrigLayerParentingWillDisplayCell) {
+            ((void (*)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *))gOrigLayerParentingWillDisplayCell)(self, _cmd, tableView, cell, indexPath);
+        }
+        return;
+    }
 
-    // Insert right after the group buttons (Group, Masking Group, Exclude Group)
-    NSUInteger insertIdx = MIN((NSUInteger)3, stack.arrangedSubviews.count);
-    [stack insertArrangedSubview:btn atIndex:insertIdx];
+    intptr_t slide = AMMainBinarySlide();
+    Ivar iv = class_getInstanceVariable([self class], "holder");
+    void *holder = iv ? *(void **)((uint8_t *)(__bridge void *)self + ivar_getOffset(iv)) : NULL;
+    if (!holder) {
+        if (gOrigLayerParentingWillDisplayCell) {
+            ((void (*)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *))gOrigLayerParentingWillDisplayCell)(self, _cmd, tableView, cell, indexPath);
+        }
+        return;
+    }
+
+    ptrdiff_t selOff = *(ptrdiff_t *)(0x103332390ULL + slide);
+    uint8_t *selSlot = (uint8_t *)holder + selOff;
+    uint8_t savedSel[9];
+    memcpy(savedSel, selSlot, 9);
+
+    uint64_t dummyId = [firstIdNum unsignedLongLongValue];
+    memcpy(selSlot, &dummyId, 8);
+    selSlot[8] = 0; // single-layer selection tag so willDisplayCell populates row UI
+
+    if (gOrigLayerParentingWillDisplayCell) {
+        ((void (*)(id, SEL, UITableView *, UITableViewCell *, NSIndexPath *))gOrigLayerParentingWillDisplayCell)(self, _cmd, tableView, cell, indexPath);
+    }
+
+    memcpy(selSlot, savedSel, 9);
+
+    // Keep all rows interactive in multi-parent mode (other selected layers can still parent to it)
+    cell.userInteractionEnabled = YES;
+    cell.contentView.alpha = 1.0;
 }
 
 static void AMHook_layerParentingDidSelectRow(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) {
@@ -3040,22 +3161,9 @@ static void AMHook_layerParentingDidSelectRow(id self, SEL _cmd, UITableView *ta
         }
     }
 
-    id vm = AMReadObjectIvar(navVC, "vm");
-    id holder = AMReadObjectIvar(navVC, "holder");
-    if (vm && holder) {
-        void *selectedArr = NULL;
-        uintptr_t getSelectedFn = (uintptr_t)(0x1003959f0ULL + slide);
-        __asm__ volatile(
-            "mov x20, %1\n"
-            "blr %2\n"
-            "mov %0, x0\n"
-            : "=r"(selectedArr)
-            : "r"((__bridge void *)vm), "r"(getSelectedFn)
-            : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
-              "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
-              "x16", "x17", "x20", "memory"
-        );
-
+    void *holder = AMSwiftWeakLoadHolder(navVC, slide);
+    if (holder) {
+        void *selectedArr = AMHolderGetSelectedIdsArray(holder, slide);
         if (selectedArr) {
             int64_t selCount = *(int64_t *)((uint8_t *)selectedArr + 0x10);
             if (selCount > 0) {
@@ -3077,15 +3185,16 @@ static void AMHook_layerParentingDidSelectRow(id self, SEL _cmd, UITableView *ta
                     "mov x20, %1\n"
                     "blr %2\n"
                     :
-                    : "r"(cbPtr), "r"((__bridge void *)holder), "r"(performEditFn)
+                    : "r"(cbPtr), "r"(holder), "r"(performEditFn)
                     : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
                       "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
                       "x16", "x17", "x20", "memory"
                 );
             }
-            typedef void (*ReleaseFn)(void *);
-            ((ReleaseFn)(0x1025bb404ULL + slide))(selectedArr);
+            typedef void (*BridgeReleaseFn)(void *);
+            ((BridgeReleaseFn)(0x1025bb404ULL + slide))(selectedArr);
         }
+        AMSwiftRelease(holder, slide);
     }
 
     [(UIViewController *)self dismissViewControllerAnimated:YES completion:nil];
@@ -3174,6 +3283,10 @@ static void AlightMotionModsInit(void) {
                     @"viewDidLoad",
                     (IMP)AMHook_multiSelectorNavViewDidLoad,
                     &gOrigMultiSelectorNavViewDidLoad);
+    AMSwizzleMethod(@"_TtC12AlightMotion16LayerParentingVC",
+                    @"tableView:willDisplayCell:forRowAtIndexPath:",
+                    (IMP)AMHook_layerParentingWillDisplayCell,
+                    &gOrigLayerParentingWillDisplayCell);
     AMSwizzleMethod(@"_TtC12AlightMotion16LayerParentingVC",
                     @"tableView:didSelectRowAtIndexPath:",
                     (IMP)AMHook_layerParentingDidSelectRow,
