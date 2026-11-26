@@ -442,41 +442,58 @@ static void AMResolveAndDirectDownload(NSURL *origURL, void (^completion)(NSURL 
 }
 
 static void AMHandleUserLinkFromVC(UIViewController *vc, NSURL *u, BOOL directBypass) {
+    (void)directBypass;
     if (!u) return;
-    if (directBypass && ([u.scheme.lowercaseString isEqualToString:@"http"] || [u.scheme.lowercaseString isEqualToString:@"https"])) {
-        UIAlertController *loading = [UIAlertController alertControllerWithTitle:@"Downloading Project..."
-                                                                         message:@"Downloading project package directly (no sign-in required). Large projects may take a moment."
+
+    // If short link (e.g. alight.link), resolve canonical alightcreative.com/am/share/... URL via proxy,
+    // then hand the real share URL to Alight Motion's native Universal Link importer (with sign-in/size gates patched).
+    NSString *host = u.host.lowercaseString ?: @"";
+    if ([host containsString:@"alight.link"] || [host containsString:@"page.link"]) {
+        UIAlertController *loading = [UIAlertController alertControllerWithTitle:@"Resolving Link..."
+                                                                         message:@"Opening project link..."
                                                                   preferredStyle:UIAlertControllerStyleAlert];
         [vc presentViewController:loading animated:YES completion:^{
-            AMResolveAndDirectDownload(u, ^(NSURL * _Nullable localFile, NSError * _Nullable err) {
+            NSURL *proxyURL = AMProxyURLForTarget(u.absoluteString);
+            NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:proxyURL cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:15.0];
+            [req setValue:@"AlightMotion/6.2.60" forHTTPHeaderField:@"User-Agent"];
+            [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable resp, NSError * _Nullable err) {
                 (void)err;
+                NSURL *resolved = u;
+                NSString *body = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+                if (resp.URL && [resp.URL.absoluteString containsString:@"/share/u/"]) {
+                    resolved = resp.URL;
+                } else if (body) {
+                    NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"https://alightcreative\\.com/am/share/u/[^\"'\\s<>]+"
+                                                                                        options:NSRegularExpressionCaseInsensitive
+                                                                                          error:nil];
+                    NSTextCheckingResult *m = [rx firstMatchInString:body options:0 range:NSMakeRange(0, body.length)];
+                    if (m && m.range.location != NSNotFound) {
+                        NSURL *parsed = [NSURL URLWithString:[body substringWithRange:m.range]];
+                        if (parsed) resolved = parsed;
+                    }
+                }
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [loading dismissViewControllerAnimated:YES completion:^{
                         UIViewController *presenter = vc.presentingViewController;
-                        void (^finishBlock)(void) = ^{
-                            if (localFile) {
-                                AMOpenLocalFileInApp(localFile);
-                            } else {
-                                // Fallback to patched native importer
-                                AMDispatchAlightLink(u);
-                            }
-                        };
                         if (presenter) {
-                            [vc dismissViewControllerAnimated:YES completion:finishBlock];
+                            [vc dismissViewControllerAnimated:YES completion:^{ AMDispatchAlightLink(resolved); }];
                         } else {
-                            finishBlock();
+                            AMDispatchAlightLink(resolved);
                         }
                     }];
                 });
-            });
+            }] resume];
+        }];
+        return;
+    }
+
+    UIViewController *presenter = vc.presentingViewController;
+    if (presenter) {
+        [vc dismissViewControllerAnimated:YES completion:^{
+            AMDispatchAlightLink(u);
         }];
     } else {
-        UIViewController *presenter = vc.presentingViewController;
-        if (presenter) {
-            [vc dismissViewControllerAnimated:YES completion:^{ AMDispatchAlightLink(u); }];
-        } else {
-            AMDispatchAlightLink(u);
-        }
+        AMDispatchAlightLink(u);
     }
 }
 
@@ -809,24 +826,86 @@ static UIImageView *AMFindLargestImageViewInView(UIView *v) {
     return best;
 }
 
+static void AMCollectLabelsInView(UIView *v, NSMutableArray<UILabel *> *out) {
+    if (!v) return;
+    if ([v isKindOfClass:[UILabel class]]) {
+        [out addObject:(UILabel *)v];
+    }
+    for (UIView *sub in v.subviews) {
+        AMCollectLabelsInView(sub, out);
+    }
+}
+
+static NSString *AMFindMatchingThumbFileForCell(UICollectionViewCell *cell, NSDictionary<NSString *, NSString *> *map) {
+    if (!cell || map.count == 0) return nil;
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+
+    SEL titleSel = NSSelectorFromString(@"titleLabel");
+    SEL textSel = NSSelectorFromString(@"textLabel");
+    if ([cell respondsToSelector:titleSel]) {
+        UILabel *tl = ((UILabel *(*)(id, SEL))objc_msgSend)(cell, titleSel);
+        if (tl.text.length > 0) [candidates addObject:tl.text];
+    }
+    if ([cell respondsToSelector:textSel]) {
+        UILabel *tx = ((UILabel *(*)(id, SEL))objc_msgSend)(cell, textSel);
+        if (tx.text.length > 0) [candidates addObject:tx.text];
+    }
+    NSMutableArray<UILabel *> *allLabels = [NSMutableArray array];
+    AMCollectLabelsInView(cell.contentView, allLabels);
+    for (UILabel *l in allLabels) {
+        if (l.text.length > 0) [candidates addObject:l.text];
+    }
+
+    for (NSString *raw in candidates) {
+        NSString *hit = map[raw];
+        if (hit.length > 0) return hit;
+        NSString *trimmed = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        hit = map[trimmed];
+        if (hit.length > 0) return hit;
+        hit = map[trimmed.lowercaseString];
+        if (hit.length > 0) return hit;
+    }
+    return nil;
+}
+
+static UIImageView *AMImageViewForEffectCell(UICollectionViewCell *cell) {
+    SEL ivSel = NSSelectorFromString(@"imageView");
+    if ([cell respondsToSelector:ivSel]) {
+        UIImageView *iv = ((UIImageView *(*)(id, SEL))objc_msgSend)(cell, ivSel);
+        if ([iv isKindOfClass:[UIImageView class]]) return iv;
+    }
+    return AMFindLargestImageViewInView(cell.contentView);
+}
+
+static void AMApplyThumbToCell(UICollectionViewCell *cell, UIImage *img) {
+    UIImageView *iv = AMImageViewForEffectCell(cell);
+    if (!iv || !img) return;
+    iv.image = img;
+    iv.contentMode = UIViewContentModeScaleAspectFill;
+    iv.clipsToBounds = YES;
+}
+
 static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView *cv, UICollectionViewCell *cell, NSIndexPath *indexPath) {
     if (gOrigEffectCatWillDisplayCell) {
         ((void (*)(id, SEL, UICollectionView *, UICollectionViewCell *, NSIndexPath *))gOrigEffectCatWillDisplayCell)(self, _cmd, cv, cell, indexPath);
     }
-    UILabel *lbl = AMFindFirstLabelInView(cell.contentView);
-    if (!lbl || lbl.text.length == 0) return;
     NSDictionary<NSString *, NSString *> *map = AMLoadCustomThumbMap();
-    NSString *thumbFile = map[lbl.text];
+    NSString *thumbFile = AMFindMatchingThumbFileForCell(cell, map);
     if (thumbFile.length > 0) {
         NSString *p = [AMCustomThumbsDir() stringByAppendingPathComponent:thumbFile];
         UIImage *img = [UIImage imageWithContentsOfFile:p];
         if (img) {
-            UIImageView *iv = AMFindLargestImageViewInView(cell.contentView);
-            if (iv) {
-                iv.image = img;
-                iv.contentMode = UIViewContentModeScaleAspectFill;
-                iv.clipsToBounds = YES;
-            }
+            AMApplyThumbToCell(cell, img);
+            // Re-apply after async thumbnail load ticks so built-in WebP decode cannot overwrite custom PNG
+            __weak UICollectionViewCell *weakCell = cell;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UICollectionViewCell *c = weakCell;
+                if (c) AMApplyThumbToCell(c, img);
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UICollectionViewCell *c = weakCell;
+                if (c) AMApplyThumbToCell(c, img);
+            });
         }
     }
 }
@@ -1192,6 +1271,7 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
             [png writeToFile:[AMCustomThumbsDir() stringByAppendingPathComponent:thumbFn] atomically:YES];
             NSMutableDictionary *map = AMLoadCustomThumbMap();
             map[name] = thumbFn;
+            map[name.lowercaseString] = thumbFn;
             AMSaveCustomThumbMap(map);
         }
     }
