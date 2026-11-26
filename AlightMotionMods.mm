@@ -21,7 +21,6 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
-#import <Metal/Metal.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <math.h>
@@ -777,17 +776,7 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
 static NSString *AMCustomEffectsDir(void) {
     NSArray<NSString *> *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *dir = [docs.firstObject stringByAppendingPathComponent:@"CustomEffects"];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *relThumbDir = [dir stringByAppendingPathComponent:@"thumb"];
-    [fm createDirectoryAtPath:relThumbDir withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *dstWebp = [relThumbDir stringByAppendingPathComponent:@"box.webp"];
-    if (![fm fileExistsAtPath:dstWebp]) {
-        NSString *srcWebp = [[[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"BuiltinEffects/thumb"] stringByAppendingPathComponent:@"box.webp"];
-        if ([fm fileExistsAtPath:srcWebp]) {
-            [fm copyItemAtPath:srcWebp toPath:dstWebp error:nil];
-        }
-    }
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     return dir;
 }
 
@@ -842,7 +831,7 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
         if ([trimmed containsString:@"void main"] || [trimmed containsString:@"gl_FragColor"]) {
             NSString *wrapped = [NSString stringWithFormat:
                 @"<?xml version='1.0' encoding='UTF-8' ?>\n"
-                @"<effect id=\"com.alightcreative.effects.custom_%@\" compat=\"acScreenNorm-y\" name=\"%@\" desc=\"Custom Effect\" category=\"custom\" tags=\"custom\" thumb=\"thumb/box.webp\">\n"
+                @"<effect id=\"com.alightcreative.effects.custom_%@\" compat=\"acScreenNorm-y\" name=\"%@\" desc=\"Custom Effect\" category=\"custom\" tags=\"custom\" thumb=\"thumb/copy-bg.webp\">\n"
                 @"    <params>\n"
                 @"        <texture id=\"inputImg\" srcType=\"content\" />\n"
                 @"    </params>\n"
@@ -891,15 +880,10 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
         }
     };
 
-    // Strip flags that hide an effect from the picker grid and non-iOS <effect> attributes
-    // that trigger XMLPullParser "Did not consume all element contents for <effect>" try! crash
+    // Strip flags that hide an effect from the picker grid
     removeAttr(@"internal");
     removeAttr(@"deprecated");
     removeAttr(@"experimental");
-    removeAttr(@"description");
-    removeAttr(@"author");
-    removeAttr(@"version");
-    removeAttr(@"type");
 
     // Always assign a unique com.alightcreative.effects.custom_<slug> ID so it gets its own box
     // and never collides with a built-in effect
@@ -908,524 +892,16 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
     setAttr(@"name", displayName);
     setAttr(@"desc", @"Custom Effect");
     setAttr(@"tags", @"custom");
-    // Use a guaranteed-valid built-in WebP thumb copied into CustomEffects/thumb/box.webp;
+    // Use a guaranteed-valid built-in WebP thumb for Alight Motion's WebP loader;
     // our cell willDisplayCell hook overlays any custom user PNG thumbnail cleanly!
-    setAttr(@"thumb", @"thumb/box.webp");
+    setAttr(@"thumb", @"thumb/copy-bg.webp");
 
     NSMutableString *result = [trimmed mutableCopy];
     [result replaceCharactersInRange:tagRange withString:openTag];
-
-    // Reject pure-JS <script> effects that lack <shader> (unsupported V8 JS runtime on iOS)
-    if ([result rangeOfString:@"<shader" options:NSCaseInsensitiveSearch].location == NSNotFound) {
-        if (outError) {
-            *outError = [NSError errorWithDomain:@"AMCustomEffects" code:4
-                                        userInfo:@{NSLocalizedDescriptionKey: @"JavaScript-only <script> effects without a <shader> are not supported by iOS Metal."}];
-        }
-        return nil;
-    }
-
-    // Strip non-external <script> blocks if present alongside <shader>
-    {
-        NSRegularExpression *scriptRx = [NSRegularExpression regularExpressionWithPattern:@"<script(?![^>]*\\bexternal\\s*=)[^>]*>[\\s\\S]*?</script>"
-                                                                                  options:NSRegularExpressionCaseInsensitive
-                                                                                    error:nil];
-        [scriptRx replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:@""];
-    }
-
-    // Normalize <shader precision="medium"> -> precision="high" and <spinner type="integer"> -> snap="true"
-    {
-        NSRegularExpression *precRx = [NSRegularExpression regularExpressionWithPattern:@"(<shader\\b[^>]*\\bprecision\\s*=\\s*\")medium(\")"
-                                                                                options:NSRegularExpressionCaseInsensitive
-                                                                                  error:nil];
-        [precRx replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:@"$1high$2"];
-
-        NSRegularExpression *intSpinRx = [NSRegularExpression regularExpressionWithPattern:@"(<spinner\\b[^>]*)\\btype\\s*=\\s*\"integer\""
-                                                                                   options:NSRegularExpressionCaseInsensitive
-                                                                                     error:nil];
-        [intSpinRx replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:@"$1snap=\"true\""];
-    }
-
-    // Normalize bare <shader> tags missing type="fragment" (common in Android/Gold Motion XMLs)
-    {
-        NSRegularExpression *bareShaderRx = [NSRegularExpression regularExpressionWithPattern:@"<shader(?![^>]*\\btype\\s*=)([^>]*)>"
-                                                                                      options:NSRegularExpressionCaseInsensitive
-                                                                                        error:nil];
-        [bareShaderRx replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:@"<shader type=\"fragment\"$1>"];
-    }
-
-    // Fallback missing Android bundled image textures (<texture ... srcType="image" .../>) to srcType="content"
-    // if the referenced image file does not exist inside AlightMotion.app/BuiltinEffects.
-    {
-        NSRegularExpression *imgTexRx = [NSRegularExpression regularExpressionWithPattern:@"<texture\\b[^>]*\\bsrcType\\s*=\\s*\"image\"[^>]*>"
-                                                                                  options:NSRegularExpressionCaseInsensitive
-                                                                                    error:nil];
-        NSArray<NSTextCheckingResult *> *matches = [imgTexRx matchesInString:result options:0 range:NSMakeRange(0, result.length)];
-        NSString *builtinDir = [[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"BuiltinEffects"];
-        NSRegularExpression *srcAttrRx = [NSRegularExpression regularExpressionWithPattern:@"\\bsrc\\s*=\\s*\"([^\"]+)\""
-                                                                                   options:NSRegularExpressionCaseInsensitive
-                                                                                     error:nil];
-        for (NSTextCheckingResult *m in [matches reverseObjectEnumerator]) {
-            NSString *tag = [result substringWithRange:m.range];
-            NSTextCheckingResult *srcM = [srcAttrRx firstMatchInString:tag options:0 range:NSMakeRange(0, tag.length)];
-            BOOL exists = NO;
-            if (srcM && srcM.numberOfRanges > 1) {
-                NSString *rel = [tag substringWithRange:[srcM rangeAtIndex:1]];
-                exists = [[NSFileManager defaultManager] fileExistsAtPath:[builtinDir stringByAppendingPathComponent:rel]];
-            }
-            if (!exists) {
-                NSMutableString *fixedTag = [tag mutableCopy];
-                NSRegularExpression *stRx = [NSRegularExpression regularExpressionWithPattern:@"\\bsrcType\\s*=\\s*\"image\""
-                                                                                      options:NSRegularExpressionCaseInsensitive
-                                                                                        error:nil];
-                [stRx replaceMatchesInString:fixedTag options:0 range:NSMakeRange(0, fixedTag.length) withTemplate:@"srcType=\"content\""];
-                [srcAttrRx replaceMatchesInString:fixedTag options:0 range:NSMakeRange(0, fixedTag.length) withTemplate:@""];
-                [result replaceCharactersInRange:m.range withString:fixedTag];
-            }
-        }
-    }
-
     if (![result hasPrefix:@"<?xml"]) {
         [result insertString:@"<?xml version='1.0' encoding='UTF-8' ?>\n" atIndex:0];
     }
     return result;
-}
-
-// ============================================================================
-// Module 3B: GLSL-ES-to-MSL Shader Compatibility Engine (Android -> iOS)
-// Hooks MTLDevice -newLibraryWithSource:options:error: with zero overhead on
-// shaders that already compile cleanly. When an AC_ShaderWrapper effect fails
-// Metal compilation, injects missing GLSL ES 2.0/3.0 built-ins/overloads and
-// rewrites GLSL-only syntax (precision, out/inout, sampler2D, const int,
-// struct/array constructors, stpq swizzles, uniform/varying, not()) to MSL.
-// ============================================================================
-
-typedef void *(*AMNewLibOrigFn)(id, SEL, NSString *, MTLCompileOptions *, NSError * __autoreleasing *);
-static AMNewLibOrigFn gOrigNewLibraryWithSource = NULL;
-
-// AM_METAL_COMPAT_BEGIN
-static NSString *AMGLSLGlobalCompatPreamble(void) {
-    return @"\n"
-    "// --- AMMod GLSL-ES-to-MSL Compatibility Preamble ---\n"
-    "typedef bool2 bvec2; typedef bool3 bvec3; typedef bool4 bvec4;\n"
-    "typedef int2 ivec2; typedef int3 ivec3; typedef int4 ivec4;\n"
-    "typedef uint2 uvec2; typedef uint3 uvec3; typedef uint4 uvec4;\n"
-    "typedef texture2d<half> sampler2D;\n"
-    "\n"
-    "inline float radians(float d) { return d * 0.017453292519943295f; }\n"
-    "inline vec2  radians(vec2  d) { return d * 0.017453292519943295f; }\n"
-    "inline vec3  radians(vec3  d) { return d * 0.017453292519943295f; }\n"
-    "inline vec4  radians(vec4  d) { return d * 0.017453292519943295f; }\n"
-    "inline float degrees(float r) { return r * 57.29577951308232f; }\n"
-    "inline vec2  degrees(vec2  r) { return r * 57.29577951308232f; }\n"
-    "inline vec3  degrees(vec3  r) { return r * 57.29577951308232f; }\n"
-    "inline vec4  degrees(vec4  r) { return r * 57.29577951308232f; }\n"
-    "\n"
-    "inline float inversesqrt(float x) { return metal::rsqrt(x); }\n"
-    "inline vec2  inversesqrt(vec2  x) { return metal::rsqrt(x); }\n"
-    "inline vec3  inversesqrt(vec3  x) { return metal::rsqrt(x); }\n"
-    "inline vec4  inversesqrt(vec4  x) { return metal::rsqrt(x); }\n"
-    "\n"
-    "inline float dFdx(float x) { return metal::dfdx(x); }\n"
-    "inline vec2  dFdx(vec2  x) { return metal::dfdx(x); }\n"
-    "inline vec3  dFdx(vec3  x) { return metal::dfdx(x); }\n"
-    "inline vec4  dFdx(vec4  x) { return metal::dfdx(x); }\n"
-    "inline float dFdy(float x) { return metal::dfdy(x); }\n"
-    "inline vec2  dFdy(vec2  x) { return metal::dfdy(x); }\n"
-    "inline vec3  dFdy(vec3  x) { return metal::dfdy(x); }\n"
-    "inline vec4  dFdy(vec4  x) { return metal::dfdy(x); }\n"
-    "\n"
-    "inline vec2 mod(vec2 x, float y) { return x - y * metal::floor(x / y); }\n"
-    "inline vec3 mod(vec3 x, float y) { return x - y * metal::floor(x / y); }\n"
-    "inline vec4 mod(vec4 x, float y) { return x - y * metal::floor(x / y); }\n"
-    "inline vec2 mod(float x, vec2 y) { return x - y * metal::floor(x / y); }\n"
-    "inline vec3 mod(float x, vec3 y) { return x - y * metal::floor(x / y); }\n"
-    "inline vec4 mod(float x, vec4 y) { return x - y * metal::floor(x / y); }\n"
-    "\n"
-    "inline vec2 atan(vec2 y, vec2 x) { return metal::atan2(y, x); }\n"
-    "inline vec3 atan(vec3 y, vec3 x) { return metal::atan2(y, x); }\n"
-    "inline vec4 atan(vec4 y, vec4 x) { return metal::atan2(y, x); }\n"
-    "\n"
-    "inline vec2  min(vec2  a, float b) { return metal::min(a, vec2(b)); }\n"
-    "inline vec3  min(vec3  a, float b) { return metal::min(a, vec3(b)); }\n"
-    "inline vec4  min(vec4  a, float b) { return metal::min(a, vec4(b)); }\n"
-    "inline vec2  min(float a, vec2  b) { return metal::min(vec2(a), b); }\n"
-    "inline vec3  min(float a, vec3  b) { return metal::min(vec3(a), b); }\n"
-    "inline vec4  min(float a, vec4  b) { return metal::min(vec4(a), b); }\n"
-    "inline float min(float a, int   b) { return metal::min(a, float(b)); }\n"
-    "inline float min(int   a, float b) { return metal::min(float(a), b); }\n"
-    "\n"
-    "inline vec2  max(vec2  a, float b) { return metal::max(a, vec2(b)); }\n"
-    "inline vec3  max(vec3  a, float b) { return metal::max(a, vec3(b)); }\n"
-    "inline vec4  max(vec4  a, float b) { return metal::max(a, vec4(b)); }\n"
-    "inline vec2  max(float a, vec2  b) { return metal::max(vec2(a), b); }\n"
-    "inline vec3  max(float a, vec3  b) { return metal::max(vec3(a), b); }\n"
-    "inline vec4  max(float a, vec4  b) { return metal::max(vec4(a), b); }\n"
-    "inline float max(float a, int   b) { return metal::max(a, float(b)); }\n"
-    "inline float max(int   a, float b) { return metal::max(float(a), b); }\n"
-    "\n"
-    "inline vec2  pow(vec2  x, float y) { return metal::pow(x, vec2(y)); }\n"
-    "inline vec3  pow(vec3  x, float y) { return metal::pow(x, vec3(y)); }\n"
-    "inline vec4  pow(vec4  x, float y) { return metal::pow(x, vec4(y)); }\n"
-    "inline float pow(float x, int   y) { return metal::pow(x, float(y)); }\n"
-    "\n"
-    "inline vec2 step(float e, vec2 x) { return metal::step(vec2(e), x); }\n"
-    "inline vec3 step(float e, vec3 x) { return metal::step(vec3(e), x); }\n"
-    "inline vec4 step(float e, vec4 x) { return metal::step(vec4(e), x); }\n"
-    "inline vec2 smoothstep(float e0, float e1, vec2 x) { return metal::smoothstep(vec2(e0), vec2(e1), x); }\n"
-    "inline vec3 smoothstep(float e0, float e1, vec3 x) { return metal::smoothstep(vec3(e0), vec3(e1), x); }\n"
-    "inline vec4 smoothstep(float e0, float e1, vec4 x) { return metal::smoothstep(vec4(e0), vec4(e1), x); }\n"
-    "\n"
-    "inline float mix(float x, float y, bool  a) { return a ? y : x; }\n"
-    "inline vec2  mix(vec2  x, vec2  y, bool  a) { return a ? y : x; }\n"
-    "inline vec3  mix(vec3  x, vec3  y, bool  a) { return a ? y : x; }\n"
-    "inline vec4  mix(vec4  x, vec4  y, bool  a) { return a ? y : x; }\n"
-    "inline vec2  mix(vec2  x, vec2  y, bvec2 a) { return metal::select(x, y, a); }\n"
-    "inline vec3  mix(vec3  x, vec3  y, bvec3 a) { return metal::select(x, y, a); }\n"
-    "inline vec4  mix(vec4  x, vec4  y, bvec4 a) { return metal::select(x, y, a); }\n"
-    "\n"
-    "inline bvec2 lessThan(vec2 a, vec2 b) { return a < b; }\n"
-    "inline bvec3 lessThan(vec3 a, vec3 b) { return a < b; }\n"
-    "inline bvec4 lessThan(vec4 a, vec4 b) { return a < b; }\n"
-    "inline bvec2 lessThan(ivec2 a, ivec2 b) { return a < b; }\n"
-    "inline bvec3 lessThan(ivec3 a, ivec3 b) { return a < b; }\n"
-    "inline bvec4 lessThan(ivec4 a, ivec4 b) { return a < b; }\n"
-    "inline bvec2 lessThanEqual(vec2 a, vec2 b) { return a <= b; }\n"
-    "inline bvec3 lessThanEqual(vec3 a, vec3 b) { return a <= b; }\n"
-    "inline bvec4 lessThanEqual(vec4 a, vec4 b) { return a <= b; }\n"
-    "inline bvec2 lessThanEqual(ivec2 a, ivec2 b) { return a <= b; }\n"
-    "inline bvec3 lessThanEqual(ivec3 a, ivec3 b) { return a <= b; }\n"
-    "inline bvec4 lessThanEqual(ivec4 a, ivec4 b) { return a <= b; }\n"
-    "inline bvec2 greaterThan(vec2 a, vec2 b) { return a > b; }\n"
-    "inline bvec3 greaterThan(vec3 a, vec3 b) { return a > b; }\n"
-    "inline bvec4 greaterThan(vec4 a, vec4 b) { return a > b; }\n"
-    "inline bvec2 greaterThan(ivec2 a, ivec2 b) { return a > b; }\n"
-    "inline bvec3 greaterThan(ivec3 a, ivec3 b) { return a > b; }\n"
-    "inline bvec4 greaterThan(ivec4 a, ivec4 b) { return a > b; }\n"
-    "inline bvec2 greaterThanEqual(vec2 a, vec2 b) { return a >= b; }\n"
-    "inline bvec3 greaterThanEqual(vec3 a, vec3 b) { return a >= b; }\n"
-    "inline bvec4 greaterThanEqual(vec4 a, vec4 b) { return a >= b; }\n"
-    "inline bvec2 greaterThanEqual(ivec2 a, ivec2 b) { return a >= b; }\n"
-    "inline bvec3 greaterThanEqual(ivec3 a, ivec3 b) { return a >= b; }\n"
-    "inline bvec4 greaterThanEqual(ivec4 a, ivec4 b) { return a >= b; }\n"
-    "inline bvec2 equal(vec2 a, vec2 b) { return a == b; }\n"
-    "inline bvec3 equal(vec3 a, vec3 b) { return a == b; }\n"
-    "inline bvec4 equal(vec4 a, vec4 b) { return a == b; }\n"
-    "inline bvec2 equal(ivec2 a, ivec2 b) { return a == b; }\n"
-    "inline bvec3 equal(ivec3 a, ivec3 b) { return a == b; }\n"
-    "inline bvec4 equal(ivec4 a, ivec4 b) { return a == b; }\n"
-    "inline bvec2 equal(bvec2 a, bvec2 b) { return a == b; }\n"
-    "inline bvec3 equal(bvec3 a, bvec3 b) { return a == b; }\n"
-    "inline bvec4 equal(bvec4 a, bvec4 b) { return a == b; }\n"
-    "inline bvec2 notEqual(vec2 a, vec2 b) { return a != b; }\n"
-    "inline bvec3 notEqual(vec3 a, vec3 b) { return a != b; }\n"
-    "inline bvec4 notEqual(vec4 a, vec4 b) { return a != b; }\n"
-    "inline bvec2 notEqual(ivec2 a, ivec2 b) { return a != b; }\n"
-    "inline bvec3 notEqual(ivec3 a, ivec3 b) { return a != b; }\n"
-    "inline bvec4 notEqual(ivec4 a, ivec4 b) { return a != b; }\n"
-    "inline bvec2 notEqual(bvec2 a, bvec2 b) { return a != b; }\n"
-    "inline bvec3 notEqual(bvec3 a, bvec3 b) { return a != b; }\n"
-    "inline bvec4 notEqual(bvec4 a, bvec4 b) { return a != b; }\n"
-    "inline bvec2 am_bnot(bvec2 a) { return !a; }\n"
-    "inline bvec3 am_bnot(bvec3 a) { return !a; }\n"
-    "inline bvec4 am_bnot(bvec4 a) { return !a; }\n"
-    "\n"
-    "inline mat2 matrixCompMult(mat2 a, mat2 b) { return mat2(a[0]*b[0], a[1]*b[1]); }\n"
-    "inline mat3 matrixCompMult(mat3 a, mat3 b) { return mat3(a[0]*b[0], a[1]*b[1], a[2]*b[2]); }\n"
-    "inline mat4 matrixCompMult(mat4 a, mat4 b) { return mat4(a[0]*b[0], a[1]*b[1], a[2]*b[2], a[3]*b[3]); }\n"
-    "inline mat2 outerProduct(vec2 c, vec2 r) { return mat2(c*r.x, c*r.y); }\n"
-    "inline mat3 outerProduct(vec3 c, vec3 r) { return mat3(c*r.x, c*r.y, c*r.z); }\n"
-    "inline mat4 outerProduct(vec4 c, vec4 r) { return mat4(c*r.x, c*r.y, c*r.z, c*r.w); }\n"
-    "inline mat2 inverse(mat2 m) {\n"
-    "    float d = m[0][0]*m[1][1] - m[1][0]*m[0][1];\n"
-    "    return mat2(m[1][1], -m[0][1], -m[1][0], m[0][0]) * (1.0f / d);\n"
-    "}\n"
-    "inline mat3 inverse(mat3 m) {\n"
-    "    float a00=m[0][0],a01=m[0][1],a02=m[0][2],a10=m[1][0],a11=m[1][1],a12=m[1][2],a20=m[2][0],a21=m[2][1],a22=m[2][2];\n"
-    "    float b01=a22*a11-a12*a21, b11=-a22*a10+a12*a20, b21=a21*a10-a11*a20;\n"
-    "    float invD = 1.0f / (a00*b01 + a01*b11 + a02*b21);\n"
-    "    return mat3(\n"
-    "        vec3(b01, (-a22*a01+a02*a21), (a12*a01-a02*a11)) * invD,\n"
-    "        vec3(b11, (a22*a00-a02*a20), (-a12*a00+a02*a10)) * invD,\n"
-    "        vec3(b21, (-a21*a00+a01*a20), (a11*a00-a01*a10)) * invD);\n"
-    "}\n"
-    "inline mat4 inverse(mat4 m) {\n"
-    "    float c00=m[2][2]*m[3][3]-m[3][2]*m[2][3], c02=m[1][2]*m[3][3]-m[3][2]*m[1][3], c03=m[1][2]*m[2][3]-m[2][2]*m[1][3];\n"
-    "    float c04=m[2][1]*m[3][3]-m[3][1]*m[2][3], c06=m[1][1]*m[3][3]-m[3][1]*m[1][3], c07=m[1][1]*m[2][3]-m[2][1]*m[1][3];\n"
-    "    float c08=m[2][1]*m[3][2]-m[3][1]*m[2][2], c10=m[1][1]*m[3][2]-m[3][1]*m[1][2], c11=m[1][1]*m[2][2]-m[2][1]*m[1][2];\n"
-    "    float c12=m[2][0]*m[3][3]-m[3][0]*m[2][3], c14=m[1][0]*m[3][3]-m[3][0]*m[1][3], c15=m[1][0]*m[2][3]-m[2][0]*m[1][3];\n"
-    "    float c16=m[2][0]*m[3][2]-m[3][0]*m[2][2], c18=m[1][0]*m[3][2]-m[3][0]*m[1][2], c19=m[1][0]*m[2][2]-m[2][0]*m[1][2];\n"
-    "    float c20=m[2][0]*m[3][1]-m[3][0]*m[2][1], c22=m[1][0]*m[3][1]-m[3][0]*m[1][1], c23=m[1][0]*m[2][1]-m[2][0]*m[1][1];\n"
-    "    vec4 f0(c00,c00,c02,c03), f1(c04,c04,c06,c07), f2(c08,c08,c10,c11);\n"
-    "    vec4 f3(c12,c12,c14,c15), f4(c16,c16,c18,c19), f5(c20,c20,c22,c23);\n"
-    "    vec4 v0(m[1][0],m[0][0],m[0][0],m[0][0]), v1(m[1][1],m[0][1],m[0][1],m[0][1]);\n"
-    "    vec4 v2(m[1][2],m[0][2],m[0][2],m[0][2]), v3(m[1][3],m[0][3],m[0][3],m[0][3]);\n"
-    "    vec4 i0(v1*f0 - v2*f1 + v3*f2), i1(v0*f0 - v2*f3 + v3*f4), i2(v0*f1 - v1*f3 + v3*f5), i3(v0*f2 - v1*f4 + v2*f5);\n"
-    "    vec4 sA(+1,-1,+1,-1), sB(-1,+1,-1,+1);\n"
-    "    mat4 inv(i0*sA, i1*sB, i2*sA, i3*sB);\n"
-    "    vec4 r0(inv[0][0], inv[1][0], inv[2][0], inv[3][0]);\n"
-    "    return inv * (1.0f / metal::dot(m[0], r0));\n"
-    "}\n"
-    "// --- End AMMod GLSL-ES-to-MSL Compatibility Preamble ---\n\n";
-}
-
-static NSString *AMGLSLWrapperExtraMethods(void) {
-    return @"\n"
-    "    vec2 am_texSize(AC_ImageInfo info) { return info.size; }\n"
-    "    template<typename T, typename U> inline T am_mix(T a, T b, U t) { return mix(a, b, t); }\n"
-    "    vec4 texture2D(texture2d<half> t, vec2 p, float bias) { (void)bias; return vec4(t.sample(textureSampler, p)); }\n"
-    "    vec4 texture2DCv(texture2d<half> t, vec2 p, float bias) { (void)bias; return texture2DCv(t, p); }\n"
-    "    vec4 texture2D(AC_ImageInfo info, vec2 p) { return texture2D(info.texture, p); }\n"
-    "    vec4 texture2DCv(AC_ImageInfo info, vec2 p) { return texture2DCv(info.texture, p); }\n"
-    "    vec4 texture(texture2d<half> t, vec2 p) { return texture2D(t, p); }\n"
-    "    vec4 texture(texture2d<half> t, vec2 p, float bias) { (void)bias; return texture2D(t, p); }\n"
-    "    vec4 texture(AC_ImageInfo info, vec2 p) { return texture2D(info.texture, p); }\n";
-}
-
-static NSString *AMSanitizeUserGLSLBody(NSString *body) {
-    NSMutableString *s = [body mutableCopy];
-
-    // 1. Strip #version and #extension directives
-    {
-        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"^[ \\t]*#(?:version|extension)\\b[^\\n]*$"
-                                                                            options:NSRegularExpressionAnchorsMatchLines
-                                                                              error:nil];
-        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@""];
-    }
-
-    // 2. Strip `precision highp/mediump/lowp float/int/sampler2D;` statements
-    {
-        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\bprecision\\s+(?:highp|mediump|lowp)\\s+\\w+\\s*;"
-                                                                            options:0
-                                                                              error:nil];
-        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@""];
-    }
-
-    // 3. Strip standalone top-level `uniform ...;`, `varying ...;`, `attribute ...;` declarations
-    {
-        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"^[ \\t]*(?:uniform|varying|attribute)\\s+[^;\\n]+;"
-                                                                            options:NSRegularExpressionAnchorsMatchLines
-                                                                              error:nil];
-        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@""];
-    }
-
-    // 4. Preserve compile-time `const int NAME = INT_EXPR;` (valid at both struct & function scope in Metal)
-    {
-        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\bconst\\s+int\\s+([A-Za-z_]\\w*)\\s*=\\s*([0-9+\\-*/()\\s]+);"
-                                                                            options:0
-                                                                              error:nil];
-        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"enum { $1 = $2 };"];
-    }
-
-    // 4b. Avoid `#define size (ac__p.size)` breaking `inputImg.size` and `#define mix (ac__p.mix)` breaking `mix(...)`
-    if ([s containsString:@"#define size (ac__p.size)"]) {
-        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\b(?!ac__p\\b)([A-Za-z_]\\w*)\\.size\\b"
-                                                                            options:0
-                                                                              error:nil];
-        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"am_texSize($1)"];
-    }
-    if ([s containsString:@"#define mix (ac__p.mix)"]) {
-        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\bmix\\s*\\("
-                                                                            options:0
-                                                                              error:nil];
-        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"am_mix("];
-    }
-
-    // 5. Rewrite GLSL `out` / `inout` function parameters to MSL `thread T&`
-    {
-        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\b(?:inout|out)\\s+(?:(?:highp|mediump|lowp)\\s+)?(float|int|uint|bool|vec[234]|ivec[234]|uvec[234]|bvec[234]|mat[234])\\s+([A-Za-z_]\\w*)"
-                                                                            options:0
-                                                                              error:nil];
-        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"thread $1& $2"];
-    }
-
-    // 6. Rewrite GLSL array constructors `float[N](...)` / `vec2[](...)` -> `{...}`
-    {
-        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\b(?:float|int|uint|bool|vec[234]|ivec[234]|mat[234])\\s*\\[\\s*\\d*\\s*\\]\\s*\\(([^()]*)\\)"
-                                                                            options:0
-                                                                              error:nil];
-        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"{$1}"];
-    }
-
-    // 7. Rewrite GLSL struct aggregate constructor calls `MyStruct(a, b)` -> `MyStruct{a, b}`
-    {
-        NSRegularExpression *structDeclRx = [NSRegularExpression regularExpressionWithPattern:@"\\bstruct\\s+([A-Za-z_]\\w*)\\s*\\{"
-                                                                                      options:0
-                                                                                        error:nil];
-        NSArray<NSTextCheckingResult *> *decls = [structDeclRx matchesInString:s options:0 range:NSMakeRange(0, s.length)];
-        NSMutableSet<NSString *> *structNames = [NSMutableSet set];
-        for (NSTextCheckingResult *m in decls) {
-            if (m.numberOfRanges > 1) {
-                [structNames addObject:[s substringWithRange:[m rangeAtIndex:1]]];
-            }
-        }
-        for (NSString *sname in structNames) {
-            NSString *pat = [NSString stringWithFormat:@"(?<!struct\\s)\\b%@\\s*\\(([^()]*)\\)", [NSRegularExpression escapedPatternForString:sname]];
-            NSRegularExpression *callRx = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
-            [callRx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length)
-                              withTemplate:[NSString stringWithFormat:@"%@{$1}", sname]];
-        }
-    }
-
-    // 8. Rewrite GLSL `not(...)` boolean vector built-in (C++ keyword collision)
-    {
-        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:@"\\bnot\\s*\\(" options:0 error:nil];
-        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:@"am_bnot("];
-    }
-
-    // 9. Rewrite extra GLSL multi-component `.stpq` swizzles missed by iOS's `.st/.s/.t` regex
-    NSDictionary<NSString *, NSString *> *swizzles = @{
-        @"\\.stpq(?![A-Za-z0-9_])": @".xyzw",
-        @"\\.stp(?![A-Za-z0-9_])":  @".xyz",
-        @"\\.ts(?![A-Za-z0-9_])":   @".yx",
-        @"\\.ss(?![A-Za-z0-9_])":   @".xx",
-        @"\\.tt(?![A-Za-z0-9_])":   @".yy",
-        @"\\.pq(?![A-Za-z0-9_])":   @".zw",
-    };
-    for (NSString *pat in swizzles) {
-        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
-        [rx replaceMatchesInString:s options:0 range:NSMakeRange(0, s.length) withTemplate:swizzles[pat]];
-    }
-
-    return s;
-}
-
-static NSString *AMTranspileGLSLWrapperToMSL(NSString *source) {
-    if (!source || ![source containsString:@"AC_ShaderWrapper"]) return nil;
-    NSMutableString *out = [source mutableCopy];
-
-    // A. Inject global GLSL compatibility preamble right before `struct AC_ShaderWrapper`
-    NSRange wrapperRange = [out rangeOfString:@"struct AC_ShaderWrapper"];
-    if (wrapperRange.location == NSNotFound) return nil;
-    [out insertString:AMGLSLGlobalCompatPreamble() atIndex:wrapperRange.location];
-
-    // B. Inject extra texture2D / texture2DCv / texture overloads inside AC_ShaderWrapper
-    NSRange getTexRange = [out rangeOfString:@"vec2 getTexSize("];
-    if (getTexRange.location != NSNotFound) {
-        [out insertString:AMGLSLWrapperExtraMethods() atIndex:getTexRange.location];
-    }
-
-    // C. Inject extra Android uniform & precision #defines right after `#define acPass`
-    NSRange acPassRange = [out rangeOfString:@"#define acPass"];
-    if (acPassRange.location != NSNotFound) {
-        NSRange nl = [out rangeOfString:@"\n" options:0 range:NSMakeRange(acPassRange.location, out.length - acPassRange.location)];
-        if (nl.location != NSNotFound) {
-            NSString *extraDefines =
-                @"#define acProjectSize (acScreenSize)\n"
-                @"#define acLayerSizeNorm (acLayerSize / max(acScreenSize, vec2(1.0)))\n"
-                @"#define acLTS (acLayerToScreen)\n"
-                @"#define highp\n"
-                @"#define mediump\n"
-                @"#define lowp\n";
-            [out insertString:extraDefines atIndex:nl.location + 1];
-        }
-    }
-
-    // D. Sanitize user GLSL body between `#define discard` line and `#undef acScreenToLayer`
-    NSRange discardDef = [out rangeOfString:@"#define discard"];
-    NSRange undefStart = [out rangeOfString:@"#undef acScreenToLayer"];
-    if (discardDef.location != NSNotFound && undefStart.location != NSNotFound && undefStart.location > discardDef.location) {
-        NSRange nl = [out rangeOfString:@"\n" options:0 range:NSMakeRange(discardDef.location, undefStart.location - discardDef.location)];
-        if (nl.location != NSNotFound && nl.location + 1 < undefStart.location) {
-            NSRange bodyRange = NSMakeRange(nl.location + 1, undefStart.location - (nl.location + 1));
-            NSString *rawBody = [out substringWithRange:bodyRange];
-            NSString *fixedBody = AMSanitizeUserGLSLBody(rawBody);
-            [out replaceCharactersInRange:bodyRange withString:fixedBody];
-        }
-    }
-
-    // E. Undefine our extra macros right after `#undef discard`
-    NSRange undefDiscard = [out rangeOfString:@"#undef discard"];
-    if (undefDiscard.location != NSNotFound) {
-        NSUInteger pos = NSMaxRange(undefDiscard);
-        [out insertString:@"\n#undef acProjectSize\n#undef acLayerSizeNorm\n#undef acLTS\n#undef highp\n#undef mediump\n#undef lowp\n" atIndex:pos];
-    }
-
-    return out;
-}
-
-static NSString *AMBuildSafePassthroughMSL(NSString *source) {
-    if (!source || ![source containsString:@"AC_ShaderWrapper"]) return nil;
-    NSRange discardDef = [source rangeOfString:@"#define discard"];
-    NSRange undefStart = [source rangeOfString:@"#undef acScreenToLayer"];
-    if (discardDef.location == NSNotFound || undefStart.location == NSNotFound || undefStart.location <= discardDef.location) {
-        return nil;
-    }
-    NSRange nl = [source rangeOfString:@"\n" options:0 range:NSMakeRange(discardDef.location, undefStart.location - discardDef.location)];
-    if (nl.location == NSNotFound || nl.location + 1 >= undefStart.location) return nil;
-
-    NSRange bodyRange = NSMakeRange(nl.location + 1, undefStart.location - (nl.location + 1));
-    BOOL hasInputImg = ([source rangeOfString:@"AC_ImageInfo inputImg"].location != NSNotFound);
-    NSString *safeBody = hasInputImg
-        ? @"\n    void main() { gl_FragColor = texture2DCv(ac__img.inputImg.texture, acScreenNorm); }\n"
-        : @"\n    void main() { gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0); }\n";
-    NSMutableString *out = [source mutableCopy];
-    [out replaceCharactersInRange:bodyRange withString:safeBody];
-    return out;
-}
-// AM_METAL_COMPAT_END
-
-static void AMLogShaderCompileFailure(NSError *err, NSString *mslSource) {
-    @try {
-        NSString *logPath = [AMCustomEffectsDir() stringByAppendingPathComponent:@"last_shader_error.txt"];
-        NSString *msg = [NSString stringWithFormat:@"=== Metal Compile Error ===\n%@\n\n=== Transpiled MSL ===\n%@\n",
-                         err.localizedDescription ?: @"(no error)", mslSource ?: @""];
-        [msg writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    } @catch (NSException *ignored) {}
-}
-
-// IMPORTANT: -newLibraryWithSource:options:error: begins with "new" so Objective-C/Swift callers
-// expect a +1 retained object (NS_RETURNS_RETAINED). Using raw void* avoids ARC autoreleasing it
-// and causing a double-free EXC_BAD_ACCESS when Swift releases its +1 reference.
-static void *AMHook_newLibraryWithSource(id self, SEL _cmd, NSString *source, MTLCompileOptions *options, NSError * __autoreleasing *error) {
-    if (!gOrigNewLibraryWithSource) return NULL;
-
-    NSError *firstErr = nil;
-    void *rawLib = gOrigNewLibraryWithSource(self, _cmd, source, options, &firstErr);
-    if (rawLib != NULL) {
-        if (error) *error = firstErr;
-        return rawLib;
-    }
-
-    if (source && [source containsString:@"AC_ShaderWrapper"]) {
-        NSString *transpiled = AMTranspileGLSLWrapperToMSL(source);
-        if (transpiled && ![transpiled isEqualToString:source]) {
-            NSError *retryErr = nil;
-            void *retryLib = gOrigNewLibraryWithSource(self, _cmd, transpiled, options, &retryErr);
-            if (retryLib != NULL) {
-                if (error) *error = nil;
-                return retryLib;
-            }
-            AMLogShaderCompileFailure(retryErr ?: firstErr, transpiled);
-        }
-
-        // Guaranteed crash-proof passthrough fallback so AlightEffectShader.init never fails with nil
-        NSString *fallback = AMBuildSafePassthroughMSL(source);
-        if (fallback) {
-            NSError *fbErr = nil;
-            void *fbLib = gOrigNewLibraryWithSource(self, _cmd, fallback, options, &fbErr);
-            if (fbLib != NULL) {
-                if (error) *error = nil;
-                return fbLib;
-            }
-        }
-    }
-
-    if (error) *error = firstErr;
-    return NULL;
-}
-
-static void AMInstallMetalShaderCompatHook(void) {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-        if (!dev) return;
-        Class devCls = object_getClass(dev);
-        if (!devCls) return;
-        SEL sel = @selector(newLibraryWithSource:options:error:);
-        Method m = class_getInstanceMethod(devCls, sel);
-        if (!m) return;
-        gOrigNewLibraryWithSource = (AMNewLibOrigFn)method_setImplementation(m, (IMP)AMHook_newLibraryWithSource);
-    });
 }
 
 static NSMutableDictionary<NSString *, NSString *> *AMLoadCustomThumbMap(void) {
@@ -1503,35 +979,6 @@ static uint8_t AMCustomCategoryFilter(void *effectPtr) {
     return (uint8_t)((isExp ^ 1) & 1);
 }
 
-static uint8_t AMGoldMotionCategoryFilter(void *effectPtr) {
-    if (!effectPtr) return 0;
-    intptr_t slide = AMMainBinarySlide();
-    typedef void *(*AMMetaFn)(uintptr_t);
-    typedef uint8_t (*AMStrEqFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint8_t);
-
-    AMMetaFn getEffectMeta = (AMMetaFn)(0x10045b298ULL + slide);
-    uint8_t *meta = (uint8_t *)getEffectMeta(0);
-    if (!meta) return 0;
-
-    int32_t catOff = *(int32_t *)(meta + 0x48);
-    int32_t expOff = *(int32_t *)(meta + 0x44);
-    uint64_t strLo = *(uint64_t *)((uint8_t *)effectPtr + catOff);
-    uint64_t strHi = *(uint64_t *)((uint8_t *)effectPtr + catOff + 8);
-
-    // Swift 5 small inline ASCII string "goldmotion" (10 bytes)
-    const uint64_t kGMLo = 0x69746f6d646c6f67ULL;
-    const uint64_t kGMHi = 0xea00000000006e6fULL;
-
-    BOOL matched = (strLo == kGMLo && strHi == kGMHi);
-    if (!matched) {
-        AMStrEqFn strEq = (AMStrEqFn)(0x1025b7bb8ULL + slide);
-        matched = (strEq(strLo, strHi, kGMLo, kGMHi, 0) & 1) != 0;
-    }
-    if (!matched) return 0;
-    uint8_t isExp = *((uint8_t *)effectPtr + expOff);
-    return (uint8_t)((isExp ^ 1) & 1);
-}
-
 static void AMMigrateCustomEffectXMLCategories(void) {
     NSString *dir = AMCustomEffectsDir();
     NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
@@ -1581,7 +1028,7 @@ static void AMInstallCustomEffectCategoryIfNeeded(void) {
         }
 
         int64_t origCount = origHdr->count;
-        int64_t newCount = origCount + 2;
+        int64_t newCount = origCount + 1;
         size_t newBytes = sizeof(AMSwiftArrayHeader) + (size_t)newCount * sizeof(AMEffectCategoryEntry);
 
         AMSwiftArrayHeader *newHdr = (AMSwiftArrayHeader *)swiftAllocObject(origHdr->isa, newBytes, 7);
@@ -1612,16 +1059,6 @@ static void AMInstallCustomEffectCategoryIfNeeded(void) {
                 customEntry.filterFn = (void *)&AMCustomCategoryFilter;
                 customEntry.filterCtx = NULL;
                 newItems[dst++] = customEntry;
-
-                AMEffectCategoryEntry gmEntry;
-                gmEntry.catId = 0x72; // 114: unique, non-zero (excluded by Other), != 500 (always visible)
-                gmEntry.nameLo = 0x746f4d20646c6f47ULL; // Swift small ASCII String "Gold Motion" (11 bytes)
-                gmEntry.nameHi = 0xeb000000006e6f69ULL;
-                gmEntry.thumbLo = 0;
-                gmEntry.thumbHi = 0;
-                gmEntry.filterFn = (void *)&AMGoldMotionCategoryFilter;
-                gmEntry.filterCtx = NULL;
-                newItems[dst++] = gmEntry;
             }
             AMEffectCategoryEntry e = origItems[i];
             if (e.nameHi) swiftBridgeRetain((void *)e.nameHi);
@@ -1639,16 +1076,6 @@ static void AMInstallCustomEffectCategoryIfNeeded(void) {
             customEntry.filterFn = (void *)&AMCustomCategoryFilter;
             customEntry.filterCtx = NULL;
             newItems[dst++] = customEntry;
-
-            AMEffectCategoryEntry gmEntry;
-            gmEntry.catId = 0x72;
-            gmEntry.nameLo = 0x746f4d20646c6f47ULL;
-            gmEntry.nameHi = 0xeb000000006e6f69ULL;
-            gmEntry.thumbLo = 0;
-            gmEntry.thumbHi = 0;
-            gmEntry.filterFn = (void *)&AMGoldMotionCategoryFilter;
-            gmEntry.filterCtx = NULL;
-            newItems[dst++] = gmEntry;
         }
 
         // Publish new array globally (intentionally keep origHdr retained for safety)
@@ -1673,26 +1100,18 @@ static void AMHook_effectMainWillDisplayCell(id self, SEL _cmd, UICollectionView
     }
     if (!titleLbl) titleLbl = AMFindFirstLabelInView(cell.contentView);
     BOOL isCustom = (titleLbl.text && [titleLbl.text caseInsensitiveCompare:@"Custom"] == NSOrderedSame);
-    BOOL isGoldMotion = (titleLbl.text && [titleLbl.text caseInsensitiveCompare:@"Gold Motion"] == NSOrderedSame);
     CAGradientLayer *grad = objc_getAssociatedObject(cell, kAMCustomCatGradKey);
-    if (isCustom || isGoldMotion) {
+    if (isCustom) {
         if (!grad) {
             grad = [CAGradientLayer layer];
-            grad.startPoint = CGPointMake(0.0, 0.0);
-            grad.endPoint = CGPointMake(1.0, 1.0);
-            [cell.contentView.layer insertSublayer:grad atIndex:0];
-            objc_setAssociatedObject(cell, kAMCustomCatGradKey, grad, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-        if (isGoldMotion) {
-            grad.colors = @[
-                (id)[UIColor colorWithRed:0.26 green:0.18 blue:0.04 alpha:1.0].CGColor,
-                (id)[UIColor colorWithRed:0.46 green:0.32 blue:0.06 alpha:1.0].CGColor,
-            ];
-        } else {
             grad.colors = @[
                 (id)[UIColor colorWithRed:0.15 green:0.20 blue:0.35 alpha:1.0].CGColor,
                 (id)[UIColor colorWithRed:0.12 green:0.30 blue:0.28 alpha:1.0].CGColor,
             ];
+            grad.startPoint = CGPointMake(0.0, 0.0);
+            grad.endPoint = CGPointMake(1.0, 1.0);
+            [cell.contentView.layer insertSublayer:grad atIndex:0];
+            objc_setAssociatedObject(cell, kAMCustomCatGradKey, grad, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         grad.hidden = NO;
         grad.frame = cell.contentView.bounds;
@@ -1703,138 +1122,6 @@ static void AMHook_effectMainWillDisplayCell(id self, SEL _cmd, UICollectionView
 
 static IMP gOrigURLsForResources = NULL;
 
-@interface AMEffectXMLSafetyValidator : NSObject <NSXMLParserDelegate>
-@property (nonatomic, assign) BOOL valid;
-@property (nonatomic, assign) BOOL sawEffectRoot;
-@property (nonatomic, assign) BOOL sawShader;
-@end
-
-@implementation AMEffectXMLSafetyValidator
-
-+ (NSDictionary<NSString *, NSSet<NSString *> *> *)allowedSchema {
-    static NSDictionary<NSString *, NSSet<NSString *> *> *schema = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        schema = @{
-            @"effect":     [NSSet setWithArray:@[@"affinity", @"afxver", @"auto-transform", @"category", @"compat", @"deprecated", @"desc", @"experimental", @"id", @"internal", @"max-overdraw", @"maxOverdraw", @"name", @"overdraw", @"tags", @"thumb", @"type"]],
-            @"params":     [NSSet set],
-            @"spinner":    [NSSet setWithArray:@[@"id", @"default", @"min", @"max", @"label", @"step", @"ticks", @"type", @"snap", @"enabled", @"multiplier", @"logscale", @"originValue", @"valueOrigin"]],
-            @"slider":     [NSSet setWithArray:@[@"id", @"default", @"min", @"max", @"label", @"step", @"ticks", @"type", @"snap", @"logscale", @"enabled", @"originValue"]],
-            @"switch":     [NSSet setWithArray:@[@"id", @"default", @"label", @"enableTargets", @"enabled"]],
-            @"color":      [NSSet setWithArray:@[@"id", @"default", @"label", @"alpha", @"enabled"]],
-            @"point":      [NSSet setWithArray:@[@"id", @"label", @"default", @"min", @"max", @"step", @"enabled"]],
-            @"selector":   [NSSet setWithArray:@[@"id", @"style", @"default", @"label", @"enabled"]],
-            @"choice":     [NSSet setWithArray:@[@"label", @"value", @"enableTargets"]],
-            @"section":    [NSSet setWithArray:@[@"text", @"hintType", @"label", @"enabled"]],
-            @"texture":    [NSSet setWithArray:@[@"id", @"srcType", @"downsample", @"src", @"label", @"enabled"]],
-            @"shader":     [NSSet setWithArray:@[@"type", @"precision", @"group", @"fastMath"]],
-            @"passes":     [NSSet set],
-            @"pass":       [NSSet setWithArray:@[@"target", @"blend", @"effect", @"src"]],
-            @"iterations": [NSSet setWithArray:@[@"param", @"count"]],
-            @"strings":    [NSSet set],
-            @"locale":     [NSSet setWithArray:@[@"lang"]],
-            @"string":     [NSSet setWithArray:@[@"name"]],
-            @"tip":        [NSSet setWithArray:@[@"text"]],
-            @"xyz":        [NSSet setWithArray:@[@"id", @"label", @"type", @"applyto", @"default", @"step", @"ticks", @"enabled"]],
-            @"orient":     [NSSet setWithArray:@[@"id", @"label", @"invert", @"default", @"enabled"]],
-            @"hue-disc":   [NSSet setWithArray:@[@"id", @"label", @"bias", @"default", @"enabled"]],
-            @"hue-ring":   [NSSet setWithArray:@[@"id", @"label", @"default", @"enabled"]],
-            @"presets":    [NSSet set],
-            @"preset":     [NSSet setWithArray:@[@"id", @"label", @"timescale", @"timing", @"short-code", @"group"]],
-            @"property":   [NSSet setWithArray:@[@"name", @"type", @"value"]],
-            @"kf":         [NSSet setWithArray:@[@"t", @"v"]],
-            @"float":      [NSSet setWithArray:@[@"id", @"value"]],
-            @"script":     [NSSet setWithArray:@[@"external"]],
-        };
-    });
-    return schema;
-}
-
-- (instancetype)init {
-    if ((self = [super init])) {
-        _valid = YES;
-    }
-    return self;
-}
-
-- (void)parser:(NSXMLParser *)parser didStartElement:(NSString *)elementName
-  namespaceURI:(NSString *)namespaceURI qualifiedName:(NSString *)qName
-    attributes:(NSDictionary<NSString *, NSString *> *)attributeDict {
-    (void)namespaceURI; (void)qName;
-    NSDictionary<NSString *, NSSet<NSString *> *> *schema = [AMEffectXMLSafetyValidator allowedSchema];
-    NSSet<NSString *> *allowedAttrs = schema[elementName];
-    if (!allowedAttrs) {
-        self.valid = NO;
-        [parser abortParsing];
-        return;
-    }
-    for (NSString *attr in attributeDict) {
-        if (![allowedAttrs containsObject:attr]) {
-            self.valid = NO;
-            [parser abortParsing];
-            return;
-        }
-    }
-    if ([elementName isEqualToString:@"effect"]) {
-        self.sawEffectRoot = YES;
-        if (attributeDict[@"id"].length == 0 || attributeDict[@"name"].length == 0) {
-            self.valid = NO;
-            [parser abortParsing];
-            return;
-        }
-        NSString *effType = [attributeDict[@"type"] uppercaseString];
-        if (effType && ![effType isEqualToString:@"SHADER"] && ![effType isEqualToString:@"TEXT"] && ![effType isEqualToString:@"DRAWING"]) {
-            self.valid = NO;
-            [parser abortParsing];
-            return;
-        }
-    } else if ([elementName isEqualToString:@"shader"]) {
-        self.sawShader = YES;
-        NSString *st = attributeDict[@"type"];
-        if (![st isEqualToString:@"fragment"] && ![st isEqualToString:@"vertex"]) {
-            self.valid = NO;
-            [parser abortParsing];
-            return;
-        }
-        NSString *pr = attributeDict[@"precision"];
-        if (pr && ![pr isEqualToString:@"low"] && ![pr isEqualToString:@"medium"] && ![pr isEqualToString:@"high"]) {
-            self.valid = NO;
-            [parser abortParsing];
-            return;
-        }
-    }
-}
-
-@end
-
-static BOOL AMIsEffectXMLSafeForIOSParser(NSString *path, NSMutableSet<NSString *> *seenIds) {
-    NSData *data = [NSData dataWithContentsOfFile:path];
-    if (!data || data.length == 0) return NO;
-    NSXMLParser *parser = [[NSXMLParser alloc] initWithData:data];
-    AMEffectXMLSafetyValidator *val = [[AMEffectXMLSafetyValidator alloc] init];
-    parser.delegate = val;
-    BOOL ok = [parser parse];
-    if (!ok || !val.valid || !val.sawEffectRoot || !val.sawShader) return NO;
-
-    // Prevent duplicate effect IDs across external XMLs
-    NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    if (str) {
-        static NSRegularExpression *idRx = nil;
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-            idRx = [NSRegularExpression regularExpressionWithPattern:@"<effect\\b[^>]*\\bid\\s*=\\s*\"([^\"]+)\""
-                                                             options:0 error:nil];
-        });
-        NSTextCheckingResult *m = [idRx firstMatchInString:str options:0 range:NSMakeRange(0, MIN((NSUInteger)1024, str.length))];
-        if (m && m.numberOfRanges > 1) {
-            NSString *eid = [str substringWithRange:[m rangeAtIndex:1]];
-            if ([seenIds containsObject:eid]) return NO;
-            [seenIds addObject:eid];
-        }
-    }
-    return YES;
-}
-
 static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd, NSString *ext, NSString *subpath) {
     NSArray<NSURL *> *orig = nil;
     if (gOrigURLsForResources) {
@@ -1844,30 +1131,17 @@ static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd,
         ext && [ext caseInsensitiveCompare:@"xml"] == NSOrderedSame &&
         subpath && [subpath isEqualToString:@"BuiltinEffects"]) {
         AMInstallCustomEffectCategoryIfNeeded();
-        NSMutableArray<NSURL *> *merged = orig ? [orig mutableCopy] : [NSMutableArray array];
-        NSMutableSet<NSString *> *seenIds = [NSMutableSet set];
-
         NSString *dir = AMCustomEffectsDir();
         NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
-        for (NSString *fn in files) {
-            if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
-                NSString *full = [dir stringByAppendingPathComponent:fn];
-                if (AMIsEffectXMLSafeForIOSParser(full, seenIds)) {
-                    [merged addObject:[NSURL fileURLWithPath:full]];
+        if (files.count > 0) {
+            NSMutableArray<NSURL *> *merged = orig ? [orig mutableCopy] : [NSMutableArray array];
+            for (NSString *fn in files) {
+                if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
+                    [merged addObject:[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:fn]]];
                 }
             }
+            return merged;
         }
-        NSString *gmDir = [[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"GoldMotionEffects"];
-        NSArray<NSString *> *gmFiles = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:gmDir error:nil];
-        for (NSString *fn in gmFiles) {
-            if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
-                NSString *full = [gmDir stringByAppendingPathComponent:fn];
-                if (AMIsEffectXMLSafeForIOSParser(full, seenIds)) {
-                    [merged addObject:[NSURL fileURLWithPath:full]];
-                }
-            }
-        }
-        return merged;
     }
     return orig;
 }
@@ -2229,7 +1503,7 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
     }
     self.xmlTextView.text =
         @"<?xml version='1.0' encoding='UTF-8' ?>\n"
-        @"<effect id=\"com.alightcreative.effects.custom_invert\" compat=\"acScreenNorm-y\" name=\"Custom Invert\" desc=\"Inverts layer colors\" category=\"custom\" tags=\"custom\" thumb=\"thumb/box.webp\">\n"
+        @"<effect id=\"com.alightcreative.effects.custom_invert\" compat=\"acScreenNorm-y\" name=\"Custom Invert\" desc=\"Inverts layer colors\" category=\"custom\" tags=\"custom\" thumb=\"thumb/copy-bg.webp\">\n"
         @"    <params>\n"
         @"        <texture id=\"inputImg\" srcType=\"content\" />\n"
         @"        <spinner id=\"strength\" default=\"1.0\" min=\"0.0\" max=\"1.0\" step=\"0.01\" label=\"Strength\" type=\"percent\" />\n"
@@ -2510,8 +1784,11 @@ static UIViewController *AMFindMainVCInHierarchy(UIViewController *vc, NSInteger
 
 static BOOL AMVCTreeContainsEditor(UIViewController *vc, NSInteger depth) {
     if (!vc || depth > 10) return NO;
+    if (vc.presentedViewController != nil) return YES;
     NSString *clsName = NSStringFromClass([vc class]) ?: @"";
     if ([clsName containsString:@"ProjectEdit"] ||
+        [clsName containsString:@"CreateProject"] ||
+        [clsName containsString:@"NewProject"] ||
         [clsName containsString:@"PreviewControlBar"] ||
         [clsName containsString:@"EffectPicker"] ||
         [clsName containsString:@"SettingsVC"] ||
@@ -2542,7 +1819,33 @@ static BOOL AMIsOnHomepage(UIWindow *win) {
     }
     UIViewController *mainVC = AMFindMainVCInHierarchy(root, 0);
     if (!mainVC || !mainVC.isViewLoaded || mainVC.view.window != win) return NO;
+    if (mainVC.presentedViewController != nil) return NO;
     if (AMVCTreeContainsEditor(root, 0)) return NO;
+
+    // Hide overlays when any modal sheet, alert, or popup covers the homepage in win.
+    UIView *hostView = mainVC.view;
+    while (hostView && hostView.superview != win) {
+        hostView = hostView.superview;
+    }
+    if (hostView) {
+        NSArray<UIView *> *subs = win.subviews;
+        NSUInteger hostIdx = [subs indexOfObject:hostView];
+        if (hostIdx != NSNotFound) {
+            for (NSUInteger i = hostIdx + 1; i < subs.count; i++) {
+                UIView *sib = subs[i];
+                if (sib.hidden || sib.alpha < 0.02) continue;
+                NSString *cls = NSStringFromClass([sib class]) ?: @"";
+                if ([cls hasPrefix:@"AMHomepage"]) continue;
+                if ([sib isKindOfClass:[UIButton class]] &&
+                    ([sib.accessibilityLabel isEqualToString:@"Search Projects"] ||
+                     [sib.accessibilityLabel isEqualToString:@"Create Folder"] ||
+                     [sib.accessibilityLabel isEqualToString:@"Assign Folder"])) {
+                    continue;
+                }
+                return NO;
+            }
+        }
+    }
     return YES;
 }
 
@@ -3540,6 +2843,7 @@ typedef struct {
     BOOL hasYourProjects;
     CGRect yourProjectsFrame;
     BOOL isSelectionMode;
+    BOOL isModalSheetOpen;
     NSInteger nativeSelectedCount;
     CGRect bottomBarFrame;
 } AMHomepageProbeInfo;
@@ -3654,6 +2958,12 @@ static AMHomepageProbeInfo AMProbeHomepageAndTrackSelection(UIWindow *win,
     AMWalkAccessibilityElements(win, 0, visited, ^(id elem, NSString *label, CGRect screenFrame) {
         CGRect winRect = [win convertRect:screenFrame fromWindow:nil];
         NSString *lower = label.lowercaseString;
+
+        if ([lower isEqualToString:@"create from scratch"] ||
+            [lower isEqualToString:@"composition size"] ||
+            [lower isEqualToString:@"frame rate"]) {
+            info.isModalSheetOpen = YES;
+        }
 
         if ([lower isEqualToString:@"your projects"]) {
             info.hasYourProjects = YES;
@@ -5268,7 +4578,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     if (!self.searchButton) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
         btn.accessibilityLabel = @"Search Projects";
-        btn.backgroundColor = [UIColor colorWithRed:0.933 green:0.941 blue:0.969 alpha:1.0]; // #EEF0F7
+        btn.backgroundColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08]; // subtle gray matching header
         btn.tintColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0]; // #1D1E2C
         btn.layer.cornerRadius = 17.0;
         btn.layer.borderWidth = 0.5;
@@ -5356,6 +4666,14 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     AMHomepageProbeInfo probe = AMProbeHomepageAndTrackSelection(win,
                                                                  self.cachedProjectTitles ?: [NSSet set],
                                                                  self.trackedSelectedTitles);
+
+    if (probe.isModalSheetOpen) {
+        self.searchButton.hidden = YES;
+        self.foldersButton.hidden = YES;
+        self.assignFolderButton.hidden = YES;
+        self.inlineFoldersView.hidden = YES;
+        return;
+    }
 
     if (probe.isSelectionMode) {
         self.searchButton.hidden = YES;
@@ -6074,7 +5392,6 @@ static void AlightMotionModsInit(void) {
 
     dispatch_async(dispatch_get_main_queue(), ^{
         AMInstallCustomEffectCategoryIfNeeded();
-        AMInstallMetalShaderCompatHook();
     });
 
     [[AMHomepageSearchOverlayManager shared] start];
