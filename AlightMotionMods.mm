@@ -26,6 +26,7 @@
 #import <stdlib.h>
 #import <dlfcn.h>
 #import <sys/xattr.h>
+#import <mach-o/dyld.h>
 
 static NSString *const kAMPreviewQualityKey = @"AMModPreviewQualityDivisor";
 static NSInteger gPreviewDivisor = 1; // 1=Full, 2=Half, 3=Third, 4=Quarter
@@ -1922,6 +1923,144 @@ typedef NS_ENUM(NSInteger, AMProjectSortMode) {
     AMProjectSortNameDesc   = 3
 };
 
+// ============================================================================
+// Native Local Project Opener (AlightMotion 6.2.60 build 869 ARM64)
+// Calls verified Swift entry points:
+//   - 0x1025b55cc: String._unconditionallyBridgeFromObjectiveC(NSString?)
+//   - 0x100245cd0: Load SceneInfo by project filename stem (<UUID>.xml -> <UUID>)
+//   - 0x100514ea0: MainVC.openProjectEdit(sceneInfo:onDismiss:)
+// ============================================================================
+
+static intptr_t AMMainBinarySlide(void) {
+    uint32_t cnt = _dyld_image_count();
+    for (uint32_t i = 0; i < cnt; ++i) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && strstr(nm, "/AlightMotion.app/AlightMotion") != NULL) {
+            return _dyld_get_image_vmaddr_slide(i);
+        }
+    }
+    return _dyld_get_image_vmaddr_slide(0);
+}
+
+static UIViewController *AMFindMainVCInHierarchy(UIViewController *vc, NSInteger depth) {
+    if (!vc || depth > 10) return nil;
+    Class mainCls = NSClassFromString(@"_TtC12AlightMotion6MainVC");
+    if (mainCls && [vc isKindOfClass:mainCls]) return vc;
+    if ([vc isKindOfClass:[UINavigationController class]]) {
+        for (UIViewController *c in ((UINavigationController *)vc).viewControllers) {
+            UIViewController *hit = AMFindMainVCInHierarchy(c, depth + 1);
+            if (hit) return hit;
+        }
+    }
+    if ([vc isKindOfClass:[UITabBarController class]]) {
+        for (UIViewController *c in ((UITabBarController *)vc).viewControllers) {
+            UIViewController *hit = AMFindMainVCInHierarchy(c, depth + 1);
+            if (hit) return hit;
+        }
+    }
+    for (UIViewController *c in vc.childViewControllers) {
+        UIViewController *hit = AMFindMainVCInHierarchy(c, depth + 1);
+        if (hit) return hit;
+    }
+    if (vc.presentedViewController) {
+        UIViewController *hit = AMFindMainVCInHierarchy(vc.presentedViewController, depth + 1);
+        if (hit) return hit;
+    }
+    return nil;
+}
+
+static BOOL AMOpenLocalProjectInMainVC(NSString *projectPath) {
+    if (projectPath.length == 0) return NO;
+#if defined(__arm64__)
+    UIWindow *win = AMKeyWindow();
+    UIViewController *mainVC = AMFindMainVCInHierarchy(win.rootViewController, 0);
+    if (!mainVC) return NO;
+
+    NSString *stem = [[projectPath lastPathComponent] stringByDeletingPathExtension];
+    if (stem.length == 0) return NO;
+
+    intptr_t slide = AMMainBinarySlide();
+    uintptr_t fnBridgeString  = (uintptr_t)(0x1025b55ccULL + slide);
+    uintptr_t fnLoadSceneInfo = (uintptr_t)(0x100245cd0ULL + slide);
+    uintptr_t fnBridgeRelease = (uintptr_t)(0x1025bb404ULL + slide);
+    uintptr_t fnErrorRelease  = (uintptr_t)(0x1025bb56cULL + slide);
+    uintptr_t fnOpenProject   = (uintptr_t)(0x100514ea0ULL + slide);
+    uintptr_t fnSceneInfoMeta = (uintptr_t)(0x1003c5d54ULL + slide);
+
+    // Query SceneInfo metadata and allocate properly sized/aligned buffer
+    void *meta = ((void *(*)(uintptr_t))fnSceneInfoMeta)(0);
+    if (!meta) return NO;
+    void *vwt = *(void **)((uintptr_t)meta - 8);
+    size_t sz = *(size_t *)((uintptr_t)vwt + 0x40);
+    if (sz == 0 || sz > 4096) sz = 1024;
+    uint8_t *sceneInfoBuf = (uint8_t *)calloc(1, sz + 64);
+    if (!sceneInfoBuf) return NO;
+
+    // 1. Bridge NSString stem -> Swift String (a, b)
+    typedef struct { uint64_t a; uint64_t b; } AMSwiftStr;
+    AMSwiftStr s = ((AMSwiftStr (*)(void *))fnBridgeString)((__bridge void *)stem);
+
+    // 2. Call 0x100245cd0(x0=s.a, x1=s.b, w2=1, x8=sceneInfoBuf, x21=0) -> x21=err
+    struct { uint64_t s0, s1, buf, fn, err; } loadArgs = { s.a, s.b, (uint64_t)sceneInfoBuf, fnLoadSceneInfo, 0 };
+    asm volatile(
+        "stp x19, x20, [sp, #-32]!\n"
+        "str x21, [sp, #16]\n"
+        "mov x19, %[args]\n"
+        "ldp x0, x1, [x19, #0]\n"
+        "mov w2, #1\n"
+        "ldp x8, x9, [x19, #16]\n"
+        "mov x21, #0\n"
+        "blr x9\n"
+        "str x21, [x19, #32]\n"
+        "ldr x21, [sp, #16]\n"
+        "ldp x19, x20, [sp], #32\n"
+        :
+        : [args] "r"(&loadArgs)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x30",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+          "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "cc", "memory"
+    );
+
+    // Release bridged Swift String object
+    ((void (*)(uint64_t))fnBridgeRelease)(s.b);
+
+    if (loadArgs.err != 0) {
+        ((void (*)(uint64_t))fnErrorRelease)(loadArgs.err);
+        free(sceneInfoBuf);
+        return NO;
+    }
+
+    // 3. Call MainVC.openProjectEdit(x0=sceneInfoBuf, x1=0, x2=0, x20=mainVC)
+    struct { uint64_t info, selfObj, fn; } openArgs = {
+        (uint64_t)sceneInfoBuf, (uint64_t)(__bridge void *)mainVC, fnOpenProject
+    };
+    asm volatile(
+        "stp x19, x20, [sp, #-16]!\n"
+        "mov x19, %[args]\n"
+        "ldp x0, x20, [x19, #0]\n"
+        "ldr x9, [x19, #16]\n"
+        "mov x1, #0\n"
+        "mov x2, #0\n"
+        "blr x9\n"
+        "ldp x19, x20, [sp], #16\n"
+        :
+        : [args] "r"(&openArgs)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x30",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+          "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "cc", "memory"
+    );
+
+    // Destroy temporary SceneInfo value via its Value Witness Table
+    typedef void (*AMDestroyFn)(void *, void *);
+    AMDestroyFn destroyFn = *(AMDestroyFn *)((uintptr_t)vwt + 8);
+    if (destroyFn) destroyFn(sceneInfoBuf, meta);
+    free(sceneInfoBuf);
+    return YES;
+#else
+    return NO;
+#endif
+}
+
 @interface AMProjectSearchVC : UIViewController <UITableViewDataSource, UITableViewDelegate, UITextFieldDelegate>
 @property (nonatomic, copy) NSArray<NSDictionary *> *allProjects;
 @property (nonatomic, strong) NSArray<NSDictionary *> *filteredProjects;
@@ -2291,7 +2430,9 @@ typedef NS_ENUM(NSInteger, AMProjectSortMode) {
     gAMSearchModalOpen = NO;
     [self dismissViewControllerAnimated:YES completion:^{
         if (path.length > 0) {
-            AMOpenLocalFileInApp([NSURL fileURLWithPath:path]);
+            if (!AMOpenLocalProjectInMainVC(path)) {
+                AMOpenLocalFileInApp([NSURL fileURLWithPath:path]);
+            }
         }
     }];
 }
