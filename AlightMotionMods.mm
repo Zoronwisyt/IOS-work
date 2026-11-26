@@ -40,6 +40,9 @@ static IMP gOrigEditSpeedVCViewDidLoad = NULL;
 static IMP gOrigEditSpeedVCViewWillAppear = NULL;
 static IMP gOrigEditSpeedVCViewDidLayout = NULL;
 static IMP gOrigEditSpeedPanelViewDidLoad = NULL;
+static IMP gOrigCompTrackInsertTimeRange = NULL;
+static IMP gOrigCompTrackScaleTimeRange = NULL;
+static IMP gOrigKeyframeViewDrawRect = NULL;
 
 // ============================================================================
 // Theme Helpers
@@ -2623,6 +2626,13 @@ static const NSInteger kAMStepPresetCount = sizeof(kAMStepPresets) / sizeof(kAMS
 static AMSpeedBezierCurve gCopiedSpeedCurve = {0.42, 0.00, 0.58, 1.00};
 static BOOL gHasCopiedSpeedCurve = NO;
 
+static AMSpeedBezierCurve gActiveSpeedCurve = {0.00, 0.00, 1.00, 1.00};
+static BOOL gActiveSpeedCurveEnabled = NO;
+static CGFloat gActiveSpeedBase = 1.0;
+static NSArray<NSDictionary *> *gActiveSpeedKeyframes = nil;
+static BOOL gInSpeedRampScale = NO;
+static const void *kAMCompTrackSrcInfoAssocKey = &kAMCompTrackSrcInfoAssocKey;
+
 static void *AMGetRawIvarPtr(id obj, const char *ivarName) {
     if (!obj || !ivarName) return NULL;
     Class cls = object_getClass(obj);
@@ -2830,6 +2840,262 @@ static CGFloat AMEvalCubicDerivative1D(CGFloat t, CGFloat p1, CGFloat p2) {
 }
 
 // Compute instantaneous speed multiplier (dy/dx) at normalized layer progress u in [0, 1]
+static CGFloat AMComputeSpeedMultiplierAtProgress(AMSpeedBezierCurve c, CGFloat u);
+
+static CGFloat AMEvalCubicBezierYForX(AMSpeedBezierCurve c, CGFloat u) {
+    if (u <= 0.0) return 0.0;
+    if (u >= 1.0) return 1.0;
+    CGFloat t = u;
+    for (int i = 0; i < 8; i++) {
+        CGFloat x = AMEvalCubic1D(t, c.x1, c.x2) - u;
+        CGFloat dx = AMEvalCubicDerivative1D(t, c.x1, c.x2);
+        if (fabs(dx) < 1e-5) break;
+        t -= x / dx;
+        if (t < 0.0) t = 0.0;
+        if (t > 1.0) t = 1.0;
+    }
+    return AMEvalCubic1D(t, c.y1, c.y2);
+}
+
+// Evaluate effective instantaneous speed at normalized clip progress u in [0, 1]
+static double AMEvaluateActiveSpeedAtNormU(double u, double clipDurationSec) {
+    if (u < 0.0) u = 0.0;
+    if (u > 1.0) u = 1.0;
+    NSArray<NSDictionary *> *kfs = gActiveSpeedKeyframes;
+    if (kfs.count >= 2) {
+        double tSec = u * MAX(0.01, clipDurationSec);
+        // Find segment [k, k+1]
+        NSDictionary *first = kfs.firstObject;
+        NSDictionary *last = kfs.lastObject;
+        if (tSec <= [first[@"t"] doubleValue]) return MAX(0.1, [first[@"speed"] doubleValue]);
+        if (tSec >= [last[@"t"] doubleValue]) return MAX(0.1, [last[@"speed"] doubleValue]);
+        for (NSUInteger i = 0; i + 1 < kfs.count; i++) {
+            double t0 = [kfs[i][@"t"] doubleValue];
+            double t1 = [kfs[i + 1][@"t"] doubleValue];
+            if (tSec >= t0 && tSec <= t1 && t1 > t0 + 1e-4) {
+                double localU = (tSec - t0) / (t1 - t0);
+                AMSpeedBezierCurve segCurve = {
+                    [kfs[i][@"x1"] doubleValue],
+                    [kfs[i][@"y1"] doubleValue],
+                    [kfs[i][@"x2"] doubleValue],
+                    [kfs[i][@"y2"] doubleValue],
+                };
+                double eased = AMEvalCubicBezierYForX(segCurve, localU);
+                double s0 = [kfs[i][@"speed"] doubleValue];
+                double s1 = [kfs[i + 1][@"speed"] doubleValue];
+                double spd = s0 + (s1 - s0) * eased;
+                if (spd < 0.1) spd = 0.1;
+                if (spd > 8.0) spd = 8.0;
+                return spd;
+            }
+        }
+    }
+    if (gActiveSpeedCurveEnabled) {
+        double mult = AMComputeSpeedMultiplierAtProgress(gActiveSpeedCurve, u);
+        double spd = gActiveSpeedBase * mult;
+        if (spd < 0.1) spd = 0.1;
+        if (spd > 8.0) spd = 8.0;
+        return spd;
+    }
+    return MAX(0.1, gActiveSpeedBase);
+}
+
+static BOOL AMIsCurveNonLinear(AMSpeedBezierCurve c) {
+    return (fabs(c.x1 - c.y1) > 0.02 || fabs(c.x2 - c.y2) > 0.02);
+}
+
+static BOOL AMHook_compTrackInsertTimeRange(id self, SEL _cmd, CMTimeRange timeRange, AVAssetTrack *track, CMTime startTime, NSError **outError) {
+    BOOL ok = gOrigCompTrackInsertTimeRange
+        ? ((BOOL (*)(id, SEL, CMTimeRange, AVAssetTrack *, CMTime, NSError **))gOrigCompTrackInsertTimeRange)(self, _cmd, timeRange, track, startTime, outError)
+        : NO;
+    if (ok && !gInSpeedRampScale && track) {
+        NSDictionary *info = @{
+            @"track": track,
+            @"srcStart": [NSValue valueWithCMTime:timeRange.start],
+            @"srcDur": [NSValue valueWithCMTime:timeRange.duration],
+            @"atTime": [NSValue valueWithCMTime:startTime],
+        };
+        objc_setAssociatedObject(self, kAMCompTrackSrcInfoAssocKey, info, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return ok;
+}
+
+static void AMHook_compTrackScaleTimeRange(id self, SEL _cmd, CMTimeRange timeRange, CMTime duration) {
+    BOOL hasRamp = (!gInSpeedRampScale) &&
+                   (gActiveSpeedKeyframes.count >= 2 || (gActiveSpeedCurveEnabled && AMIsCurveNonLinear(gActiveSpeedCurve)));
+    NSDictionary *info = hasRamp ? objc_getAssociatedObject(self, kAMCompTrackSrcInfoAssocKey) : nil;
+    AVAssetTrack *srcTrack = info[@"track"];
+    if (!hasRamp || !srcTrack || CMTIME_IS_INVALID(duration) || CMTimeGetSeconds(duration) <= 0.05) {
+        if (gOrigCompTrackScaleTimeRange) {
+            ((void (*)(id, SEL, CMTimeRange, CMTime))gOrigCompTrackScaleTimeRange)(self, _cmd, timeRange, duration);
+        }
+        return;
+    }
+
+    CMTime srcStart = [info[@"srcStart"] CMTimeValue];
+    CMTime srcDur = [info[@"srcDur"] CMTimeValue];
+    double srcDurSec = CMTimeGetSeconds(srcDur);
+    double targetTotalSec = CMTimeGetSeconds(duration);
+    if (!isfinite(srcDurSec) || srcDurSec <= 0.05 || !isfinite(targetTotalSec) || targetTotalSec <= 0.05) {
+        if (gOrigCompTrackScaleTimeRange) {
+            ((void (*)(id, SEL, CMTimeRange, CMTime))gOrigCompTrackScaleTimeRange)(self, _cmd, timeRange, duration);
+        }
+        return;
+    }
+
+    const int kSegments = 32;
+    double weights[kSegments];
+    double weightSum = 0.0;
+    for (int i = 0; i < kSegments; i++) {
+        double u = (i + 0.5) / (double)kSegments;
+        double spd = AMEvaluateActiveSpeedAtNormU(u, targetTotalSec);
+        weights[i] = 1.0 / MAX(0.1, spd);
+        weightSum += weights[i];
+    }
+    if (weightSum <= 0.0) {
+        if (gOrigCompTrackScaleTimeRange) {
+            ((void (*)(id, SEL, CMTimeRange, CMTime))gOrigCompTrackScaleTimeRange)(self, _cmd, timeRange, duration);
+        }
+        return;
+    }
+
+    gInSpeedRampScale = YES;
+    AVMutableCompositionTrack *compTrack = (AVMutableCompositionTrack *)self;
+    [compTrack removeTimeRange:timeRange];
+
+    CMTimeScale ts = (duration.timescale > 0) ? duration.timescale : 600;
+    CMTime cursor = timeRange.start;
+    double segSrcSec = srcDurSec / (double)kSegments;
+    double srcStartSec = CMTimeGetSeconds(srcStart);
+
+    for (int i = 0; i < kSegments; i++) {
+        double s0 = srcStartSec + i * segSrcSec;
+        double s1 = (i == kSegments - 1) ? (srcStartSec + srcDurSec) : (srcStartSec + (i + 1) * segSrcSec);
+        CMTime segStart = CMTimeMakeWithSeconds(s0, ts);
+        CMTime segDur = CMTimeMakeWithSeconds(MAX(0.002, s1 - s0), ts);
+        CMTimeRange srcRange = CMTimeRangeMake(segStart, segDur);
+
+        double dstSec = targetTotalSec * (weights[i] / weightSum);
+        CMTime dstDur = CMTimeMakeWithSeconds(MAX(0.002, dstSec), ts);
+
+        NSError *err = nil;
+        BOOL inserted = ((BOOL (*)(id, SEL, CMTimeRange, AVAssetTrack *, CMTime, NSError **))gOrigCompTrackInsertTimeRange)(
+            compTrack, @selector(insertTimeRange:ofTrack:atTime:error:), srcRange, srcTrack, cursor, &err);
+        if (inserted) {
+            CMTimeRange insertedRange = CMTimeRangeMake(cursor, segDur);
+            ((void (*)(id, SEL, CMTimeRange, CMTime))gOrigCompTrackScaleTimeRange)(
+                compTrack, _cmd, insertedRange, dstDur);
+            cursor = CMTimeAdd(cursor, dstDur);
+        }
+    }
+    gInSpeedRampScale = NO;
+}
+
+static void AMRedrawAllKeyframeViewsInView(UIView *v) {
+    if (!v) return;
+    if ([NSStringFromClass([v class]) isEqualToString:@"_TtC12AlightMotion12KeyframeView"]) {
+        [v setNeedsDisplay];
+    }
+    for (UIView *sub in v.subviews) {
+        AMRedrawAllKeyframeViewsInView(sub);
+    }
+}
+
+static void AMRedrawAllKeyframeViews(void) {
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+            AMRedrawAllKeyframeViewsInView(w);
+        }
+    }
+}
+
+static float AMGetFloatIvar(id obj, const char *ivarName, float fallback) {
+    if (!obj || !ivarName) return fallback;
+    Class cls = object_getClass(obj);
+    while (cls) {
+        Ivar iv = class_getInstanceVariable(cls, ivarName);
+        if (iv) {
+            ptrdiff_t off = ivar_getOffset(iv);
+            float val = *(float *)((uint8_t *)(__bridge void *)obj + off);
+            return isfinite(val) ? val : fallback;
+        }
+        cls = class_getSuperclass(cls);
+    }
+    return fallback;
+}
+
+static void AMHook_keyframeViewDrawRect(id self, SEL _cmd, CGRect rect) {
+    if (gOrigKeyframeViewDrawRect) {
+        ((void (*)(id, SEL, CGRect))gOrigKeyframeViewDrawRect)(self, _cmd, rect);
+    }
+    NSArray<NSDictionary *> *kfs = gActiveSpeedKeyframes;
+    if (kfs.count == 0) return;
+
+    UIView *kfView = (UIView *)self;
+    CGFloat w = kfView.bounds.size.width;
+    CGFloat h = kfView.bounds.size.height;
+    if (w < 8.0 || h < 8.0) return;
+
+    float scale = AMGetFloatIvar(self, "timeScaleFactor", 1.0f);
+    float offset = AMGetFloatIvar(self, "timeOffset", 0.0f);
+    if (scale <= 0.0001f) scale = 1.0f;
+
+    CGContextRef cg = UIGraphicsGetCurrentContext();
+    if (!cg) return;
+
+    double totalDur = 1.0;
+    AVPlayer *player = gActivePreviewPlayer;
+    if (player && player.currentItem) {
+        double d = CMTimeGetSeconds(player.currentItem.duration);
+        if (isfinite(d) && d > 0.05) totalDur = d;
+    }
+
+    double now = AMCurrentPlayheadSeconds();
+    CGContextSaveGState(cg);
+    for (NSDictionary *kf in kfs) {
+        double tSec = [kf[@"t"] doubleValue];
+        double u = (kf[@"u"] != nil) ? [kf[@"u"] doubleValue] : (tSec / totalDur);
+        if (u < 0.0) u = 0.0;
+        if (u > 1.0) u = 1.0;
+        CGFloat x = (CGFloat)(u * scale + offset) * w;
+        if (x < 6.0) x = 6.0;
+        if (x > w - 6.0) x = w - 6.0;
+        CGFloat cy = h * 0.5;
+        CGFloat rx = 5.5;
+        CGFloat ry = 7.5;
+
+        UIBezierPath *diamond = [UIBezierPath bezierPath];
+        [diamond moveToPoint:CGPointMake(x, cy - ry)];
+        [diamond addLineToPoint:CGPointMake(x + rx, cy)];
+        [diamond addLineToPoint:CGPointMake(x, cy + ry)];
+        [diamond addLineToPoint:CGPointMake(x - rx, cy)];
+        [diamond closePath];
+
+        BOOL active = fabs(tSec - now) <= 0.04;
+        [(active ? AMAccentGreenColor() : [UIColor whiteColor]) setFill];
+        [diamond fill];
+        [[UIColor colorWithRed:0.08 green:0.09 blue:0.13 alpha:0.9] setStroke];
+        diamond.lineWidth = 1.2;
+        [diamond stroke];
+    }
+    CGContextRestoreGState(cg);
+}
+
+static void AMTriggerSpeedCompositionRebuild(UIViewController *speedVC, double targetSpeed) {
+    void *vmPtr = AMGetRawIvarPtr(speedVC, "vm");
+    if (!vmPtr) return;
+    if (targetSpeed < 0.10) targetSpeed = 0.10;
+    if (targetSpeed > 8.00) targetSpeed = 8.00;
+    int64_t milli = (int64_t)llround(targetSpeed * 1000.0);
+    // Nudge by 1 milliSpeed if unchanged so Alight Motion rebuilds AVMutableComposition via our scaleTimeRange hook
+    int64_t nudge = (milli > 110) ? (milli - 1) : (milli + 1);
+    AMCallEditSpeedVMSetSpeed(vmPtr, nudge);
+    AMCallEditSpeedVMSetSpeed(vmPtr, milli);
+    AMCallEditSpeedVMRefreshUI(vmPtr);
+    AMForceImmediatePreviewRedraw();
+}
+
 static CGFloat AMComputeSpeedMultiplierAtProgress(AMSpeedBezierCurve c, CGFloat u) {
     if (u < 0.0) u = 0.0;
     if (u > 1.0) u = 1.0;
@@ -3321,10 +3587,33 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
 - (void)applyCurveToLayer:(AMSpeedBezierCurve)curve commit:(BOOL)commit {
     [self updateReadout];
     AMSaveSpeedGraphForKey(self.layerKey, curve, self.canvasView.baseSpeed, self.presetTitleLabel.text);
+
+    gActiveSpeedCurve = curve;
+    gActiveSpeedCurveEnabled = AMIsCurveNonLinear(curve);
+    gActiveSpeedBase = self.canvasView.baseSpeed;
+
+    NSMutableArray<NSDictionary *> *kfs = AMGetSpeedKeyframesForKey(self.layerKey);
+    if (kfs.count >= 2) {
+        double now = AMCurrentPlayheadSeconds();
+        NSInteger segIdx = 0;
+        for (NSInteger i = 0; i + 1 < (NSInteger)kfs.count; i++) {
+            if (now >= [kfs[i][@"t"] doubleValue]) segIdx = i;
+        }
+        NSMutableDictionary *mut = [kfs[segIdx] mutableCopy];
+        mut[@"x1"] = @(curve.x1);
+        mut[@"y1"] = @(curve.y1);
+        mut[@"x2"] = @(curve.x2);
+        mut[@"y2"] = @(curve.y2);
+        kfs[segIdx] = mut;
+        AMSaveSpeedKeyframesForKey(self.layerKey, kfs);
+        gActiveSpeedKeyframes = [kfs copy];
+    }
+
     if (!commit) return;
-    // Preserve layer timeline length when editing the Speed Graph (After Effects behavior):
-    // do not invoke EditSpeedVM::setSpeed, which rescales element.endTime.
-    AMForceImmediatePreviewRedraw();
+    // Rebuild AVMutableComposition via our 32-segment variable-speed scaleTimeRange hook
+    // while keeping total clip duration locked to baseSpeed.
+    AMTriggerSpeedCompositionRebuild(self.speedVC, self.canvasView.baseSpeed);
+    AMRedrawAllKeyframeViews();
 }
 
 - (void)onTapPresetButton:(UIButton *)sender {
@@ -3468,16 +3757,26 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
     NSString *key = AMSpeedLayerKeyForVC(speedVC);
     NSMutableArray<NSDictionary *> *kfs = AMGetSpeedKeyframesForKey(key);
     double now = AMCurrentPlayheadSeconds();
-    NSInteger existing = AMFindKeyframeIndexNearTime(kfs, now, 0.03);
+    double totalDur = 1.0;
+    if (gActivePreviewPlayer && gActivePreviewPlayer.currentItem) {
+        double d = CMTimeGetSeconds(gActivePreviewPlayer.currentItem.duration);
+        if (isfinite(d) && d > 0.05) totalDur = d;
+    }
+    double normU = MIN(1.0, MAX(0.0, now / totalDur));
+    double spd = AMReadCurrentSpeedFromVC(speedVC);
+
+    NSInteger existing = AMFindKeyframeIndexNearTime(kfs, now, 0.04);
     if (existing != NSNotFound) {
         [kfs removeObjectAtIndex:existing];
     } else {
-        double spd = AMReadCurrentSpeedFromVC(speedVC);
         [kfs addObject:@{
             @"t": @(now),
+            @"u": @(normU),
             @"speed": @(spd),
-            @"x1": @(0.42), @"y1": @(0.00),
-            @"x2": @(0.58), @"y2": @(1.00),
+            @"x1": @(gActiveSpeedCurveEnabled ? gActiveSpeedCurve.x1 : 0.42),
+            @"y1": @(gActiveSpeedCurveEnabled ? gActiveSpeedCurve.y1 : 0.00),
+            @"x2": @(gActiveSpeedCurveEnabled ? gActiveSpeedCurve.x2 : 0.58),
+            @"y2": @(gActiveSpeedCurveEnabled ? gActiveSpeedCurve.y2 : 1.00),
         }];
         [kfs sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
             double ta = [a[@"t"] doubleValue];
@@ -3488,7 +3787,13 @@ static UIImage *AMBezierCurveIconImage(AMSpeedBezierCurve c, CGSize size, UIColo
         }];
     }
     AMSaveSpeedKeyframesForKey(key, kfs);
+    gActiveSpeedKeyframes = [kfs copy];
+    gActiveSpeedBase = spd;
     [self refreshKeyframeUIForSpeedVC:speedVC];
+    AMRedrawAllKeyframeViews();
+    if (kfs.count >= 2) {
+        AMTriggerSpeedCompositionRebuild(speedVC, spd);
+    }
     UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     [haptic impactOccurred];
 }
@@ -3585,8 +3890,7 @@ static void AMEnsureSpeedGraphButton(UIViewController *speedVC) {
         panelVC = panelVC.parentViewController;
     }
 
-    UIView *cueView = panelVC ? (UIView *)AMCallObjCGetter(panelVC, @"cueView") : nil;
-    UIView *targetHost = (cueView && cueView.superview) ? cueView.superview : nil;
+    UIView *targetHost = (panelVC && panelVC.view) ? panelVC.view : speedVC.view;
     if (!targetHost) {
         return;
     }
@@ -3597,8 +3901,9 @@ static void AMEnsureSpeedGraphButton(UIViewController *speedVC) {
         [existingToolbar removeFromSuperview];
         [targetHost addSubview:existingToolbar];
         [NSLayoutConstraint activateConstraints:@[
-            [existingToolbar.trailingAnchor constraintEqualToAnchor:targetHost.trailingAnchor constant:-12.0],
-            [existingToolbar.centerYAnchor constraintEqualToAnchor:cueView.centerYAnchor],
+            [existingToolbar.trailingAnchor constraintEqualToAnchor:targetHost.trailingAnchor constant:-14.0],
+            [existingToolbar.topAnchor constraintEqualToAnchor:targetHost.topAnchor constant:4.0],
+            [existingToolbar.heightAnchor constraintEqualToConstant:32.0],
         ]];
     }
 
@@ -3691,8 +3996,9 @@ static void AMEnsureSpeedGraphButton(UIViewController *speedVC) {
             [nextBtn.heightAnchor constraintEqualToConstant:28.0],
             [btn.widthAnchor constraintEqualToConstant:30.0],
             [btn.heightAnchor constraintEqualToConstant:30.0],
-            [toolbar.trailingAnchor constraintEqualToAnchor:hostView.trailingAnchor constant:-12.0],
-            [toolbar.centerYAnchor constraintEqualToAnchor:cueView.centerYAnchor],
+            [toolbar.trailingAnchor constraintEqualToAnchor:hostView.trailingAnchor constant:-14.0],
+            [toolbar.topAnchor constraintEqualToAnchor:hostView.topAnchor constant:4.0],
+            [toolbar.heightAnchor constraintEqualToConstant:32.0],
         ]];
 
         objc_setAssociatedObject(speedVC, kAMSpeedKfBarAssocKey, toolbar, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -3834,6 +4140,21 @@ static void AlightMotionModsInit(void) {
                     @"viewDidLoad",
                     (IMP)AMHook_editSpeedPanelViewDidLoad,
                     &gOrigEditSpeedPanelViewDidLoad);
+
+    AMSwizzleMethod(@"AVMutableCompositionTrack",
+                    @"insertTimeRange:ofTrack:atTime:error:",
+                    (IMP)AMHook_compTrackInsertTimeRange,
+                    &gOrigCompTrackInsertTimeRange);
+
+    AMSwizzleMethod(@"AVMutableCompositionTrack",
+                    @"scaleTimeRange:toDuration:",
+                    (IMP)AMHook_compTrackScaleTimeRange,
+                    &gOrigCompTrackScaleTimeRange);
+
+    AMSwizzleMethod(@"_TtC12AlightMotion12KeyframeView",
+                    @"drawRect:",
+                    (IMP)AMHook_keyframeViewDrawRect,
+                    &gOrigKeyframeViewDrawRect);
 
     [[AMHomepageSearchOverlayManager shared] start];
 }
