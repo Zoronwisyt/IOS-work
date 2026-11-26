@@ -1779,6 +1779,8 @@ static UIViewController *AMTopMostViewController(void) {
     return vc;
 }
 
+static UIViewController *AMFindMainVCInHierarchy(UIViewController *vc, NSInteger depth);
+
 static BOOL AMVCTreeContainsEditor(UIViewController *vc, NSInteger depth) {
     if (!vc || depth > 10) return NO;
     NSString *clsName = NSStringFromClass([vc class]) ?: @"";
@@ -1786,7 +1788,10 @@ static BOOL AMVCTreeContainsEditor(UIViewController *vc, NSInteger depth) {
         [clsName containsString:@"PreviewControlBar"] ||
         [clsName containsString:@"EffectPicker"] ||
         [clsName containsString:@"SettingsVC"] ||
-        [clsName containsString:@"AMProjectSearchVC"]) {
+        [clsName containsString:@"AMProjectSearchVC"] ||
+        [clsName containsString:@"Loading"] ||
+        [clsName containsString:@"Splash"] ||
+        [clsName containsString:@"Launch"]) {
         return YES;
     }
     for (UIViewController *child in vc.childViewControllers) {
@@ -1804,6 +1809,8 @@ static BOOL AMIsOnHomepage(UIWindow *win) {
         UINavigationController *nav = (UINavigationController *)root;
         if (nav.viewControllers.count > 1) return NO;
     }
+    UIViewController *mainVC = AMFindMainVCInHierarchy(root, 0);
+    if (!mainVC || !mainVC.isViewLoaded || mainVC.view.window != win) return NO;
     if (AMVCTreeContainsEditor(root, 0)) return NO;
     return YES;
 }
