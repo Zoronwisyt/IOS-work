@@ -817,8 +817,8 @@ static NSString *AMXmlEscapeAttr(NSString *s) {
 }
 
 // Prepares valid Alight Motion <effect> XML so VisualEffectParser always registers
-// it as its own standalone box inside category="custom" (usable on any layer).
-static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSString *slug, NSError **outError) {
+// it as its own standalone box inside the chosen category (usable on any layer).
+static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSString *slug, NSString *categorySlug, NSError **outError) {
     NSString *trimmed = [rawXML stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) {
         if (outError) {
@@ -827,6 +827,7 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
         }
         return nil;
     }
+    NSString *cat = (categorySlug.length > 0) ? categorySlug : @"custom";
 
     // If user pasted raw GLSL fragment code (void main()) without <effect> wrapper, auto-wrap it!
     NSRange openStart = [trimmed rangeOfString:@"<effect" options:NSCaseInsensitiveSearch];
@@ -834,13 +835,13 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
         if ([trimmed containsString:@"void main"] || [trimmed containsString:@"gl_FragColor"]) {
             NSString *wrapped = [NSString stringWithFormat:
                 @"<?xml version='1.0' encoding='UTF-8' ?>\n"
-                @"<effect id=\"com.alightcreative.effects.custom_%@\" compat=\"acScreenNorm-y\" name=\"%@\" desc=\"Custom Effect\" category=\"custom\" tags=\"custom\" thumb=\"thumb/copy-bg.webp\">\n"
+                @"<effect id=\"com.alightcreative.effects.custom_%@\" compat=\"acScreenNorm-y\" name=\"%@\" desc=\"Custom Effect\" category=\"%@\" tags=\"custom,%@\" thumb=\"thumb/copy-bg.webp\">\n"
                 @"    <params>\n"
                 @"        <texture id=\"inputImg\" srcType=\"content\" />\n"
                 @"    </params>\n"
                 @"    <shader type=\"fragment\" precision=\"high\"><![CDATA[\n%@\n    ]]></shader>\n"
                 @"</effect>\n",
-                slug, AMXmlEscapeAttr(displayName), trimmed];
+                slug, AMXmlEscapeAttr(displayName), AMXmlEscapeAttr(cat), AMXmlEscapeAttr(cat), trimmed];
             return wrapped;
         }
         if (outError) {
@@ -891,10 +892,10 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
     // Always assign a unique com.alightcreative.effects.custom_<slug> ID so it gets its own box
     // and never collides with a built-in effect
     setAttr(@"id", [NSString stringWithFormat:@"com.alightcreative.effects.custom_%@", slug]);
-    setAttr(@"category", @"custom");
+    setAttr(@"category", cat);
     setAttr(@"name", displayName);
     setAttr(@"desc", @"Custom Effect");
-    setAttr(@"tags", @"custom");
+    setAttr(@"tags", [NSString stringWithFormat:@"custom,%@", cat]);
     // Use a guaranteed-valid built-in WebP thumb for Alight Motion's WebP loader;
     // our cell willDisplayCell hook overlays any custom user PNG thumbnail cleanly!
     setAttr(@"thumb", @"thumb/copy-bg.webp");
@@ -953,7 +954,127 @@ struct AMSwiftArrayHeader {
 };
 static_assert(sizeof(AMSwiftArrayHeader) == 0x20, "Swift array header size mismatch");
 
-static uint8_t AMCustomCategoryFilter(void *effectPtr) {
+struct AMSwiftString {
+    uint64_t lo;
+    uint64_t hi;
+};
+
+static AMSwiftString AMMakeSwiftString(NSString *ns) {
+    AMSwiftString res = { 0, 0xe000000000000000ULL };
+    if (!ns || ns.length == 0) return res;
+    const char *utf8 = [ns UTF8String];
+    if (!utf8) return res;
+    size_t len = strlen(utf8);
+    BOOL ascii = YES;
+    for (size_t i = 0; i < len; ++i) {
+        if (((unsigned char)utf8[i]) >= 0x80) { ascii = NO; break; }
+    }
+    if (ascii && len <= 15) {
+        uint64_t lo = 0, hi = 0;
+        for (size_t i = 0; i < len && i < 8; ++i) {
+            lo |= ((uint64_t)(unsigned char)utf8[i]) << (i * 8);
+        }
+        for (size_t i = 8; i < len && i < 15; ++i) {
+            hi |= ((uint64_t)(unsigned char)utf8[i]) << ((i - 8) * 8);
+        }
+        hi |= ((uint64_t)(0xE0 | (len & 0x0F))) << 56;
+        res.lo = lo;
+        res.hi = hi;
+        return res;
+    }
+    typedef AMSwiftString (*AMBridgeStrFn)(NSString *);
+    static AMBridgeStrFn bridgeFn = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        bridgeFn = (AMBridgeStrFn)dlsym(RTLD_DEFAULT, "$sSS10FoundationE36_unconditionallyBridgeFromObjectiveCySSSo8NSStringCSgFZ");
+    });
+    if (bridgeFn) {
+        return bridgeFn(ns);
+    }
+    size_t n = len > 15 ? 15 : len;
+    uint64_t lo = 0, hi = 0;
+    for (size_t i = 0; i < n && i < 8; ++i) lo |= ((uint64_t)(unsigned char)utf8[i]) << (i * 8);
+    for (size_t i = 8; i < n && i < 15; ++i) hi |= ((uint64_t)(unsigned char)utf8[i]) << ((i - 8) * 8);
+    hi |= ((uint64_t)(0xE0 | (n & 0x0F))) << 56;
+    res.lo = lo;
+    res.hi = hi;
+    return res;
+}
+
+static NSString *AMCustomCategoryThumbsDir(void) {
+    NSString *dir = [AMCustomEffectsDir() stringByAppendingPathComponent:@"cat_thumbs"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+static NSString *AMCategoriesConfigPath(void) {
+    return [AMCustomEffectsDir() stringByAppendingPathComponent:@"categories_config.plist"];
+}
+
+static NSMutableDictionary *AMLoadCategoriesConfig(void) {
+    NSDictionary *raw = [NSDictionary dictionaryWithContentsOfFile:AMCategoriesConfigPath()];
+    NSMutableDictionary *cfg = raw ? [raw mutableCopy] : [NSMutableDictionary dictionary];
+    if (![cfg[@"deletedIds"] isKindOfClass:[NSArray class]]) {
+        cfg[@"deletedIds"] = [NSMutableArray array];
+    } else {
+        cfg[@"deletedIds"] = [cfg[@"deletedIds"] mutableCopy];
+    }
+    if (![cfg[@"overrides"] isKindOfClass:[NSDictionary class]]) {
+        cfg[@"overrides"] = [NSMutableDictionary dictionary];
+    } else {
+        cfg[@"overrides"] = [cfg[@"overrides"] mutableCopy];
+    }
+    if (![cfg[@"userCategories"] isKindOfClass:[NSArray class]]) {
+        cfg[@"userCategories"] = [NSMutableArray array];
+    } else {
+        cfg[@"userCategories"] = [cfg[@"userCategories"] mutableCopy];
+    }
+    return cfg;
+}
+
+static void AMSaveCategoriesConfig(NSDictionary *cfg) {
+    [cfg writeToFile:AMCategoriesConfigPath() atomically:YES];
+}
+
+static NSArray<NSDictionary *> *AMBuiltinCategoryCatalog(void) {
+    return @[
+        @{@"id": @103, @"name": @"Color & Light",      @"slug": @"color",      @"thumb": @"ic_category_thumbnail_colorlight.png"},
+        @{@"id": @102, @"name": @"Drawing & Edge",     @"slug": @"drawing",    @"thumb": @"ic_category_thumbnail_drawingedge.png"},
+        @{@"id": @104, @"name": @"Blur",               @"slug": @"blur",       @"thumb": @"ic_category_thumbnail_blur.png"},
+        @{@"id": @106, @"name": @"Distortion/Warp",    @"slug": @"distort",    @"thumb": @"ic_category_thumbnail_warp.png"},
+        @{@"id": @105, @"name": @"Procedural",         @"slug": @"procedural", @"thumb": @"ic_category_thumbnail_procedural.png"},
+        @{@"id": @112, @"name": @"3D",                 @"slug": @"3d",         @"thumb": @"ic_category_thumbnail_3d.png"},
+        @{@"id": @107, @"name": @"Move/Transform",     @"slug": @"transform",  @"thumb": @"ic_category_thumbnail_movetransform.png"},
+        @{@"id": @111, @"name": @"Repeat",             @"slug": @"repeat",     @"thumb": @"ic_category_thumbnail_repeat.png"},
+        @{@"id": @108, @"name": @"Matte/Mask/Key",     @"slug": @"matte",      @"thumb": @"ic_category_thumbnail_mask.png"},
+        @{@"id": @109, @"name": @"Opacity/Visibility", @"slug": @"opacity",    @"thumb": @"ic_category_thumbnail_opacity.png"},
+        @{@"id": @101, @"name": @"Text",               @"slug": @"text",       @"thumb": @"ic_category_thumbnail_text.png"},
+        @{@"id": @0,   @"name": @"Other",              @"slug": @"other",      @"thumb": @""},
+        @{@"id": @113, @"name": @"Custom",             @"slug": @"custom",     @"thumb": @""},
+    ];
+}
+
+static NSCache<NSString *, UIImage *> *AMCategoryThumbCache(void) {
+    static NSCache<NSString *, UIImage *> *cache = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cache = [[NSCache alloc] init];
+        cache.countLimit = 48;
+    });
+    return cache;
+}
+
+static UIImage *AMLoadCategoryThumbImage(NSString *filename) {
+    if (filename.length == 0) return nil;
+    UIImage *cached = [AMCategoryThumbCache() objectForKey:filename];
+    if (cached) return cached;
+    NSString *path = [AMCustomCategoryThumbsDir() stringByAppendingPathComponent:filename];
+    UIImage *img = [UIImage imageWithContentsOfFile:path];
+    if (img) [AMCategoryThumbCache() setObject:img forKey:filename];
+    return img;
+}
+
+static uint8_t AMCategoryMatchSwiftString(void *effectPtr, AMSwiftString target) {
     if (!effectPtr) return 0;
     intptr_t slide = AMMainBinarySlide();
     typedef void *(*AMMetaFn)(uintptr_t);
@@ -968,19 +1089,60 @@ static uint8_t AMCustomCategoryFilter(void *effectPtr) {
     uint64_t strLo = *(uint64_t *)((uint8_t *)effectPtr + catOff);
     uint64_t strHi = *(uint64_t *)((uint8_t *)effectPtr + catOff + 8);
 
-    // Swift 5 small inline ASCII string "custom" (6 bytes: 'c','u','s','t','o','m')
-    const uint64_t kCustomLo = 0x00006d6f74737563ULL;
-    const uint64_t kCustomHi = 0xe600000000000000ULL;
-
-    BOOL matched = (strLo == kCustomLo && strHi == kCustomHi);
+    BOOL matched = (strLo == target.lo && strHi == target.hi);
     if (!matched) {
         AMStrEqFn strEq = (AMStrEqFn)(0x1025b7bb8ULL + slide);
-        matched = (strEq(strLo, strHi, kCustomLo, kCustomHi, 0) & 1) != 0;
+        matched = (strEq(strLo, strHi, target.lo, target.hi, 0) & 1) != 0;
     }
     if (!matched) return 0;
     uint8_t isExp = *((uint8_t *)effectPtr + expOff);
     return (uint8_t)((isExp ^ 1) & 1);
 }
+
+static uint8_t AMCustomCategoryFilter(void *effectPtr) {
+    AMSwiftString target = { 0x00006d6f74737563ULL, 0xe600000000000000ULL };
+    return AMCategoryMatchSwiftString(effectPtr, target);
+}
+
+static const int kAMMaxUserCategories = 32;
+static AMSwiftString gAMUserCatSlugStr[kAMMaxUserCategories];
+static BOOL gAMUserCatSlugValid[kAMMaxUserCategories];
+
+#define AM_DEF_USER_CAT_FILTER(N) \
+static uint8_t AMUserCategoryFilter_##N(void *effectPtr) { \
+    if (!gAMUserCatSlugValid[N]) return 0; \
+    return AMCategoryMatchSwiftString(effectPtr, gAMUserCatSlugStr[N]); \
+}
+
+AM_DEF_USER_CAT_FILTER(0)  AM_DEF_USER_CAT_FILTER(1)  AM_DEF_USER_CAT_FILTER(2)  AM_DEF_USER_CAT_FILTER(3)
+AM_DEF_USER_CAT_FILTER(4)  AM_DEF_USER_CAT_FILTER(5)  AM_DEF_USER_CAT_FILTER(6)  AM_DEF_USER_CAT_FILTER(7)
+AM_DEF_USER_CAT_FILTER(8)  AM_DEF_USER_CAT_FILTER(9)  AM_DEF_USER_CAT_FILTER(10) AM_DEF_USER_CAT_FILTER(11)
+AM_DEF_USER_CAT_FILTER(12) AM_DEF_USER_CAT_FILTER(13) AM_DEF_USER_CAT_FILTER(14) AM_DEF_USER_CAT_FILTER(15)
+AM_DEF_USER_CAT_FILTER(16) AM_DEF_USER_CAT_FILTER(17) AM_DEF_USER_CAT_FILTER(18) AM_DEF_USER_CAT_FILTER(19)
+AM_DEF_USER_CAT_FILTER(20) AM_DEF_USER_CAT_FILTER(21) AM_DEF_USER_CAT_FILTER(22) AM_DEF_USER_CAT_FILTER(23)
+AM_DEF_USER_CAT_FILTER(24) AM_DEF_USER_CAT_FILTER(25) AM_DEF_USER_CAT_FILTER(26) AM_DEF_USER_CAT_FILTER(27)
+AM_DEF_USER_CAT_FILTER(28) AM_DEF_USER_CAT_FILTER(29) AM_DEF_USER_CAT_FILTER(30) AM_DEF_USER_CAT_FILTER(31)
+
+static void *const kAMUserCatFilters[kAMMaxUserCategories] = {
+    (void *)&AMUserCategoryFilter_0,  (void *)&AMUserCategoryFilter_1,
+    (void *)&AMUserCategoryFilter_2,  (void *)&AMUserCategoryFilter_3,
+    (void *)&AMUserCategoryFilter_4,  (void *)&AMUserCategoryFilter_5,
+    (void *)&AMUserCategoryFilter_6,  (void *)&AMUserCategoryFilter_7,
+    (void *)&AMUserCategoryFilter_8,  (void *)&AMUserCategoryFilter_9,
+    (void *)&AMUserCategoryFilter_10, (void *)&AMUserCategoryFilter_11,
+    (void *)&AMUserCategoryFilter_12, (void *)&AMUserCategoryFilter_13,
+    (void *)&AMUserCategoryFilter_14, (void *)&AMUserCategoryFilter_15,
+    (void *)&AMUserCategoryFilter_16, (void *)&AMUserCategoryFilter_17,
+    (void *)&AMUserCategoryFilter_18, (void *)&AMUserCategoryFilter_19,
+    (void *)&AMUserCategoryFilter_20, (void *)&AMUserCategoryFilter_21,
+    (void *)&AMUserCategoryFilter_22, (void *)&AMUserCategoryFilter_23,
+    (void *)&AMUserCategoryFilter_24, (void *)&AMUserCategoryFilter_25,
+    (void *)&AMUserCategoryFilter_26, (void *)&AMUserCategoryFilter_27,
+    (void *)&AMUserCategoryFilter_28, (void *)&AMUserCategoryFilter_29,
+    (void *)&AMUserCategoryFilter_30, (void *)&AMUserCategoryFilter_31,
+};
+
+static NSMutableArray<NSDictionary *> *gAMActiveRuntimeCategories = nil;
 
 static void AMMigrateCustomEffectXMLCategories(void) {
     NSString *dir = AMCustomEffectsDir();
@@ -1024,71 +1186,187 @@ static void AMInstallCustomEffectCategoryIfNeeded(void) {
         AMSwiftArrayHeader *origHdr = (AMSwiftArrayHeader *)(*globalSlot);
         if (!origHdr || origHdr->count < 1 || origHdr->count > 64) return;
 
-        // Guard against duplicate insertion
+        NSDictionary *cfg = AMLoadCategoriesConfig();
+        NSSet<NSNumber *> *deletedSet = [NSSet setWithArray:(cfg[@"deletedIds"] ?: @[])];
+        NSDictionary *overrides = cfg[@"overrides"] ?: @{};
+        NSArray<NSDictionary *> *userCats = cfg[@"userCategories"] ?: @[];
+
+        NSMutableDictionary<NSNumber *, NSDictionary *> *catalogById = [NSMutableDictionary dictionary];
+        for (NSDictionary *item in AMBuiltinCategoryCatalog()) {
+            catalogById[item[@"id"]] = item;
+        }
+
         AMEffectCategoryEntry *origItems = (AMEffectCategoryEntry *)((uint8_t *)origHdr + sizeof(AMSwiftArrayHeader));
-        for (int64_t i = 0; i < origHdr->count; ++i) {
-            if (origItems[i].catId == 0x71) return;
-        }
-
         int64_t origCount = origHdr->count;
-        int64_t newCount = origCount + 1;
-        size_t newBytes = sizeof(AMSwiftArrayHeader) + (size_t)newCount * sizeof(AMEffectCategoryEntry);
 
-        AMSwiftArrayHeader *newHdr = (AMSwiftArrayHeader *)swiftAllocObject(origHdr->isa, newBytes, 7);
-        if (!newHdr) return;
-        newHdr->count = newCount;
-        newHdr->capacityAndFlags = newCount << 1;
+        AMEffectCategoryEntry finalEntries[64];
+        int64_t finalCount = 0;
+        gAMActiveRuntimeCategories = [NSMutableArray array];
 
-        AMEffectCategoryEntry *newItems = (AMEffectCategoryEntry *)((uint8_t *)newHdr + sizeof(AMSwiftArrayHeader));
+        BOOL hasExp = NO;
+        AMEffectCategoryEntry expEntry;
 
-        // Insert "Custom" right before Experimental (id == 500), i.e. right after "Other"
-        int64_t insertIdx = origCount;
-        for (int64_t i = 0; i < origCount; ++i) {
-            if (origItems[i].catId == 500) {
-                insertIdx = i;
-                break;
-            }
-        }
-
-        int64_t dst = 0;
-        for (int64_t i = 0; i < origCount; ++i) {
-            if (i == insertIdx) {
-                AMEffectCategoryEntry customEntry;
-                customEntry.catId = 0x71; // 113: unique, non-zero (excluded by Other), != 500 (always visible)
-                customEntry.nameLo = 0x00006d6f74737543ULL; // Swift small ASCII String "Custom" (6 bytes)
-                customEntry.nameHi = 0xe600000000000000ULL;
-                customEntry.thumbLo = 0;
-                customEntry.thumbHi = 0;
-                customEntry.filterFn = (void *)&AMCustomCategoryFilter;
-                customEntry.filterCtx = NULL;
-                newItems[dst++] = customEntry;
-            }
+        for (int64_t i = 0; i < origCount && finalCount < 60; ++i) {
             AMEffectCategoryEntry e = origItems[i];
-            if (e.nameHi) swiftBridgeRetain((void *)e.nameHi);
+            if (e.catId == 500) {
+                hasExp = YES;
+                expEntry = e;
+                continue;
+            }
+            if ([deletedSet containsObject:@(e.catId)]) {
+                continue;
+            }
+            NSString *idKey = [NSString stringWithFormat:@"%lld", (long long)e.catId];
+            NSDictionary *ov = overrides[idKey];
+            NSString *ovName = [ov[@"name"] isKindOfClass:[NSString class]] ? ov[@"name"] : nil;
+            NSString *ovImg = [ov[@"image"] isKindOfClass:[NSString class]] ? ov[@"image"] : @"";
+            NSDictionary *catInfo = catalogById[@(e.catId)];
+            NSString *dispName = (ovName.length > 0) ? ovName : (catInfo[@"name"] ?: @"Category");
+            NSString *slug = catInfo[@"slug"] ?: @"other";
+
+            if (ovName.length > 0) {
+                AMSwiftString sw = AMMakeSwiftString(ovName);
+                e.nameLo = sw.lo;
+                e.nameHi = sw.hi;
+            } else if (e.nameHi) {
+                swiftBridgeRetain((void *)e.nameHi);
+            }
             if (e.thumbHi) swiftBridgeRetain((void *)e.thumbHi);
             if (e.filterCtx) swiftRetain(e.filterCtx);
-            newItems[dst++] = e;
+
+            finalEntries[finalCount++] = e;
+            [gAMActiveRuntimeCategories addObject:@{
+                @"id": @(e.catId),
+                @"name": dispName,
+                @"slug": slug,
+                @"image": ovImg ?: @"",
+                @"isUser": @NO,
+                @"isCustom": @NO,
+            }];
         }
-        if (insertIdx == origCount) {
+
+        if (![deletedSet containsObject:@(0x71)] && finalCount < 60) {
+            NSDictionary *ov = overrides[@"113"];
+            NSString *ovName = [ov[@"name"] isKindOfClass:[NSString class]] ? ov[@"name"] : nil;
+            NSString *ovImg = [ov[@"image"] isKindOfClass:[NSString class]] ? ov[@"image"] : @"";
+            NSString *dispName = (ovName.length > 0) ? ovName : @"Custom";
+            AMSwiftString sw = AMMakeSwiftString(dispName);
+
             AMEffectCategoryEntry customEntry;
             customEntry.catId = 0x71;
-            customEntry.nameLo = 0x00006d6f74737543ULL;
-            customEntry.nameHi = 0xe600000000000000ULL;
+            customEntry.nameLo = sw.lo;
+            customEntry.nameHi = sw.hi;
             customEntry.thumbLo = 0;
             customEntry.thumbHi = 0;
             customEntry.filterFn = (void *)&AMCustomCategoryFilter;
             customEntry.filterCtx = NULL;
-            newItems[dst++] = customEntry;
+            finalEntries[finalCount++] = customEntry;
+
+            [gAMActiveRuntimeCategories addObject:@{
+                @"id": @(0x71),
+                @"name": dispName,
+                @"slug": @"custom",
+                @"image": ovImg ?: @"",
+                @"isUser": @YES,
+                @"isCustom": @YES,
+            }];
         }
 
-        // Publish new array globally (intentionally keep origHdr retained for safety)
+        int slot = 0;
+        for (NSDictionary *uc in userCats) {
+            if (slot >= kAMMaxUserCategories || finalCount >= 62) break;
+            NSString *name = [uc[@"name"] isKindOfClass:[NSString class]] ? uc[@"name"] : nil;
+            NSString *slug = [uc[@"slug"] isKindOfClass:[NSString class]] ? uc[@"slug"] : nil;
+            NSNumber *idNum = [uc[@"id"] isKindOfClass:[NSNumber class]] ? uc[@"id"] : nil;
+            NSString *img = [uc[@"image"] isKindOfClass:[NSString class]] ? uc[@"image"] : @"";
+            if (name.length == 0 || slug.length == 0 || !idNum) continue;
+
+            int64_t cid = idNum.longLongValue;
+            if (cid <= 0 || cid == 500 || cid == 0x71) continue;
+
+            AMSwiftString nameSw = AMMakeSwiftString(name);
+            gAMUserCatSlugStr[slot] = AMMakeSwiftString(slug.lowercaseString);
+            gAMUserCatSlugValid[slot] = YES;
+
+            AMEffectCategoryEntry uEntry;
+            uEntry.catId = cid;
+            uEntry.nameLo = nameSw.lo;
+            uEntry.nameHi = nameSw.hi;
+            uEntry.thumbLo = 0;
+            uEntry.thumbHi = 0;
+            uEntry.filterFn = kAMUserCatFilters[slot];
+            uEntry.filterCtx = NULL;
+            finalEntries[finalCount++] = uEntry;
+
+            [gAMActiveRuntimeCategories addObject:@{
+                @"id": @(cid),
+                @"name": name,
+                @"slug": slug.lowercaseString,
+                @"image": img ?: @"",
+                @"isUser": @YES,
+                @"isCustom": @NO,
+            }];
+            slot++;
+        }
+
+        if (hasExp && finalCount < 64) {
+            if (expEntry.nameHi) swiftBridgeRetain((void *)expEntry.nameHi);
+            if (expEntry.thumbHi) swiftBridgeRetain((void *)expEntry.thumbHi);
+            if (expEntry.filterCtx) swiftRetain(expEntry.filterCtx);
+            finalEntries[finalCount++] = expEntry;
+        }
+
+        if (finalCount <= 0) return;
+
+        size_t newBytes = sizeof(AMSwiftArrayHeader) + (size_t)finalCount * sizeof(AMEffectCategoryEntry);
+        AMSwiftArrayHeader *newHdr = (AMSwiftArrayHeader *)swiftAllocObject(origHdr->isa, newBytes, 7);
+        if (!newHdr) return;
+        newHdr->count = finalCount;
+        newHdr->capacityAndFlags = finalCount << 1;
+
+        AMEffectCategoryEntry *newItems = (AMEffectCategoryEntry *)((uint8_t *)newHdr + sizeof(AMSwiftArrayHeader));
+        for (int64_t i = 0; i < finalCount; ++i) {
+            newItems[i] = finalEntries[i];
+        }
+
         *globalSlot = newHdr;
     });
 }
 
 static UILabel *AMFindFirstLabelInView(UIView *v);
+static UIImageView *AMFindLargestImageViewInView(UIView *v);
 static IMP gOrigEffectMainWillDisplayCell = NULL;
+static IMP gOrigEffectMainViewDidAppear = NULL;
 static const void *kAMCustomCatGradKey = &kAMCustomCatGradKey;
+static const void *kAMManageCatBtnKey = &kAMManageCatBtnKey;
+
+static UIImageView *AMMainCellThumbnailImageView(UICollectionViewCell *cell) {
+    if (!cell) return nil;
+    @try {
+        id iv = [cell valueForKey:@"thumbnailImageView"];
+        if ([iv isKindOfClass:[UIImageView class]]) return (UIImageView *)iv;
+    } @catch (NSException *ex) { (void)ex; }
+    return AMFindLargestImageViewInView(cell.contentView);
+}
+
+static NSDictionary *AMRuntimeCategoryForCell(UICollectionViewCell *cell, NSIndexPath *indexPath) {
+    if (indexPath && indexPath.item >= 0 && (NSUInteger)indexPath.item < gAMActiveRuntimeCategories.count) {
+        return gAMActiveRuntimeCategories[(NSUInteger)indexPath.item];
+    }
+    UILabel *titleLbl = nil;
+    SEL titleSel = NSSelectorFromString(@"titleLabel");
+    if ([cell respondsToSelector:titleSel]) {
+        titleLbl = ((UILabel *(*)(id, SEL))objc_msgSend)(cell, titleSel);
+    }
+    if (!titleLbl) titleLbl = AMFindFirstLabelInView(cell.contentView);
+    NSString *txt = titleLbl.text;
+    if (txt.length > 0) {
+        for (NSDictionary *d in gAMActiveRuntimeCategories) {
+            if ([d[@"name"] caseInsensitiveCompare:txt] == NSOrderedSame) return d;
+        }
+    }
+    return nil;
+}
 
 static void AMHook_effectMainWillDisplayCell(id self, SEL _cmd, UICollectionView *cv, UICollectionViewCell *cell, NSIndexPath *indexPath) {
     AMInstallCustomEffectCategoryIfNeeded();
@@ -1096,30 +1374,66 @@ static void AMHook_effectMainWillDisplayCell(id self, SEL _cmd, UICollectionView
         ((void (*)(id, SEL, UICollectionView *, UICollectionViewCell *, NSIndexPath *))gOrigEffectMainWillDisplayCell)(self, _cmd, cv, cell, indexPath);
     }
     if (!cell) return;
-    UILabel *titleLbl = nil;
-    SEL titleSel = NSSelectorFromString(@"titleLabel");
-    if ([cell respondsToSelector:titleSel]) {
-        titleLbl = ((UILabel *(*)(id, SEL))objc_msgSend)(cell, titleSel);
+
+    NSDictionary *catInfo = AMRuntimeCategoryForCell(cell, indexPath);
+    NSString *imgFile = catInfo[@"image"];
+    if (catInfo[@"id"]) {
+        NSDictionary *liveCfg = AMLoadCategoriesConfig();
+        NSString *idKey = [NSString stringWithFormat:@"%@", catInfo[@"id"]];
+        NSDictionary *ov = liveCfg[@"overrides"][idKey];
+        if ([ov[@"image"] isKindOfClass:[NSString class]]) {
+            imgFile = ov[@"image"];
+        } else {
+            for (NSDictionary *uc in (liveCfg[@"userCategories"] ?: @[])) {
+                if ([uc[@"id"] isEqual:catInfo[@"id"]]) {
+                    imgFile = [uc[@"image"] isKindOfClass:[NSString class]] ? uc[@"image"] : @"";
+                    break;
+                }
+            }
+        }
     }
-    if (!titleLbl) titleLbl = AMFindFirstLabelInView(cell.contentView);
-    BOOL isCustom = (titleLbl.text && [titleLbl.text caseInsensitiveCompare:@"Custom"] == NSOrderedSame);
+
+    UIImage *customBg = (imgFile.length > 0) ? AMLoadCategoryThumbImage(imgFile) : nil;
+    BOOL isUserOrCustom = [catInfo[@"isUser"] boolValue];
+    UIImageView *thumbIV = AMMainCellThumbnailImageView(cell);
     CAGradientLayer *grad = objc_getAssociatedObject(cell, kAMCustomCatGradKey);
-    if (isCustom) {
+
+    if (customBg) {
+        if (thumbIV) {
+            thumbIV.image = customBg;
+            thumbIV.contentMode = UIViewContentModeScaleAspectFill;
+            thumbIV.clipsToBounds = YES;
+            thumbIV.hidden = NO;
+        }
+        if (grad) grad.hidden = YES;
+    } else if (isUserOrCustom) {
+        if (thumbIV) {
+            thumbIV.image = nil;
+        }
         if (!grad) {
             grad = [CAGradientLayer layer];
-            grad.colors = @[
-                (id)[UIColor colorWithRed:0.15 green:0.20 blue:0.35 alpha:1.0].CGColor,
-                (id)[UIColor colorWithRed:0.12 green:0.30 blue:0.28 alpha:1.0].CGColor,
-            ];
             grad.startPoint = CGPointMake(0.0, 0.0);
             grad.endPoint = CGPointMake(1.0, 1.0);
             [cell.contentView.layer insertSublayer:grad atIndex:0];
             objc_setAssociatedObject(cell, kAMCustomCatGradKey, grad, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
+        BOOL isMainCustom = [catInfo[@"isCustom"] boolValue];
+        if (isMainCustom) {
+            grad.colors = @[
+                (id)[UIColor colorWithRed:0.15 green:0.20 blue:0.35 alpha:1.0].CGColor,
+                (id)[UIColor colorWithRed:0.12 green:0.30 blue:0.28 alpha:1.0].CGColor,
+            ];
+        } else {
+            NSInteger cid = [catInfo[@"id"] integerValue];
+            CGFloat hue = fmod((cid * 0.173), 1.0);
+            UIColor *c1 = [UIColor colorWithHue:hue saturation:0.42 brightness:0.28 alpha:1.0];
+            UIColor *c2 = [UIColor colorWithHue:fmod(hue + 0.12, 1.0) saturation:0.48 brightness:0.22 alpha:1.0];
+            grad.colors = @[(id)c1.CGColor, (id)c2.CGColor];
+        }
         grad.hidden = NO;
         grad.frame = cell.contentView.bounds;
-    } else if (grad) {
-        grad.hidden = YES;
+    } else {
+        if (grad) grad.hidden = YES;
     }
 }
 
@@ -1269,10 +1583,779 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
 }
 
 // ============================================================================
-// Module 3: Custom XML Effect Importer Modal UI & '+' in Other Category
+// Module 3B: Effect Categories Manager UI (Create, Delete, Rename, Picture)
+// ============================================================================
+
+@interface AMEffectCategoryEditorVC : UIViewController <UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+@property (nonatomic, assign) BOOL isCreating;
+@property (nonatomic, assign) BOOL isUserCategory;
+@property (nonatomic, assign) int64_t categoryId;
+@property (nonatomic, copy) NSString *initialName;
+@property (nonatomic, copy, nullable) NSString *initialImageFile;
+@property (nonatomic, copy, nullable) NSString *builtinThumbName;
+@property (nonatomic, copy, nullable) void (^onSaved)(void);
+
+@property (nonatomic, strong) UITextField *nameField;
+@property (nonatomic, strong) UIImageView *barPreviewIV;
+@property (nonatomic, strong) UILabel *barPreviewLabel;
+@property (nonatomic, strong) UIButton *clearPicBtn;
+@property (nonatomic, strong, nullable) UIImage *pickedImage;
+@property (nonatomic, assign) BOOL clearedImage;
+@end
+
+@implementation AMEffectCategoryEditorVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = AMBgColor();
+
+    UIScrollView *scroll = [[UIScrollView alloc] init];
+    scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+    [self.view addSubview:scroll];
+
+    UIStackView *stack = [[UIStackView alloc] init];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 14.0;
+    [scroll addSubview:stack];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [scroll.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [scroll.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [scroll.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [scroll.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:16.0],
+        [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-28.0],
+        [stack.leadingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.leadingAnchor constant:18.0],
+        [stack.trailingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.trailingAnchor constant:-18.0],
+    ]];
+
+    UIStackView *topRow = [[UIStackView alloc] init];
+    topRow.axis = UILayoutConstraintAxisHorizontal;
+    topRow.alignment = UIStackViewAlignmentCenter;
+
+    UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [cancelBtn setTitle:@"Cancel" forState:UIControlStateNormal];
+    [cancelBtn setTitleColor:[UIColor colorWithWhite:0.78 alpha:1.0] forState:UIControlStateNormal];
+    cancelBtn.titleLabel.font = AMThemeFont(15.0, UIFontWeightMedium);
+    [cancelBtn addTarget:self action:@selector(onCancel) forControlEvents:UIControlEventTouchUpInside];
+
+    UILabel *hdr = [[UILabel alloc] init];
+    hdr.text = self.isCreating ? @"New Category" : @"Edit Category";
+    hdr.textAlignment = NSTextAlignmentCenter;
+    hdr.textColor = [UIColor whiteColor];
+    hdr.font = AMThemeFont(17.0, UIFontWeightBold);
+
+    UIButton *saveBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [saveBtn setTitle:@"Save" forState:UIControlStateNormal];
+    [saveBtn setTitleColor:AMAccentGreenColor() forState:UIControlStateNormal];
+    saveBtn.titleLabel.font = AMThemeFont(15.0, UIFontWeightBold);
+    [saveBtn addTarget:self action:@selector(onSave) forControlEvents:UIControlEventTouchUpInside];
+
+    [topRow addArrangedSubview:cancelBtn];
+    [topRow addArrangedSubview:hdr];
+    [topRow addArrangedSubview:saveBtn];
+    [cancelBtn.widthAnchor constraintEqualToConstant:64.0].active = YES;
+    [saveBtn.widthAnchor constraintEqualToConstant:64.0].active = YES;
+    [stack addArrangedSubview:topRow];
+
+    UILabel *prevLbl = [[UILabel alloc] init];
+    prevLbl.text = @"CATEGORY BAR PREVIEW";
+    prevLbl.font = AMThemeFont(11.0, UIFontWeightBold);
+    prevLbl.textColor = [UIColor colorWithWhite:0.65 alpha:1.0];
+    [stack addArrangedSubview:prevLbl];
+
+    UIView *previewBox = [[UIView alloc] init];
+    previewBox.backgroundColor = [UIColor colorWithRed:0.15 green:0.19 blue:0.30 alpha:1.0];
+    previewBox.layer.cornerRadius = 8.0;
+    previewBox.layer.borderWidth = 1.0;
+    previewBox.layer.borderColor = AMBorderColor().CGColor;
+    previewBox.clipsToBounds = YES;
+    [previewBox.heightAnchor constraintEqualToConstant:72.0].active = YES;
+
+    self.barPreviewIV = [[UIImageView alloc] init];
+    self.barPreviewIV.translatesAutoresizingMaskIntoConstraints = NO;
+    self.barPreviewIV.contentMode = UIViewContentModeScaleAspectFill;
+    self.barPreviewIV.clipsToBounds = YES;
+    [previewBox addSubview:self.barPreviewIV];
+
+    UIView *dimm = [[UIView alloc] init];
+    dimm.translatesAutoresizingMaskIntoConstraints = NO;
+    dimm.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.32];
+    [previewBox addSubview:dimm];
+
+    self.barPreviewLabel = [[UILabel alloc] init];
+    self.barPreviewLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.barPreviewLabel.text = self.initialName.length > 0 ? self.initialName : @"New Category";
+    self.barPreviewLabel.textColor = [UIColor whiteColor];
+    self.barPreviewLabel.font = AMThemeFont(16.0, UIFontWeightBold);
+    self.barPreviewLabel.textAlignment = NSTextAlignmentCenter;
+    self.barPreviewLabel.shadowColor = [UIColor colorWithWhite:0.0 alpha:0.6];
+    self.barPreviewLabel.shadowOffset = CGSizeMake(0, 1);
+    [previewBox addSubview:self.barPreviewLabel];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.barPreviewIV.topAnchor constraintEqualToAnchor:previewBox.topAnchor],
+        [self.barPreviewIV.bottomAnchor constraintEqualToAnchor:previewBox.bottomAnchor],
+        [self.barPreviewIV.leadingAnchor constraintEqualToAnchor:previewBox.leadingAnchor],
+        [self.barPreviewIV.trailingAnchor constraintEqualToAnchor:previewBox.trailingAnchor],
+        [dimm.topAnchor constraintEqualToAnchor:previewBox.topAnchor],
+        [dimm.bottomAnchor constraintEqualToAnchor:previewBox.bottomAnchor],
+        [dimm.leadingAnchor constraintEqualToAnchor:previewBox.leadingAnchor],
+        [dimm.trailingAnchor constraintEqualToAnchor:previewBox.trailingAnchor],
+        [self.barPreviewLabel.centerXAnchor constraintEqualToAnchor:previewBox.centerXAnchor],
+        [self.barPreviewLabel.centerYAnchor constraintEqualToAnchor:previewBox.centerYAnchor],
+        [self.barPreviewLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:previewBox.leadingAnchor constant:12.0],
+        [self.barPreviewLabel.trailingAnchor constraintLessThanOrEqualToAnchor:previewBox.trailingAnchor constant:-12.0],
+    ]];
+    [stack addArrangedSubview:previewBox];
+
+    UILabel *nameLbl = [[UILabel alloc] init];
+    nameLbl.text = @"CATEGORY NAME";
+    nameLbl.font = AMThemeFont(11.0, UIFontWeightBold);
+    nameLbl.textColor = [UIColor colorWithWhite:0.65 alpha:1.0];
+    [stack addArrangedSubview:nameLbl];
+
+    self.nameField = [[UITextField alloc] init];
+    self.nameField.backgroundColor = AMInputSurfaceColor();
+    self.nameField.textColor = [UIColor whiteColor];
+    self.nameField.font = AMThemeFont(15.0, UIFontWeightMedium);
+    self.nameField.layer.cornerRadius = 10.0;
+    self.nameField.layer.borderWidth = 1.0;
+    self.nameField.layer.borderColor = AMBorderColor().CGColor;
+    self.nameField.text = self.initialName ?: @"";
+    self.nameField.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"e.g. Shaders, Glitch, Transitions"
+                                                                           attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.55 alpha:1.0]}];
+    self.nameField.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 12, 42)];
+    self.nameField.leftViewMode = UITextFieldViewModeAlways;
+    [self.nameField.heightAnchor constraintEqualToConstant:44.0].active = YES;
+    [self.nameField addTarget:self action:@selector(onNameChanged) forControlEvents:UIControlEventEditingChanged];
+    [stack addArrangedSubview:self.nameField];
+
+    UILabel *picLbl = [[UILabel alloc] init];
+    picLbl.text = @"BACKGROUND PICTURE";
+    picLbl.font = AMThemeFont(11.0, UIFontWeightBold);
+    picLbl.textColor = [UIColor colorWithWhite:0.65 alpha:1.0];
+    [stack addArrangedSubview:picLbl];
+
+    UIStackView *picBtns = [[UIStackView alloc] init];
+    picBtns.axis = UILayoutConstraintAxisHorizontal;
+    picBtns.spacing = 10.0;
+    picBtns.distribution = UIStackViewDistributionFillEqually;
+
+    UIButton *pickBtn = [self makeBtn:@"Choose Picture" action:@selector(onPickPicture)];
+    self.clearPicBtn = [self makeBtn:@"Reset Picture" action:@selector(onClearPicture)];
+    [picBtns addArrangedSubview:pickBtn];
+    [picBtns addArrangedSubview:self.clearPicBtn];
+    [stack addArrangedSubview:picBtns];
+
+    [self refreshPreviewImage];
+}
+
+- (UIButton *)makeBtn:(NSString *)title action:(SEL)sel {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.titleLabel.font = AMThemeFont(13.0, UIFontWeightSemibold);
+    b.backgroundColor = AMSurfaceColor();
+    b.layer.cornerRadius = 9.0;
+    b.layer.borderWidth = 1.0;
+    b.layer.borderColor = AMBorderColor().CGColor;
+    b.contentEdgeInsets = UIEdgeInsetsMake(10, 12, 10, 12);
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)refreshPreviewImage {
+    if (self.pickedImage) {
+        self.barPreviewIV.image = self.pickedImage;
+        return;
+    }
+    if (!self.clearedImage && self.initialImageFile.length > 0) {
+        UIImage *img = AMLoadCategoryThumbImage(self.initialImageFile);
+        if (img) {
+            self.barPreviewIV.image = img;
+            return;
+        }
+    }
+    if (self.builtinThumbName.length > 0) {
+        NSString *p = [[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:
+                       [@"BuiltinCategory/thumb" stringByAppendingPathComponent:self.builtinThumbName]];
+        UIImage *img = [UIImage imageWithContentsOfFile:p];
+        self.barPreviewIV.image = img;
+        return;
+    }
+    self.barPreviewIV.image = nil;
+}
+
+- (void)onNameChanged {
+    NSString *t = [self.nameField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    self.barPreviewLabel.text = t.length > 0 ? t : @"New Category";
+}
+
+- (void)onCancel {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)onPickPicture {
+    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)onClearPicture {
+    self.pickedImage = nil;
+    self.clearedImage = YES;
+    [self refreshPreviewImage];
+}
+
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
+    UIImage *img = info[UIImagePickerControllerOriginalImage];
+    if (img) {
+        CGSize target = CGSizeMake(600.0, 200.0);
+        CGFloat scaleX = target.width / MAX(img.size.width, 1.0);
+        CGFloat scaleY = target.height / MAX(img.size.height, 1.0);
+        CGFloat scale = MAX(scaleX, scaleY);
+        CGSize drawSz = CGSizeMake(img.size.width * scale, img.size.height * scale);
+        CGRect drawRect = CGRectMake((target.width - drawSz.width) * 0.5, (target.height - drawSz.height) * 0.5, drawSz.width, drawSz.height);
+        UIGraphicsBeginImageContextWithOptions(target, YES, 1.0);
+        [img drawInRect:drawRect];
+        UIImage *resized = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        self.pickedImage = resized ?: img;
+        self.clearedImage = NO;
+        [self refreshPreviewImage];
+    }
+    [picker dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)onSave {
+    NSString *name = [self.nameField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (name.length == 0) {
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Missing Name" message:@"Enter a category name." preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:ac animated:YES completion:nil];
+        return;
+    }
+
+    NSMutableDictionary *cfg = AMLoadCategoriesConfig();
+    NSMutableArray *userCats = cfg[@"userCategories"];
+    NSMutableDictionary *overrides = cfg[@"overrides"];
+
+    int64_t cid = self.categoryId;
+    if (self.isCreating) {
+        if ((int)userCats.count >= kAMMaxUserCategories) {
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Limit Reached" message:@"Maximum of 32 custom categories reached." preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:ac animated:YES completion:nil];
+            return;
+        }
+        int64_t maxId = 113;
+        for (NSDictionary *uc in userCats) {
+            int64_t v = [uc[@"id"] longLongValue];
+            if (v > maxId) maxId = v;
+        }
+        cid = maxId + 1;
+    }
+
+    NSString *imgFile = self.clearedImage ? @"" : (self.initialImageFile ?: @"");
+    if (self.pickedImage) {
+        NSString *fn = [NSString stringWithFormat:@"cat_%lld_%lld.png", (long long)cid, (long long)[[NSDate date] timeIntervalSince1970]];
+        NSData *png = UIImagePNGRepresentation(self.pickedImage);
+        if (png) {
+            if (self.initialImageFile.length > 0) {
+                [[NSFileManager defaultManager] removeItemAtPath:[AMCustomCategoryThumbsDir() stringByAppendingPathComponent:self.initialImageFile] error:nil];
+                [AMCategoryThumbCache() removeObjectForKey:self.initialImageFile];
+            }
+            [png writeToFile:[AMCustomCategoryThumbsDir() stringByAppendingPathComponent:fn] atomically:YES];
+            imgFile = fn;
+        }
+    } else if (self.clearedImage && self.initialImageFile.length > 0) {
+        [[NSFileManager defaultManager] removeItemAtPath:[AMCustomCategoryThumbsDir() stringByAppendingPathComponent:self.initialImageFile] error:nil];
+        [AMCategoryThumbCache() removeObjectForKey:self.initialImageFile];
+    }
+
+    if (self.isCreating) {
+        NSString *slug = AMSanitizeSlug(name);
+        NSMutableSet<NSString *> *usedSlugs = [NSMutableSet setWithObjects:@"color", @"drawing", @"blur", @"distort", @"procedural", @"3d", @"transform", @"repeat", @"matte", @"opacity", @"text", @"other", @"custom", nil];
+        for (NSDictionary *uc in userCats) {
+            if (uc[@"slug"]) [usedSlugs addObject:uc[@"slug"]];
+        }
+        NSString *finalSlug = slug;
+        int suffix = 2;
+        while ([usedSlugs containsObject:finalSlug]) {
+            finalSlug = [NSString stringWithFormat:@"%@_%d", slug, suffix++];
+        }
+        [userCats addObject:@{
+            @"id": @(cid),
+            @"slug": finalSlug,
+            @"name": name,
+            @"image": imgFile ?: @"",
+        }];
+    } else if (self.isUserCategory) {
+        for (NSUInteger i = 0; i < userCats.count; ++i) {
+            if ([userCats[i][@"id"] longLongValue] == cid) {
+                NSMutableDictionary *m = [userCats[i] mutableCopy];
+                m[@"name"] = name;
+                m[@"image"] = imgFile ?: @"";
+                userCats[i] = m;
+                break;
+            }
+        }
+    } else {
+        NSString *idKey = [NSString stringWithFormat:@"%lld", (long long)cid];
+        overrides[idKey] = @{
+            @"name": name,
+            @"image": imgFile ?: @"",
+        };
+    }
+
+    AMSaveCategoriesConfig(cfg);
+    if (self.onSaved) self.onSaved();
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+@end
+
+@interface AMEffectCategoriesManagerVC : UIViewController
+@property (nonatomic, copy, nullable) void (^onDidChange)(void);
+@property (nonatomic, strong) UIStackView *listStack;
+@property (nonatomic, strong) UIStackView *deletedStack;
+@property (nonatomic, strong) UILabel *deletedHeaderLabel;
+@end
+
+@implementation AMEffectCategoriesManagerVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = AMBgColor();
+
+    UIScrollView *scroll = [[UIScrollView alloc] init];
+    scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:scroll];
+
+    UIStackView *stack = [[UIStackView alloc] init];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 12.0;
+    [scroll addSubview:stack];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [scroll.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [scroll.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [scroll.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [scroll.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:16.0],
+        [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-28.0],
+        [stack.leadingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.leadingAnchor constant:16.0],
+        [stack.trailingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.trailingAnchor constant:-16.0],
+    ]];
+
+    UIStackView *topRow = [[UIStackView alloc] init];
+    topRow.axis = UILayoutConstraintAxisHorizontal;
+    topRow.alignment = UIStackViewAlignmentCenter;
+
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [closeBtn setTitle:@"Done" forState:UIControlStateNormal];
+    [closeBtn setTitleColor:[UIColor colorWithWhite:0.78 alpha:1.0] forState:UIControlStateNormal];
+    closeBtn.titleLabel.font = AMThemeFont(15.0, UIFontWeightMedium);
+    [closeBtn addTarget:self action:@selector(onClose) forControlEvents:UIControlEventTouchUpInside];
+
+    UILabel *hdr = [[UILabel alloc] init];
+    hdr.text = @"Effect Categories";
+    hdr.textAlignment = NSTextAlignmentCenter;
+    hdr.textColor = [UIColor whiteColor];
+    hdr.font = AMThemeFont(17.0, UIFontWeightBold);
+
+    UIButton *addBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [addBtn setTitle:@"+ New" forState:UIControlStateNormal];
+    [addBtn setTitleColor:AMAccentGreenColor() forState:UIControlStateNormal];
+    addBtn.titleLabel.font = AMThemeFont(15.0, UIFontWeightBold);
+    [addBtn addTarget:self action:@selector(onAddNew) forControlEvents:UIControlEventTouchUpInside];
+
+    [topRow addArrangedSubview:closeBtn];
+    [topRow addArrangedSubview:hdr];
+    [topRow addArrangedSubview:addBtn];
+    [closeBtn.widthAnchor constraintEqualToConstant:62.0].active = YES;
+    [addBtn.widthAnchor constraintEqualToConstant:62.0].active = YES;
+    [stack addArrangedSubview:topRow];
+
+    UIView *banner = [[UIView alloc] init];
+    banner.backgroundColor = AMSurfaceColor();
+    banner.layer.cornerRadius = 10.0;
+    banner.layer.borderWidth = 1.0;
+    banner.layer.borderColor = AMBorderColor().CGColor;
+
+    UIStackView *bRow = [[UIStackView alloc] init];
+    bRow.translatesAutoresizingMaskIntoConstraints = NO;
+    bRow.axis = UILayoutConstraintAxisHorizontal;
+    bRow.alignment = UIStackViewAlignmentCenter;
+    bRow.spacing = 10.0;
+    [banner addSubview:bRow];
+    [NSLayoutConstraint activateConstraints:@[
+        [bRow.topAnchor constraintEqualToAnchor:banner.topAnchor constant:10.0],
+        [bRow.bottomAnchor constraintEqualToAnchor:banner.bottomAnchor constant:-10.0],
+        [bRow.leadingAnchor constraintEqualToAnchor:banner.leadingAnchor constant:12.0],
+        [bRow.trailingAnchor constraintEqualToAnchor:banner.trailingAnchor constant:-12.0],
+    ]];
+
+    UILabel *note = [[UILabel alloc] init];
+    note.text = @"Restart Alight Motion to load new or deleted categories.";
+    note.textColor = [UIColor colorWithWhite:0.78 alpha:1.0];
+    note.font = AMThemeFont(12.0, UIFontWeightRegular);
+    note.numberOfLines = 0;
+
+    UIButton *restartBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [restartBtn setTitle:@"Close App" forState:UIControlStateNormal];
+    [restartBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    restartBtn.titleLabel.font = AMThemeFont(12.0, UIFontWeightBold);
+    restartBtn.backgroundColor = [UIColor colorWithRed:0.20 green:0.56 blue:0.44 alpha:1.0];
+    restartBtn.layer.cornerRadius = 7.0;
+    restartBtn.contentEdgeInsets = UIEdgeInsetsMake(6, 10, 6, 10);
+    [restartBtn setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [restartBtn addTarget:self action:@selector(onRestartApp) forControlEvents:UIControlEventTouchUpInside];
+
+    [bRow addArrangedSubview:note];
+    [bRow addArrangedSubview:restartBtn];
+    [stack addArrangedSubview:banner];
+
+    UILabel *activeLbl = [[UILabel alloc] init];
+    activeLbl.text = @"ACTIVE CATEGORIES";
+    activeLbl.font = AMThemeFont(11.0, UIFontWeightBold);
+    activeLbl.textColor = [UIColor colorWithWhite:0.65 alpha:1.0];
+    [stack addArrangedSubview:activeLbl];
+
+    self.listStack = [[UIStackView alloc] init];
+    self.listStack.axis = UILayoutConstraintAxisVertical;
+    self.listStack.spacing = 8.0;
+    [stack addArrangedSubview:self.listStack];
+
+    self.deletedHeaderLabel = [[UILabel alloc] init];
+    self.deletedHeaderLabel.text = @"DELETED BUILT-IN CATEGORIES (TAP TO RESTORE)";
+    self.deletedHeaderLabel.font = AMThemeFont(11.0, UIFontWeightBold);
+    self.deletedHeaderLabel.textColor = [UIColor colorWithWhite:0.65 alpha:1.0];
+    [stack addArrangedSubview:self.deletedHeaderLabel];
+
+    self.deletedStack = [[UIStackView alloc] init];
+    self.deletedStack.axis = UILayoutConstraintAxisVertical;
+    self.deletedStack.spacing = 8.0;
+    [stack addArrangedSubview:self.deletedStack];
+
+    [self reloadLists];
+}
+
+- (void)onClose {
+    if (self.onDidChange) self.onDidChange();
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)onRestartApp {
+    exit(0);
+}
+
+- (void)onAddNew {
+    AMEffectCategoryEditorVC *ed = [[AMEffectCategoryEditorVC alloc] init];
+    ed.isCreating = YES;
+    ed.isUserCategory = YES;
+    ed.modalPresentationStyle = UIModalPresentationPageSheet;
+    __weak typeof(self) weakSelf = self;
+    ed.onSaved = ^{
+        [weakSelf reloadLists];
+    };
+    [self presentViewController:ed animated:YES completion:nil];
+}
+
+- (UIView *)makeCategoryCardWithId:(int64_t)cid name:(NSString *)name slug:(NSString *)slug imageFile:(NSString *)imgFile builtinThumb:(NSString *)builtinThumb isUser:(BOOL)isUser {
+    UIView *card = [[UIView alloc] init];
+    card.backgroundColor = AMSurfaceColor();
+    card.layer.cornerRadius = 10.0;
+    card.layer.borderWidth = 1.0;
+    card.layer.borderColor = AMBorderColor().CGColor;
+
+    UIStackView *row = [[UIStackView alloc] init];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.alignment = UIStackViewAlignmentCenter;
+    row.spacing = 10.0;
+    [card addSubview:row];
+    [NSLayoutConstraint activateConstraints:@[
+        [row.topAnchor constraintEqualToAnchor:card.topAnchor constant:8.0],
+        [row.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-8.0],
+        [row.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:10.0],
+        [row.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-10.0],
+    ]];
+
+    UIImageView *thumb = [[UIImageView alloc] init];
+    thumb.backgroundColor = AMInputSurfaceColor();
+    thumb.contentMode = UIViewContentModeScaleAspectFill;
+    thumb.clipsToBounds = YES;
+    thumb.layer.cornerRadius = 6.0;
+    [thumb.widthAnchor constraintEqualToConstant:64.0].active = YES;
+    [thumb.heightAnchor constraintEqualToConstant:36.0].active = YES;
+    if (imgFile.length > 0) {
+        thumb.image = AMLoadCategoryThumbImage(imgFile);
+    } else if (builtinThumb.length > 0) {
+        NSString *p = [[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:
+                       [@"BuiltinCategory/thumb" stringByAppendingPathComponent:builtinThumb]];
+        thumb.image = [UIImage imageWithContentsOfFile:p];
+    }
+
+    UIStackView *txtCol = [[UIStackView alloc] init];
+    txtCol.axis = UILayoutConstraintAxisVertical;
+    txtCol.spacing = 2.0;
+
+    UILabel *titleLbl = [[UILabel alloc] init];
+    titleLbl.text = name;
+    titleLbl.textColor = [UIColor whiteColor];
+    titleLbl.font = AMThemeFont(14.0, UIFontWeightSemibold);
+
+    UILabel *subLbl = [[UILabel alloc] init];
+    subLbl.text = isUser ? [NSString stringWithFormat:@"Custom • slug: %@", slug] : [NSString stringWithFormat:@"Built-in • slug: %@", slug];
+    subLbl.textColor = [UIColor colorWithWhite:0.58 alpha:1.0];
+    subLbl.font = AMThemeFont(11.0, UIFontWeightRegular);
+
+    [txtCol addArrangedSubview:titleLbl];
+    [txtCol addArrangedSubview:subLbl];
+
+    UIButton *editBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [editBtn setTitle:@"Edit" forState:UIControlStateNormal];
+    [editBtn setTitleColor:AMAccentGreenColor() forState:UIControlStateNormal];
+    editBtn.titleLabel.font = AMThemeFont(13.0, UIFontWeightSemibold);
+    editBtn.tag = (NSInteger)cid;
+    editBtn.accessibilityValue = isUser ? @"user" : @"builtin";
+    [editBtn setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [editBtn addTarget:self action:@selector(onEditCategory:) forControlEvents:UIControlEventTouchUpInside];
+
+    UIButton *delBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [delBtn setTitle:@"Delete" forState:UIControlStateNormal];
+    [delBtn setTitleColor:[UIColor colorWithRed:0.95 green:0.38 blue:0.42 alpha:1.0] forState:UIControlStateNormal];
+    delBtn.titleLabel.font = AMThemeFont(13.0, UIFontWeightSemibold);
+    delBtn.tag = (NSInteger)cid;
+    delBtn.accessibilityValue = isUser ? @"user" : @"builtin";
+    [delBtn setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [delBtn addTarget:self action:@selector(onDeleteCategory:) forControlEvents:UIControlEventTouchUpInside];
+
+    [row addArrangedSubview:thumb];
+    [row addArrangedSubview:txtCol];
+    [row addArrangedSubview:editBtn];
+    [row addArrangedSubview:delBtn];
+    return card;
+}
+
+- (void)reloadLists {
+    for (UIView *v in [self.listStack.arrangedSubviews copy]) {
+        [self.listStack removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
+    for (UIView *v in [self.deletedStack.arrangedSubviews copy]) {
+        [self.deletedStack removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
+
+    NSDictionary *cfg = AMLoadCategoriesConfig();
+    NSSet<NSNumber *> *deletedSet = [NSSet setWithArray:(cfg[@"deletedIds"] ?: @[])];
+    NSDictionary *overrides = cfg[@"overrides"] ?: @{};
+    NSArray<NSDictionary *> *userCats = cfg[@"userCategories"] ?: @[];
+
+    NSInteger deletedCount = 0;
+    for (NSDictionary *b in AMBuiltinCategoryCatalog()) {
+        int64_t cid = [b[@"id"] longLongValue];
+        NSString *idKey = [NSString stringWithFormat:@"%lld", (long long)cid];
+        NSDictionary *ov = overrides[idKey];
+        NSString *name = ([ov[@"name"] isKindOfClass:[NSString class]] && [ov[@"name"] length] > 0) ? ov[@"name"] : b[@"name"];
+        NSString *imgFile = [ov[@"image"] isKindOfClass:[NSString class]] ? ov[@"image"] : @"";
+        if ([deletedSet containsObject:@(cid)]) {
+            deletedCount++;
+            UIButton *restoreBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+            [restoreBtn setTitle:[NSString stringWithFormat:@"Restore \"%@\"", name] forState:UIControlStateNormal];
+            [restoreBtn setTitleColor:[UIColor colorWithWhite:0.85 alpha:1.0] forState:UIControlStateNormal];
+            restoreBtn.titleLabel.font = AMThemeFont(13.0, UIFontWeightMedium);
+            restoreBtn.backgroundColor = AMInputSurfaceColor();
+            restoreBtn.layer.cornerRadius = 8.0;
+            restoreBtn.layer.borderWidth = 1.0;
+            restoreBtn.layer.borderColor = AMBorderColor().CGColor;
+            restoreBtn.contentEdgeInsets = UIEdgeInsetsMake(9, 12, 9, 12);
+            restoreBtn.tag = (NSInteger)cid;
+            [restoreBtn addTarget:self action:@selector(onRestoreBuiltin:) forControlEvents:UIControlEventTouchUpInside];
+            [self.deletedStack addArrangedSubview:restoreBtn];
+            continue;
+        }
+        [self.listStack addArrangedSubview:[self makeCategoryCardWithId:cid name:name slug:b[@"slug"] imageFile:imgFile builtinThumb:b[@"thumb"] isUser:NO]];
+    }
+
+    for (NSDictionary *uc in userCats) {
+        int64_t cid = [uc[@"id"] longLongValue];
+        NSString *name = uc[@"name"] ?: @"Category";
+        NSString *slug = uc[@"slug"] ?: @"custom";
+        NSString *imgFile = [uc[@"image"] isKindOfClass:[NSString class]] ? uc[@"image"] : @"";
+        [self.listStack addArrangedSubview:[self makeCategoryCardWithId:cid name:name slug:slug imageFile:imgFile builtinThumb:@"" isUser:YES]];
+    }
+
+    self.deletedHeaderLabel.hidden = (deletedCount == 0);
+    self.deletedStack.hidden = (deletedCount == 0);
+}
+
+- (void)onEditCategory:(UIButton *)btn {
+    int64_t cid = (int64_t)btn.tag;
+    BOOL isUser = [btn.accessibilityValue isEqualToString:@"user"];
+    NSDictionary *cfg = AMLoadCategoriesConfig();
+
+    AMEffectCategoryEditorVC *ed = [[AMEffectCategoryEditorVC alloc] init];
+    ed.isCreating = NO;
+    ed.isUserCategory = isUser;
+    ed.categoryId = cid;
+    if (isUser) {
+        for (NSDictionary *uc in (cfg[@"userCategories"] ?: @[])) {
+            if ([uc[@"id"] longLongValue] == cid) {
+                ed.initialName = uc[@"name"];
+                ed.initialImageFile = uc[@"image"];
+                break;
+            }
+        }
+    } else {
+        NSString *idKey = [NSString stringWithFormat:@"%lld", (long long)cid];
+        NSDictionary *ov = cfg[@"overrides"][idKey];
+        for (NSDictionary *b in AMBuiltinCategoryCatalog()) {
+            if ([b[@"id"] longLongValue] == cid) {
+                ed.initialName = ([ov[@"name"] isKindOfClass:[NSString class]] && [ov[@"name"] length] > 0) ? ov[@"name"] : b[@"name"];
+                ed.initialImageFile = [ov[@"image"] isKindOfClass:[NSString class]] ? ov[@"image"] : @"";
+                ed.builtinThumbName = b[@"thumb"];
+                break;
+            }
+        }
+    }
+    ed.modalPresentationStyle = UIModalPresentationPageSheet;
+    __weak typeof(self) weakSelf = self;
+    ed.onSaved = ^{
+        [weakSelf reloadLists];
+    };
+    [self presentViewController:ed animated:YES completion:nil];
+}
+
+- (void)onDeleteCategory:(UIButton *)btn {
+    int64_t cid = (int64_t)btn.tag;
+    BOOL isUser = [btn.accessibilityValue isEqualToString:@"user"];
+    NSMutableDictionary *cfg = AMLoadCategoriesConfig();
+    if (isUser) {
+        NSMutableArray *userCats = cfg[@"userCategories"];
+        for (NSUInteger i = 0; i < userCats.count; ++i) {
+            if ([userCats[i][@"id"] longLongValue] == cid) {
+                NSString *imgFile = userCats[i][@"image"];
+                if (imgFile.length > 0) {
+                    [[NSFileManager defaultManager] removeItemAtPath:[AMCustomCategoryThumbsDir() stringByAppendingPathComponent:imgFile] error:nil];
+                    [AMCategoryThumbCache() removeObjectForKey:imgFile];
+                }
+                [userCats removeObjectAtIndex:i];
+                break;
+            }
+        }
+    } else {
+        NSMutableArray *delIds = cfg[@"deletedIds"];
+        if (![delIds containsObject:@(cid)]) {
+            [delIds addObject:@(cid)];
+        }
+    }
+    AMSaveCategoriesConfig(cfg);
+    [self reloadLists];
+}
+
+- (void)onRestoreBuiltin:(UIButton *)btn {
+    int64_t cid = (int64_t)btn.tag;
+    NSMutableDictionary *cfg = AMLoadCategoriesConfig();
+    NSMutableArray *delIds = cfg[@"deletedIds"];
+    [delIds removeObject:@(cid)];
+    AMSaveCategoriesConfig(cfg);
+    [self reloadLists];
+}
+
+@end
+
+@interface AMCategoryManagerPresenter : NSObject
++ (void)onTapManageCategories:(UIButton *)btn;
+@end
+
+@implementation AMCategoryManagerPresenter
++ (void)onTapManageCategories:(UIButton *)btn {
+    UIViewController *vc = objc_getAssociatedObject(btn, kAMManageCatBtnKey);
+    if (!vc) return;
+    AMEffectCategoriesManagerVC *mgr = [[AMEffectCategoriesManagerVC alloc] init];
+    mgr.modalPresentationStyle = UIModalPresentationPageSheet;
+    [vc presentViewController:mgr animated:YES completion:nil];
+}
+@end
+
+static void AMHook_effectMainViewDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (gOrigEffectMainViewDidAppear) {
+        ((void (*)(id, SEL, BOOL))gOrigEffectMainViewDidAppear)(self, _cmd, animated);
+    }
+    UIViewController *vc = (UIViewController *)self;
+    if (objc_getAssociatedObject(vc, kAMManageCatBtnKey)) return;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (objc_getAssociatedObject(vc, kAMManageCatBtnKey)) return;
+        UIView *catCV = nil;
+        @try {
+            id obj = [vc valueForKey:@"categoriesCollectionView"];
+            if ([obj isKindOfClass:[UIView class]]) catCV = (UIView *)obj;
+        } @catch (NSException *ex) { (void)ex; }
+
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+        btn.translatesAutoresizingMaskIntoConstraints = NO;
+        [btn setTitle:@"Edit Categories" forState:UIControlStateNormal];
+        [btn setTitleColor:[UIColor colorWithWhite:0.90 alpha:1.0] forState:UIControlStateNormal];
+        btn.titleLabel.font = AMThemeFont(11.0, UIFontWeightSemibold);
+        btn.backgroundColor = AMSurfaceColor();
+        btn.layer.cornerRadius = 11.0;
+        btn.layer.borderWidth = 0.75;
+        btn.layer.borderColor = AMBorderColor().CGColor;
+        btn.contentEdgeInsets = UIEdgeInsetsMake(4, 10, 4, 10);
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *symCfg = [UIImageSymbolConfiguration configurationWithPointSize:10.5 weight:UIImageSymbolWeightSemibold];
+            [btn setImage:[UIImage systemImageNamed:@"slider.horizontal.3" withConfiguration:symCfg] forState:UIControlStateNormal];
+            btn.tintColor = AMAccentGreenColor();
+            btn.imageEdgeInsets = UIEdgeInsetsMake(0, -3, 0, 3);
+        }
+        objc_setAssociatedObject(btn, kAMManageCatBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
+        [btn addTarget:[AMCategoryManagerPresenter class]
+                action:@selector(onTapManageCategories:)
+      forControlEvents:UIControlEventTouchUpInside];
+
+        UIView *host = catCV.superview ?: vc.view;
+        [host addSubview:btn];
+        if (catCV && catCV.superview == host) {
+            [NSLayoutConstraint activateConstraints:@[
+                [btn.trailingAnchor constraintEqualToAnchor:catCV.trailingAnchor constant:-10.0],
+                [btn.bottomAnchor constraintEqualToAnchor:catCV.topAnchor constant:-4.0],
+                [btn.heightAnchor constraintEqualToConstant:24.0],
+            ]];
+        } else {
+            [NSLayoutConstraint activateConstraints:@[
+                [btn.trailingAnchor constraintEqualToAnchor:host.safeAreaLayoutGuide.trailingAnchor constant:-12.0],
+                [btn.bottomAnchor constraintEqualToAnchor:host.safeAreaLayoutGuide.bottomAnchor constant:-12.0],
+                [btn.heightAnchor constraintEqualToConstant:26.0],
+            ]];
+        }
+        objc_setAssociatedObject(vc, kAMManageCatBtnKey, btn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    });
+}
+
+// ============================================================================
+// Module 3C: Custom XML Effect Importer Modal UI, AI Downloads, & '+' Button
 // ============================================================================
 
 @interface AMCustomEffectImporterVC : UIViewController <UIDocumentPickerDelegate, UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+@property (nonatomic, copy, nullable) NSString *initialCategorySlug;
+@property (nonatomic, copy, nullable) NSString *initialCategoryName;
+@property (nonatomic, copy) NSString *selectedCategorySlug;
+@property (nonatomic, copy) NSString *selectedCategoryName;
+@property (nonatomic, strong) UIButton *categoryPickBtn;
+@property (nonatomic, strong) UIButton *downloadAllBtn;
 @property (nonatomic, strong) UITextField *nameField;
 @property (nonatomic, strong) UITextView *xmlTextView;
 @property (nonatomic, strong) UIImageView *thumbPreview;
@@ -1287,6 +2370,8 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
     [super viewDidLoad];
     self.view.backgroundColor = AMBgColor();
     self.title = @"Import XML Effect";
+    self.selectedCategorySlug = self.initialCategorySlug.length > 0 ? self.initialCategorySlug : @"custom";
+    self.selectedCategoryName = self.initialCategoryName.length > 0 ? self.initialCategoryName : @"Custom";
 
     UIScrollView *scroll = [[UIScrollView alloc] init];
     scroll.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1340,6 +2425,27 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
     [importBtn.widthAnchor constraintEqualToConstant:60.0].active = YES;
     [stack addArrangedSubview:topRow];
 
+    [stack addArrangedSubview:[self makeSectionLabel:@"AI EFFECT AUTHORING RESOURCES"]];
+    UIStackView *aiRow = [[UIStackView alloc] init];
+    aiRow.axis = UILayoutConstraintAxisHorizontal;
+    aiRow.spacing = 10.0;
+    aiRow.distribution = UIStackViewDistributionFillEqually;
+
+    UIButton *guideBtn = [self makeActionButton:@"Effects Guide (.md)" action:@selector(onDownloadGuide:)];
+    self.downloadAllBtn = [self makeActionButton:@"All Effects (.md)" action:@selector(onDownloadAllEffects:)];
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *symCfg = [UIImageSymbolConfiguration configurationWithPointSize:12.5 weight:UIImageSymbolWeightSemibold];
+        [guideBtn setImage:[UIImage systemImageNamed:@"doc.text" withConfiguration:symCfg] forState:UIControlStateNormal];
+        guideBtn.tintColor = AMAccentGreenColor();
+        guideBtn.imageEdgeInsets = UIEdgeInsetsMake(0, -4, 0, 4);
+        [self.downloadAllBtn setImage:[UIImage systemImageNamed:@"arrow.down.doc" withConfiguration:symCfg] forState:UIControlStateNormal];
+        self.downloadAllBtn.tintColor = AMAccentGreenColor();
+        self.downloadAllBtn.imageEdgeInsets = UIEdgeInsetsMake(0, -4, 0, 4);
+    }
+    [aiRow addArrangedSubview:guideBtn];
+    [aiRow addArrangedSubview:self.downloadAllBtn];
+    [stack addArrangedSubview:aiRow];
+
     [stack addArrangedSubview:[self makeSectionLabel:@"EFFECT NAME"]];
     self.nameField = [[UITextField alloc] init];
     self.nameField.backgroundColor = AMInputSurfaceColor();
@@ -1355,6 +2461,19 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
     self.nameField.leftViewMode = UITextFieldViewModeAlways;
     [self.nameField.heightAnchor constraintEqualToConstant:44.0].active = YES;
     [stack addArrangedSubview:self.nameField];
+
+    [stack addArrangedSubview:[self makeSectionLabel:@"CATEGORY"]];
+    UIStackView *catRow = [[UIStackView alloc] init];
+    catRow.axis = UILayoutConstraintAxisHorizontal;
+    catRow.spacing = 10.0;
+
+    self.categoryPickBtn = [self makeActionButton:[NSString stringWithFormat:@"Category: %@", self.selectedCategoryName] action:@selector(onChooseCategory:)];
+    UIButton *manageCatsBtn = [self makeActionButton:@"Manage Categories" action:@selector(onOpenManageCategories)];
+    [manageCatsBtn setTitleColor:AMAccentGreenColor() forState:UIControlStateNormal];
+    [manageCatsBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [catRow addArrangedSubview:self.categoryPickBtn];
+    [catRow addArrangedSubview:manageCatsBtn];
+    [stack addArrangedSubview:catRow];
 
     [stack addArrangedSubview:[self makeSectionLabel:@"THUMBNAIL (OPTIONAL)"]];
     UIStackView *thumbRow = [[UIStackView alloc] init];
@@ -1442,6 +2561,164 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
     return b;
 }
 
+- (void)presentShareForFileURL:(NSURL *)url sourceButton:(UIButton *)btn {
+    if (!url) return;
+    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    if (avc.popoverPresentationController && btn) {
+        avc.popoverPresentationController.sourceView = btn;
+        avc.popoverPresentationController.sourceRect = btn.bounds;
+    }
+    [self presentViewController:avc animated:YES completion:nil];
+}
+
+- (void)onDownloadGuide:(UIButton *)btn {
+    NSString *srcPath = [[NSBundle mainBundle] pathForResource:@"AlightMotion_Effects_Guide" ofType:@"md"];
+    NSString *dstPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"AlightMotion_Effects_Guide.md"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:dstPath error:nil];
+
+    if (srcPath && [fm fileExistsAtPath:srcPath]) {
+        NSError *err = nil;
+        if (![fm copyItemAtPath:srcPath toPath:dstPath error:&err]) {
+            [self showAlertTitle:@"Export Failed" message:(err.localizedDescription ?: @"Could not copy guide file.")];
+            return;
+        }
+        [self presentShareForFileURL:[NSURL fileURLWithPath:dstPath] sourceButton:btn];
+        return;
+    }
+
+    NSString *fallback = @"# Alight Motion Custom Effects Guide\n\nBundle file AlightMotion_Effects_Guide.md not found in app bundle.\n";
+    [fallback writeToFile:dstPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [self presentShareForFileURL:[NSURL fileURLWithPath:dstPath] sourceButton:btn];
+}
+
+- (void)onDownloadAllEffects:(UIButton *)btn {
+    btn.enabled = NO;
+    [btn setTitle:@"Packing..." forState:UIControlStateNormal];
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *builtinDir = [[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:@"BuiltinEffects"];
+        NSArray<NSString *> *builtinFiles = [[fm contentsOfDirectoryAtPath:builtinDir error:nil]
+                                             sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+        NSMutableArray<NSString *> *xmlNames = [NSMutableArray array];
+        for (NSString *fn in builtinFiles) {
+            if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
+                [xmlNames addObject:fn];
+            }
+        }
+
+        NSString *customDir = AMCustomEffectsDir();
+        NSArray<NSString *> *customFiles = [[fm contentsOfDirectoryAtPath:customDir error:nil]
+                                            sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+        NSMutableArray<NSString *> *customXmlNames = [NSMutableArray array];
+        for (NSString *fn in customFiles) {
+            if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
+                [customXmlNames addObject:fn];
+            }
+        }
+
+        NSMutableString *md = [NSMutableString stringWithCapacity:1500000];
+        [md appendString:@"# Alight Motion — Complete Effects XML Reference\n\n"];
+        [md appendFormat:@"Exported from Alight Motion iOS bundle. Contains **%lu built-in effects** and **%lu custom effects**.\n",
+                         (unsigned long)xmlNames.count, (unsigned long)customXmlNames.count];
+        [md appendString:@"Use alongside `AlightMotion_Effects_Guide.md` as real reference implementations for AI custom effect authoring.\n\n"];
+
+        [md appendString:@"## Built-in Effects\n\n"];
+        for (NSString *fn in xmlNames) {
+            @autoreleasepool {
+                NSString *p = [builtinDir stringByAppendingPathComponent:fn];
+                NSString *xml = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+                if (!xml) continue;
+                [md appendFormat:@"### %@\n\n```xml\n%@\n```\n\n", fn, xml];
+            }
+        }
+
+        if (customXmlNames.count > 0) {
+            [md appendString:@"## Installed Custom Effects\n\n"];
+            for (NSString *fn in customXmlNames) {
+                @autoreleasepool {
+                    NSString *p = [customDir stringByAppendingPathComponent:fn];
+                    NSString *xml = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+                    if (!xml) continue;
+                    [md appendFormat:@"### %@\n\n```xml\n%@\n```\n\n", fn, xml];
+                }
+            }
+        }
+
+        NSString *dstPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"AlightMotion_All_Effects.md"];
+        NSError *writeErr = nil;
+        BOOL ok = [md writeToFile:dstPath atomically:YES encoding:NSUTF8StringEncoding error:&writeErr];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            btn.enabled = YES;
+            [btn setTitle:@"All Effects (.md)" forState:UIControlStateNormal];
+            if (!ok) {
+                [self showAlertTitle:@"Export Failed" message:(writeErr.localizedDescription ?: @"Could not write effects bundle.")];
+                return;
+            }
+            [self presentShareForFileURL:[NSURL fileURLWithPath:dstPath] sourceButton:btn];
+        });
+    });
+}
+
+- (void)onChooseCategory:(UIButton *)btn {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Effect Category"
+                                                                   message:@"Choose which category this custom effect will appear in."
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    NSDictionary *cfg = AMLoadCategoriesConfig();
+    NSSet<NSNumber *> *deletedSet = [NSSet setWithArray:(cfg[@"deletedIds"] ?: @[])];
+    NSDictionary *overrides = cfg[@"overrides"] ?: @{};
+
+    if (![deletedSet containsObject:@(113)]) {
+        NSDictionary *ov = overrides[@"113"];
+        NSString *cname = ([ov[@"name"] isKindOfClass:[NSString class]] && [ov[@"name"] length] > 0) ? ov[@"name"] : @"Custom";
+        [sheet addAction:[UIAlertAction actionWithTitle:cname style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+            (void)a;
+            self.selectedCategorySlug = @"custom";
+            self.selectedCategoryName = cname;
+            [self.categoryPickBtn setTitle:[NSString stringWithFormat:@"Category: %@", cname] forState:UIControlStateNormal];
+        }]];
+    }
+    for (NSDictionary *uc in (cfg[@"userCategories"] ?: @[])) {
+        NSString *uname = uc[@"name"];
+        NSString *uslug = uc[@"slug"];
+        if (uname.length == 0 || uslug.length == 0) continue;
+        [sheet addAction:[UIAlertAction actionWithTitle:uname style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+            (void)a;
+            self.selectedCategorySlug = uslug;
+            self.selectedCategoryName = uname;
+            [self.categoryPickBtn setTitle:[NSString stringWithFormat:@"Category: %@", uname] forState:UIControlStateNormal];
+        }]];
+    }
+    for (NSDictionary *b in AMBuiltinCategoryCatalog()) {
+        int64_t cid = [b[@"id"] longLongValue];
+        if (cid == 113 || [deletedSet containsObject:@(cid)]) continue;
+        NSString *idKey = [NSString stringWithFormat:@"%lld", (long long)cid];
+        NSDictionary *ov = overrides[idKey];
+        NSString *bname = ([ov[@"name"] isKindOfClass:[NSString class]] && [ov[@"name"] length] > 0) ? ov[@"name"] : b[@"name"];
+        NSString *bslug = b[@"slug"];
+        [sheet addAction:[UIAlertAction actionWithTitle:bname style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+            (void)a;
+            self.selectedCategorySlug = bslug;
+            self.selectedCategoryName = bname;
+            [self.categoryPickBtn setTitle:[NSString stringWithFormat:@"Category: %@", bname] forState:UIControlStateNormal];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    if (sheet.popoverPresentationController) {
+        sheet.popoverPresentationController.sourceView = btn;
+        sheet.popoverPresentationController.sourceRect = btn.bounds;
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)onOpenManageCategories {
+    AMEffectCategoriesManagerVC *mgr = [[AMEffectCategoriesManagerVC alloc] init];
+    mgr.modalPresentationStyle = UIModalPresentationPageSheet;
+    [self presentViewController:mgr animated:YES completion:nil];
+}
+
 - (void)reloadInstalledList {
     for (UIView *v in [self.installedListStack.arrangedSubviews copy]) {
         [self.installedListStack removeArrangedSubview:v];
@@ -1504,9 +2781,9 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
     if (self.nameField.text.length == 0) {
         self.nameField.text = @"Custom Invert";
     }
-    self.xmlTextView.text =
+    self.xmlTextView.text = [NSString stringWithFormat:
         @"<?xml version='1.0' encoding='UTF-8' ?>\n"
-        @"<effect id=\"com.alightcreative.effects.custom_invert\" compat=\"acScreenNorm-y\" name=\"Custom Invert\" desc=\"Inverts layer colors\" category=\"custom\" tags=\"custom\" thumb=\"thumb/copy-bg.webp\">\n"
+        @"<effect id=\"com.alightcreative.effects.custom_invert\" compat=\"acScreenNorm-y\" name=\"Custom Invert\" desc=\"Inverts layer colors\" category=\"%@\" tags=\"custom\" thumb=\"thumb/copy-bg.webp\">\n"
         @"    <params>\n"
         @"        <texture id=\"inputImg\" srcType=\"content\" />\n"
         @"        <spinner id=\"strength\" default=\"1.0\" min=\"0.0\" max=\"1.0\" step=\"0.01\" label=\"Strength\" type=\"percent\" />\n"
@@ -1514,11 +2791,13 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
         @"    <shader type=\"fragment\" precision=\"high\"><![CDATA[\n"
         @"        void main() {\n"
         @"            vec4 c = texture2DCv(inputImg.texture, acScreenNorm);\n"
-        @"            vec3 inv = vec3(1.0) - c.rgb;\n"
-        @"            gl_FragColor = vec4(mix(c.rgb, inv, strength), c.a);\n"
+        @"            vec3 rgb = (c.a > 0.0001) ? (c.rgb / c.a) : vec3(0.0);\n"
+        @"            vec3 inv = vec3(1.0) - rgb;\n"
+        @"            gl_FragColor = vec4(mix(rgb, inv, strength) * c.a, c.a);\n"
         @"        }\n"
         @"    ]]></shader>\n"
-        @"</effect>\n";
+        @"</effect>\n",
+        AMXmlEscapeAttr(self.selectedCategorySlug ?: @"custom")];
 }
 
 - (void)onPasteXML {
@@ -1610,7 +2889,7 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
     }
     NSString *slug = AMSanitizeSlug(name);
     NSError *err = nil;
-    NSString *prepared = AMPrepareEffectXML(self.xmlTextView.text, name, slug, &err);
+    NSString *prepared = AMPrepareEffectXML(self.xmlTextView.text, name, slug, self.selectedCategorySlug, &err);
     if (!prepared) {
         [self showAlertTitle:@"Invalid Effect Code" message:(err.localizedDescription ?: @"Could not parse XML/GLSL.")];
         return;
@@ -1636,7 +2915,7 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
 
     [self reloadInstalledList];
     UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Custom Effect Created"
-                                                                  message:[NSString stringWithFormat:@"'%@' is saved. Reopen Alight Motion so its own effect box loads in Effects > Custom, then tap it to apply to any layer.", name]
+                                                                  message:[NSString stringWithFormat:@"'%@' is saved to %@. Reopen Alight Motion so its effect box loads, then tap it to apply to any layer.", name, self.selectedCategoryName ?: @"Custom"]
                                                            preferredStyle:UIAlertControllerStyleAlert];
     [done addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:^(__kindof UIAlertAction * _Nonnull a) {
         (void)a;
@@ -1653,25 +2932,44 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
 
 static IMP gOrigEffectCatViewWillAppear = NULL;
 static const void *kAMImportPlusBtnKey = &kAMImportPlusBtnKey;
+static const void *kAMImportPlusCatInfoKey = &kAMImportPlusCatInfoKey;
 
-static BOOL AMViewHierarchyContainsCustomTitle(UIView *v, NSInteger depth) {
-    if (!v || depth > 5) return NO;
-    if ([v isKindOfClass:[UILabel class]]) {
-        NSString *t = ((UILabel *)v).text;
-        if (t && [t caseInsensitiveCompare:@"Custom"] == NSOrderedSame) return YES;
+static NSDictionary *AMMatchingUserCategoryForTitle(NSString *t) {
+    if (t.length == 0) return nil;
+    for (NSDictionary *d in gAMActiveRuntimeCategories) {
+        if ([d[@"isUser"] boolValue] && [d[@"name"] caseInsensitiveCompare:t] == NSOrderedSame) {
+            return d;
+        }
     }
-    for (UIView *sub in v.subviews) {
-        if (AMViewHierarchyContainsCustomTitle(sub, depth + 1)) return YES;
+    if ([t caseInsensitiveCompare:@"Custom"] == NSOrderedSame) {
+        return @{@"name": @"Custom", @"slug": @"custom", @"isUser": @YES};
     }
-    return NO;
+    return nil;
 }
 
-static BOOL AMIsCustomEffectCategoryVC(UIViewController *vc) {
-    if (vc.title && [vc.title caseInsensitiveCompare:@"Custom"] == NSOrderedSame) return YES;
-    if (vc.navigationItem.title && [vc.navigationItem.title caseInsensitiveCompare:@"Custom"] == NSOrderedSame) return YES;
-    if (vc.navigationController && AMViewHierarchyContainsCustomTitle(vc.navigationController.navigationBar, 0)) return YES;
-    if (AMViewHierarchyContainsCustomTitle(vc.view, 0)) return YES;
-    return NO;
+static NSDictionary *AMFindUserCategoryInHierarchy(UIView *v, NSInteger depth) {
+    if (!v || depth > 5) return nil;
+    if ([v isKindOfClass:[UILabel class]]) {
+        NSDictionary *hit = AMMatchingUserCategoryForTitle(((UILabel *)v).text);
+        if (hit) return hit;
+    }
+    for (UIView *sub in v.subviews) {
+        NSDictionary *hit = AMFindUserCategoryInHierarchy(sub, depth + 1);
+        if (hit) return hit;
+    }
+    return nil;
+}
+
+static NSDictionary *AMUserCategoryForCategoryVC(UIViewController *vc) {
+    NSDictionary *hit = AMMatchingUserCategoryForTitle(vc.title);
+    if (hit) return hit;
+    hit = AMMatchingUserCategoryForTitle(vc.navigationItem.title);
+    if (hit) return hit;
+    if (vc.navigationController) {
+        hit = AMFindUserCategoryInHierarchy(vc.navigationController.navigationBar, 0);
+        if (hit) return hit;
+    }
+    return AMFindUserCategoryInHierarchy(vc.view, 0);
 }
 
 @interface AMEffectImportPresenter : NSObject
@@ -1683,7 +2981,10 @@ static BOOL AMIsCustomEffectCategoryVC(UIViewController *vc) {
 + (void)onTapPlus:(UIButton *)btn {
     UIViewController *vc = objc_getAssociatedObject(btn, kAMImportPlusBtnKey);
     if (!vc) return;
+    NSDictionary *catInfo = objc_getAssociatedObject(btn, kAMImportPlusCatInfoKey);
     AMCustomEffectImporterVC *importer = [[AMCustomEffectImporterVC alloc] init];
+    importer.initialCategorySlug = catInfo[@"slug"] ?: @"custom";
+    importer.initialCategoryName = catInfo[@"name"] ?: @"Custom";
     importer.modalPresentationStyle = UIModalPresentationPageSheet;
     [vc presentViewController:importer animated:YES completion:nil];
 }
@@ -1697,13 +2998,14 @@ static void AMHook_effectCategoryViewWillAppear(id self, SEL _cmd, BOOL animated
 
     UIViewController *vc = (UIViewController *)self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        BOOL isCustom = AMIsCustomEffectCategoryVC(vc);
+        NSDictionary *catInfo = AMUserCategoryForCategoryVC(vc);
         UIButton *existing = objc_getAssociatedObject(vc, kAMImportPlusBtnKey);
-        if (!isCustom) {
+        if (!catInfo) {
             if (existing) existing.hidden = YES;
             return;
         }
         if (existing) {
+            objc_setAssociatedObject(existing, kAMImportPlusCatInfoKey, catInfo, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             existing.hidden = NO;
             return;
         }
@@ -1729,6 +3031,7 @@ static void AMHook_effectCategoryViewWillAppear(id self, SEL _cmd, BOOL animated
         ]];
 
         objc_setAssociatedObject(plusBtn, kAMImportPlusBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
+        objc_setAssociatedObject(plusBtn, kAMImportPlusCatInfoKey, catInfo, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [plusBtn addTarget:[AMEffectImportPresenter class]
                     action:@selector(onTapPlus:)
           forControlEvents:UIControlEventTouchUpInside];
@@ -5527,6 +6830,11 @@ static void AlightMotionModsInit(void) {
                     @"collectionView:willDisplayCell:forItemAtIndexPath:",
                     (IMP)AMHook_effectMainWillDisplayCell,
                     &gOrigEffectMainWillDisplayCell);
+
+    AMSwizzleMethod(@"_TtC12AlightMotion18EffectPickerMainVC",
+                    @"viewDidAppear:",
+                    (IMP)AMHook_effectMainViewDidAppear,
+                    &gOrigEffectMainViewDidAppear);
 
     AMSwizzleMethod(@"_TtC12AlightMotion22EffectPickerCategoryVC",
                     @"viewWillAppear:",
