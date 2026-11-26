@@ -777,7 +777,17 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
 static NSString *AMCustomEffectsDir(void) {
     NSArray<NSString *> *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *dir = [docs.firstObject stringByAppendingPathComponent:@"CustomEffects"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *relThumbDir = [dir stringByAppendingPathComponent:@"thumb"];
+    [fm createDirectoryAtPath:relThumbDir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *dstWebp = [relThumbDir stringByAppendingPathComponent:@"box.webp"];
+    if (![fm fileExistsAtPath:dstWebp]) {
+        NSString *srcWebp = [[[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"BuiltinEffects/thumb"] stringByAppendingPathComponent:@"box.webp"];
+        if ([fm fileExistsAtPath:srcWebp]) {
+            [fm copyItemAtPath:srcWebp toPath:dstWebp error:nil];
+        }
+    }
     return dir;
 }
 
@@ -832,7 +842,7 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
         if ([trimmed containsString:@"void main"] || [trimmed containsString:@"gl_FragColor"]) {
             NSString *wrapped = [NSString stringWithFormat:
                 @"<?xml version='1.0' encoding='UTF-8' ?>\n"
-                @"<effect id=\"com.alightcreative.effects.custom_%@\" compat=\"acScreenNorm-y\" name=\"%@\" desc=\"Custom Effect\" category=\"custom\" tags=\"custom\" thumb=\"thumb/copy-bg.webp\">\n"
+                @"<effect id=\"com.alightcreative.effects.custom_%@\" compat=\"acScreenNorm-y\" name=\"%@\" desc=\"Custom Effect\" category=\"custom\" tags=\"custom\" thumb=\"thumb/box.webp\">\n"
                 @"    <params>\n"
                 @"        <texture id=\"inputImg\" srcType=\"content\" />\n"
                 @"    </params>\n"
@@ -881,10 +891,15 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
         }
     };
 
-    // Strip flags that hide an effect from the picker grid
+    // Strip flags that hide an effect from the picker grid and non-iOS <effect> attributes
+    // that trigger XMLPullParser "Did not consume all element contents for <effect>" try! crash
     removeAttr(@"internal");
     removeAttr(@"deprecated");
     removeAttr(@"experimental");
+    removeAttr(@"description");
+    removeAttr(@"author");
+    removeAttr(@"version");
+    removeAttr(@"type");
 
     // Always assign a unique com.alightcreative.effects.custom_<slug> ID so it gets its own box
     // and never collides with a built-in effect
@@ -893,12 +908,42 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
     setAttr(@"name", displayName);
     setAttr(@"desc", @"Custom Effect");
     setAttr(@"tags", @"custom");
-    // Use a guaranteed-valid built-in WebP thumb for Alight Motion's WebP loader;
+    // Use a guaranteed-valid built-in WebP thumb copied into CustomEffects/thumb/box.webp;
     // our cell willDisplayCell hook overlays any custom user PNG thumbnail cleanly!
-    setAttr(@"thumb", @"thumb/copy-bg.webp");
+    setAttr(@"thumb", @"thumb/box.webp");
 
     NSMutableString *result = [trimmed mutableCopy];
     [result replaceCharactersInRange:tagRange withString:openTag];
+
+    // Reject pure-JS <script> effects that lack <shader> (unsupported V8 JS runtime on iOS)
+    if ([result rangeOfString:@"<shader" options:NSCaseInsensitiveSearch].location == NSNotFound) {
+        if (outError) {
+            *outError = [NSError errorWithDomain:@"AMCustomEffects" code:4
+                                        userInfo:@{NSLocalizedDescriptionKey: @"JavaScript-only <script> effects without a <shader> are not supported by iOS Metal."}];
+        }
+        return nil;
+    }
+
+    // Strip non-external <script> blocks if present alongside <shader>
+    {
+        NSRegularExpression *scriptRx = [NSRegularExpression regularExpressionWithPattern:@"<script(?![^>]*\\bexternal\\s*=)[^>]*>[\\s\\S]*?</script>"
+                                                                                  options:NSRegularExpressionCaseInsensitive
+                                                                                    error:nil];
+        [scriptRx replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:@""];
+    }
+
+    // Normalize <shader precision="medium"> -> precision="high" and <spinner type="integer"> -> snap="true"
+    {
+        NSRegularExpression *precRx = [NSRegularExpression regularExpressionWithPattern:@"(<shader\\b[^>]*\\bprecision\\s*=\\s*\")medium(\")"
+                                                                                options:NSRegularExpressionCaseInsensitive
+                                                                                  error:nil];
+        [precRx replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:@"$1high$2"];
+
+        NSRegularExpression *intSpinRx = [NSRegularExpression regularExpressionWithPattern:@"(<spinner\\b[^>]*)\\btype\\s*=\\s*\"integer\""
+                                                                                   options:NSRegularExpressionCaseInsensitive
+                                                                                     error:nil];
+        [intSpinRx replaceMatchesInString:result options:0 range:NSMakeRange(0, result.length) withTemplate:@"$1snap=\"true\""];
+    }
 
     // Normalize bare <shader> tags missing type="fragment" (common in Android/Gold Motion XMLs)
     {
@@ -1608,6 +1653,138 @@ static void AMHook_effectMainWillDisplayCell(id self, SEL _cmd, UICollectionView
 
 static IMP gOrigURLsForResources = NULL;
 
+@interface AMEffectXMLSafetyValidator : NSObject <NSXMLParserDelegate>
+@property (nonatomic, assign) BOOL valid;
+@property (nonatomic, assign) BOOL sawEffectRoot;
+@property (nonatomic, assign) BOOL sawShader;
+@end
+
+@implementation AMEffectXMLSafetyValidator
+
++ (NSDictionary<NSString *, NSSet<NSString *> *> *)allowedSchema {
+    static NSDictionary<NSString *, NSSet<NSString *> *> *schema = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        schema = @{
+            @"effect":     [NSSet setWithArray:@[@"affinity", @"afxver", @"auto-transform", @"category", @"compat", @"deprecated", @"desc", @"experimental", @"id", @"internal", @"max-overdraw", @"maxOverdraw", @"name", @"overdraw", @"tags", @"thumb", @"type"]],
+            @"params":     [NSSet set],
+            @"spinner":    [NSSet setWithArray:@[@"id", @"default", @"min", @"max", @"label", @"step", @"ticks", @"type", @"snap", @"enabled", @"multiplier", @"logscale", @"originValue", @"valueOrigin"]],
+            @"slider":     [NSSet setWithArray:@[@"id", @"default", @"min", @"max", @"label", @"step", @"ticks", @"type", @"snap", @"logscale", @"enabled", @"originValue"]],
+            @"switch":     [NSSet setWithArray:@[@"id", @"default", @"label", @"enableTargets", @"enabled"]],
+            @"color":      [NSSet setWithArray:@[@"id", @"default", @"label", @"alpha", @"enabled"]],
+            @"point":      [NSSet setWithArray:@[@"id", @"label", @"default", @"min", @"max", @"step", @"enabled"]],
+            @"selector":   [NSSet setWithArray:@[@"id", @"style", @"default", @"label", @"enabled"]],
+            @"choice":     [NSSet setWithArray:@[@"label", @"value", @"enableTargets"]],
+            @"section":    [NSSet setWithArray:@[@"text", @"hintType", @"label", @"enabled"]],
+            @"texture":    [NSSet setWithArray:@[@"id", @"srcType", @"downsample", @"src", @"label", @"enabled"]],
+            @"shader":     [NSSet setWithArray:@[@"type", @"precision", @"group", @"fastMath"]],
+            @"passes":     [NSSet set],
+            @"pass":       [NSSet setWithArray:@[@"target", @"blend", @"effect", @"src"]],
+            @"iterations": [NSSet setWithArray:@[@"param", @"count"]],
+            @"strings":    [NSSet set],
+            @"locale":     [NSSet setWithArray:@[@"lang"]],
+            @"string":     [NSSet setWithArray:@[@"name"]],
+            @"tip":        [NSSet setWithArray:@[@"text"]],
+            @"xyz":        [NSSet setWithArray:@[@"id", @"label", @"type", @"applyto", @"default", @"step", @"ticks", @"enabled"]],
+            @"orient":     [NSSet setWithArray:@[@"id", @"label", @"invert", @"default", @"enabled"]],
+            @"hue-disc":   [NSSet setWithArray:@[@"id", @"label", @"bias", @"default", @"enabled"]],
+            @"hue-ring":   [NSSet setWithArray:@[@"id", @"label", @"default", @"enabled"]],
+            @"presets":    [NSSet set],
+            @"preset":     [NSSet setWithArray:@[@"id", @"label", @"timescale", @"timing", @"short-code", @"group"]],
+            @"property":   [NSSet setWithArray:@[@"name", @"type", @"value"]],
+            @"kf":         [NSSet setWithArray:@[@"t", @"v"]],
+            @"float":      [NSSet setWithArray:@[@"id", @"value"]],
+            @"script":     [NSSet setWithArray:@[@"external"]],
+        };
+    });
+    return schema;
+}
+
+- (instancetype)init {
+    if ((self = [super init])) {
+        _valid = YES;
+    }
+    return self;
+}
+
+- (void)parser:(NSXMLParser *)parser didStartElement:(NSString *)elementName
+  namespaceURI:(NSString *)namespaceURI qualifiedName:(NSString *)qName
+    attributes:(NSDictionary<NSString *, NSString *> *)attributeDict {
+    (void)namespaceURI; (void)qName;
+    NSDictionary<NSString *, NSSet<NSString *> *> *schema = [AMEffectXMLSafetyValidator allowedSchema];
+    NSSet<NSString *> *allowedAttrs = schema[elementName];
+    if (!allowedAttrs) {
+        self.valid = NO;
+        [parser abortParsing];
+        return;
+    }
+    for (NSString *attr in attributeDict) {
+        if (![allowedAttrs containsObject:attr]) {
+            self.valid = NO;
+            [parser abortParsing];
+            return;
+        }
+    }
+    if ([elementName isEqualToString:@"effect"]) {
+        self.sawEffectRoot = YES;
+        if (attributeDict[@"id"].length == 0 || attributeDict[@"name"].length == 0) {
+            self.valid = NO;
+            [parser abortParsing];
+            return;
+        }
+        NSString *effType = [attributeDict[@"type"] uppercaseString];
+        if (effType && ![effType isEqualToString:@"SHADER"] && ![effType isEqualToString:@"TEXT"] && ![effType isEqualToString:@"DRAWING"]) {
+            self.valid = NO;
+            [parser abortParsing];
+            return;
+        }
+    } else if ([elementName isEqualToString:@"shader"]) {
+        self.sawShader = YES;
+        NSString *st = attributeDict[@"type"];
+        if (![st isEqualToString:@"fragment"] && ![st isEqualToString:@"vertex"]) {
+            self.valid = NO;
+            [parser abortParsing];
+            return;
+        }
+        NSString *pr = attributeDict[@"precision"];
+        if (pr && ![pr isEqualToString:@"low"] && ![pr isEqualToString:@"medium"] && ![pr isEqualToString:@"high"]) {
+            self.valid = NO;
+            [parser abortParsing];
+            return;
+        }
+    }
+}
+
+@end
+
+static BOOL AMIsEffectXMLSafeForIOSParser(NSString *path, NSMutableSet<NSString *> *seenIds) {
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (!data || data.length == 0) return NO;
+    NSXMLParser *parser = [[NSXMLParser alloc] initWithData:data];
+    AMEffectXMLSafetyValidator *val = [[AMEffectXMLSafetyValidator alloc] init];
+    parser.delegate = val;
+    BOOL ok = [parser parse];
+    if (!ok || !val.valid || !val.sawEffectRoot || !val.sawShader) return NO;
+
+    // Prevent duplicate effect IDs across external XMLs
+    NSString *str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (str) {
+        static NSRegularExpression *idRx = nil;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            idRx = [NSRegularExpression regularExpressionWithPattern:@"<effect\\b[^>]*\\bid\\s*=\\s*\"([^\"]+)\""
+                                                             options:0 error:nil];
+        });
+        NSTextCheckingResult *m = [idRx firstMatchInString:str options:0 range:NSMakeRange(0, MIN((NSUInteger)1024, str.length))];
+        if (m && m.numberOfRanges > 1) {
+            NSString *eid = [str substringWithRange:[m rangeAtIndex:1]];
+            if ([seenIds containsObject:eid]) return NO;
+            [seenIds addObject:eid];
+        }
+    }
+    return YES;
+}
+
 static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd, NSString *ext, NSString *subpath) {
     NSArray<NSURL *> *orig = nil;
     if (gOrigURLsForResources) {
@@ -1618,18 +1795,26 @@ static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd,
         subpath && [subpath isEqualToString:@"BuiltinEffects"]) {
         AMInstallCustomEffectCategoryIfNeeded();
         NSMutableArray<NSURL *> *merged = orig ? [orig mutableCopy] : [NSMutableArray array];
+        NSMutableSet<NSString *> *seenIds = [NSMutableSet set];
+
         NSString *dir = AMCustomEffectsDir();
         NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
         for (NSString *fn in files) {
             if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
-                [merged addObject:[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:fn]]];
+                NSString *full = [dir stringByAppendingPathComponent:fn];
+                if (AMIsEffectXMLSafeForIOSParser(full, seenIds)) {
+                    [merged addObject:[NSURL fileURLWithPath:full]];
+                }
             }
         }
         NSString *gmDir = [[[NSBundle mainBundle] bundlePath] stringByAppendingPathComponent:@"GoldMotionEffects"];
         NSArray<NSString *> *gmFiles = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:gmDir error:nil];
         for (NSString *fn in gmFiles) {
             if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
-                [merged addObject:[NSURL fileURLWithPath:[gmDir stringByAppendingPathComponent:fn]]];
+                NSString *full = [gmDir stringByAppendingPathComponent:fn];
+                if (AMIsEffectXMLSafeForIOSParser(full, seenIds)) {
+                    [merged addObject:[NSURL fileURLWithPath:full]];
+                }
             }
         }
         return merged;
@@ -1994,7 +2179,7 @@ static void AMHook_effectCatWillDisplayCell(id self, SEL _cmd, UICollectionView 
     }
     self.xmlTextView.text =
         @"<?xml version='1.0' encoding='UTF-8' ?>\n"
-        @"<effect id=\"com.alightcreative.effects.custom_invert\" compat=\"acScreenNorm-y\" name=\"Custom Invert\" desc=\"Inverts layer colors\" category=\"custom\" tags=\"custom\" thumb=\"thumb/copy-bg.webp\">\n"
+        @"<effect id=\"com.alightcreative.effects.custom_invert\" compat=\"acScreenNorm-y\" name=\"Custom Invert\" desc=\"Inverts layer colors\" category=\"custom\" tags=\"custom\" thumb=\"thumb/box.webp\">\n"
         @"    <params>\n"
         @"        <texture id=\"inputImg\" srcType=\"content\" />\n"
         @"        <spinner id=\"strength\" default=\"1.0\" min=\"0.0\" max=\"1.0\" step=\"0.01\" label=\"Strength\" type=\"percent\" />\n"
