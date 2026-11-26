@@ -2,37 +2,42 @@
 // Native iOS ARM64 tweak for Alight Motion 6.2.60 (build 869)
 // 1. Preview Quality Button: Seamless white flat toolbar button next to playButton.
 //    Single-tap ladder cycle: Full -> 1/2 -> 1/3 -> 1/4 -> Full.
+//    Immediately re-renders paused frame via AVPlayer without pressing Play.
 //    Wired to AMCompositor -> AMCompositorMetal (preview only; exports stay Full).
-// 2. Custom XML Effects Importer: `+` button in Effects -> Other category.
+// 2. Open Alight Motion Link: Native pill row inside SettingsVC to paste/open
+//    alight.link / alightmotion:// links directly inside this sideloaded app.
+// 3. Custom XML Effects Importer: `+` button in Effects -> Other category.
 //    Import XML code (paste or Files picker), custom name, optional thumbnail.
-//    Hooked into NSBundle BuiltinEffects & BuiltinThumb so Alight Motion natively
-//    parses, displays in Other, compiles to Metal, animates, and renders them.
-// 3. 3D Layer Toggle & 3D Transform State (EditingInspectorVC).
+//    Hooked into NSBundle BuiltinEffects & BuiltinThumb.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <simd/simd.h>
 #import <math.h>
 #import <stdint.h>
 
 static NSString *const kAMPreviewQualityKey = @"AMModPreviewQualityDivisor";
 static NSInteger gPreviewDivisor = 1; // 1=Full, 2=Half, 3=Third, 4=Quarter
 
+// Track active editor AVPlayer for immediate paused-frame redraw on quality change
+static __weak AVPlayer *gActivePreviewPlayer = nil;
+static IMP gOrigReplaceCurrentItem = NULL;
+static IMP gOrigInitWithPlayerItem = NULL;
+
 // ============================================================================
-// Theme Helpers (Matches Alight Motion Dark UI from Reference Screenshots)
+// Theme Helpers (Matches Alight Motion UI)
 // ============================================================================
 
 static UIColor *AMBgColor(void) {
-    // Matches Alight Motion dark slate-indigo background (#242636)
     return [UIColor colorWithRed:0.141 green:0.149 blue:0.212 alpha:1.0];
 }
 
 static UIColor *AMSurfaceColor(void) {
-    // Slightly elevated card surface (#2E3145)
     return [UIColor colorWithRed:0.180 green:0.192 blue:0.271 alpha:1.0];
 }
 
@@ -41,7 +46,6 @@ static UIColor *AMInputSurfaceColor(void) {
 }
 
 static UIColor *AMCircleBtnColor(void) {
-    // Matches the translucent dark-slate circular back button in Effects -> Other
     return [UIColor colorWithRed:0.243 green:0.255 blue:0.345 alpha:0.85];
 }
 
@@ -51,6 +55,24 @@ static UIColor *AMBorderColor(void) {
 
 static UIColor *AMAccentGreenColor(void) {
     return [UIColor colorWithRed:0.204 green:0.827 blue:0.600 alpha:1.0]; // #34D399
+}
+
+static UIColor *AMSettingsPillColor(void) {
+    // Adaptive pill color matching Leave Feedback / Privacy Settings / About rows
+    return [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull tc) {
+        if (tc.userInterfaceStyle == UIUserInterfaceStyleDark) {
+            return [UIColor colorWithRed:0.176 green:0.184 blue:0.247 alpha:1.0];
+        }
+        return [UIColor colorWithRed:0.918 green:0.922 blue:0.933 alpha:1.0]; // #EAEBF0
+    }];
+}
+
+static UIColor *AMSettingsTextColor(void) {
+    return [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull tc) {
+        return (tc.userInterfaceStyle == UIUserInterfaceStyleDark)
+            ? [UIColor whiteColor]
+            : [UIColor colorWithRed:0.09 green:0.10 blue:0.14 alpha:1.0];
+    }];
 }
 
 static UIFont *AMThemeFont(CGFloat size, UIFontWeight weight) {
@@ -73,8 +95,67 @@ static NSString *AMLabelForDivisor(NSInteger d) {
 }
 
 // ============================================================================
-// Module 1: Preview Quality Engine Hook (AMCompositor -> AMCompositorMetal)
+// Module 1: Preview Quality Engine Hook + Immediate Paused-Frame Refresh
 // ============================================================================
+
+static BOOL AMItemUsesAMCompositor(AVPlayerItem *item) {
+    if (!item) return NO;
+    AVVideoComposition *vc = item.videoComposition;
+    if (!vc) return NO;
+    Class compCls = NSClassFromString(@"_TtC12AlightMotion12AMCompositor");
+    return (compCls != Nil && vc.customVideoCompositorClass == compCls);
+}
+
+static void AMTrackPlayerIfPreview(AVPlayer *player, AVPlayerItem *item) {
+    if (!player) return;
+    if (AMItemUsesAMCompositor(item) || AMItemUsesAMCompositor(player.currentItem)) {
+        gActivePreviewPlayer = player;
+    } else if (item && gActivePreviewPlayer == nil) {
+        // VideoComposition may be assigned right after replaceCurrentItem; track tentatively
+        gActivePreviewPlayer = player;
+    }
+}
+
+static void AMHook_replaceCurrentItem(id self, SEL _cmd, AVPlayerItem *item) {
+    if (gOrigReplaceCurrentItem) {
+        ((void (*)(id, SEL, AVPlayerItem *))gOrigReplaceCurrentItem)(self, _cmd, item);
+    }
+    AMTrackPlayerIfPreview((AVPlayer *)self, item);
+}
+
+static id AMHook_initWithPlayerItem(id self, SEL _cmd, AVPlayerItem *item) {
+    id res = self;
+    if (gOrigInitWithPlayerItem) {
+        res = ((id (*)(id, SEL, AVPlayerItem *))gOrigInitWithPlayerItem)(self, _cmd, item);
+    }
+    if (res) {
+        AMTrackPlayerIfPreview((AVPlayer *)res, item);
+    }
+    return res;
+}
+
+static void AMForceImmediatePreviewRedraw(void) {
+    AVPlayer *player = gActivePreviewPlayer;
+    if (!player) return;
+    AVPlayerItem *item = player.currentItem;
+    if (!item) return;
+
+    // Re-assigning a copy of videoComposition forces AVFoundation to immediately
+    // re-invoke AMCompositor.startVideoCompositionRequest: on the current paused frame.
+    AVVideoComposition *vc = item.videoComposition;
+    if (vc) {
+        AVVideoComposition *copied = [vc copy];
+        if (copied) {
+            item.videoComposition = copied;
+        }
+    }
+    if (player.rate == 0.0f) {
+        CMTime cur = player.currentTime;
+        if (CMTIME_IS_NUMERIC(cur)) {
+            [player seekToTime:cur toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+        }
+    }
+}
 
 static IMP gOrigStartVideoCompReq = NULL;
 static ptrdiff_t gCompImplOffset = -1;
@@ -153,6 +234,7 @@ static const void *kAMQualityButtonAssocKey = &kAMQualityButtonAssocKey;
     gPreviewDivisor = (gPreviewDivisor % 4) + 1;
     [[NSUserDefaults standardUserDefaults] setInteger:gPreviewDivisor forKey:kAMPreviewQualityKey];
     [self styleQualityButton:btn];
+    AMForceImmediatePreviewRedraw();
     UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     [haptic impactOccurred];
 }
@@ -208,7 +290,186 @@ static void AMHook_previewControlBarViewDidLoad(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// Module 2: Custom XML Effects Storage & NSBundle Loader Hooks
+// Module 2: Open Alight Motion Link inside SettingsVC
+// ============================================================================
+
+static IMP gOrigSettingsVCViewDidLoad = NULL;
+static const void *kAMSettingsLinkBtnKey = &kAMSettingsLinkBtnKey;
+
+static void AMDispatchAlightLink(NSURL *url) {
+    if (!url) return;
+    UIApplication *app = [UIApplication sharedApplication];
+    id<UIApplicationDelegate> del = app.delegate;
+    if (!del) return;
+
+    NSString *scheme = url.scheme.lowercaseString;
+    BOOL handled = NO;
+
+    // Universal Links (https://alight.link/... or https://alightcreative.com/...)
+    if ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]) {
+        SEL uaSel = @selector(application:continueUserActivity:restorationHandler:);
+        if ([del respondsToSelector:uaSel]) {
+            NSUserActivity *ua = [[NSUserActivity alloc] initWithActivityType:NSUserActivityTypeBrowsingWeb];
+            ua.webpageURL = url;
+            handled = [del application:app
+                  continueUserActivity:ua
+                    restorationHandler:^(NSArray<id<UIUserActivityRestoring>> * _Nullable restorableObjects) {
+                        (void)restorableObjects;
+                    }];
+        }
+    }
+
+    // Custom scheme (alightmotion://...) or fallback
+    if (!handled) {
+        SEL openSel = @selector(application:openURL:options:);
+        if ([del respondsToSelector:openSel]) {
+            [del application:app openURL:url options:@{}];
+        }
+    }
+}
+
+static NSURL *AMNormalizeAlightLink(NSString *raw) {
+    if (!raw) return nil;
+    NSString *s = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (s.length == 0) return nil;
+    if (![s containsString:@"://"]) {
+        s = [@"https://" stringByAppendingString:s];
+    }
+    return [NSURL URLWithString:s];
+}
+
+@interface AMSettingsLinkHandler : NSObject
++ (void)onTapOpenLink:(UIButton *)btn;
+@end
+
+@implementation AMSettingsLinkHandler
+
++ (void)onTapOpenLink:(UIButton *)btn {
+    UIViewController *vc = objc_getAssociatedObject(btn, kAMSettingsLinkBtnKey);
+    if (!vc) return;
+
+    NSString *clip = [UIPasteboard generalPasteboard].string ?: @"";
+    NSString *trimmedClip = [clip stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    BOOL clipLooksLikeLink = ([trimmedClip localizedCaseInsensitiveContainsString:@"alight.link"] ||
+                              [trimmedClip localizedCaseInsensitiveContainsString:@"alightmotion"] ||
+                              [trimmedClip localizedCaseInsensitiveContainsString:@"alightcreative"]);
+
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Open Alight Motion Link"
+                                                                message:@"Paste an alight.link or alightmotion:// project/preset URL to open it directly inside this app."
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull tf) {
+        tf.placeholder = @"https://alight.link/...";
+        tf.keyboardType = UIKeyboardTypeURL;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+        if (clipLooksLikeLink) {
+            tf.text = trimmedClip;
+        }
+    }];
+
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Paste Clipboard" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+        (void)a;
+        NSURL *u = AMNormalizeAlightLink([UIPasteboard generalPasteboard].string);
+        if (!u) return;
+        UIViewController *presenter = vc.presentingViewController;
+        if (presenter) {
+            [vc dismissViewControllerAnimated:YES completion:^{
+                AMDispatchAlightLink(u);
+            }];
+        } else {
+            AMDispatchAlightLink(u);
+        }
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Open Link" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+        (void)a;
+        NSString *entered = ac.textFields.firstObject.text;
+        NSURL *u = AMNormalizeAlightLink(entered);
+        if (!u) return;
+        UIViewController *presenter = vc.presentingViewController;
+        if (presenter) {
+            [vc dismissViewControllerAnimated:YES completion:^{
+                AMDispatchAlightLink(u);
+            }];
+        } else {
+            AMDispatchAlightLink(u);
+        }
+    }]];
+
+    [vc presentViewController:ac animated:YES completion:nil];
+}
+
+@end
+
+static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
+    if (gOrigSettingsVCViewDidLoad) {
+        ((void (*)(id, SEL))gOrigSettingsVCViewDidLoad)(self, _cmd);
+    }
+
+    UIViewController *vc = (UIViewController *)self;
+    if (objc_getAssociatedObject(vc, kAMSettingsLinkBtnKey) != nil) return;
+
+    UITableView *tv = nil;
+    SEL tvSel = NSSelectorFromString(@"sTableView");
+    if ([self respondsToSelector:tvSel]) {
+        tv = ((UITableView *(*)(id, SEL))objc_msgSend)(self, tvSel);
+    }
+    if (!tv) return;
+
+    // Native Settings-style pill card placed right at the top of Settings table
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, tv.bounds.size.width > 0 ? tv.bounds.size.width : 280, 62)];
+    header.backgroundColor = [UIColor clearColor];
+
+    UIButton *pill = [UIButton buttonWithType:UIButtonTypeSystem];
+    pill.translatesAutoresizingMaskIntoConstraints = NO;
+    pill.backgroundColor = AMSettingsPillColor();
+    pill.layer.cornerRadius = 16.0;
+    pill.clipsToBounds = YES;
+    [header addSubview:pill];
+
+    UILabel *lbl = [[UILabel alloc] init];
+    lbl.translatesAutoresizingMaskIntoConstraints = NO;
+    lbl.text = @"Open Alight Link";
+    lbl.font = AMThemeFont(15.0, UIFontWeightMedium);
+    lbl.textColor = AMSettingsTextColor();
+    lbl.userInteractionEnabled = NO;
+    [pill addSubview:lbl];
+
+    UIImageView *chev = [[UIImageView alloc] init];
+    chev.translatesAutoresizingMaskIntoConstraints = NO;
+    chev.userInteractionEnabled = NO;
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.0 weight:UIImageSymbolWeightSemibold];
+        chev.image = [UIImage systemImageNamed:@"link" withConfiguration:cfg];
+    }
+    chev.tintColor = AMSettingsTextColor();
+    [pill addSubview:chev];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [pill.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16.0],
+        [pill.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16.0],
+        [pill.topAnchor constraintEqualToAnchor:header.topAnchor constant:8.0],
+        [pill.bottomAnchor constraintEqualToAnchor:header.bottomAnchor constant:-6.0],
+
+        [lbl.leadingAnchor constraintEqualToAnchor:pill.leadingAnchor constant:18.0],
+        [lbl.centerYAnchor constraintEqualToAnchor:pill.centerYAnchor],
+
+        [chev.trailingAnchor constraintEqualToAnchor:pill.trailingAnchor constant:-16.0],
+        [chev.centerYAnchor constraintEqualToAnchor:pill.centerYAnchor],
+    ]];
+
+    objc_setAssociatedObject(pill, kAMSettingsLinkBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
+    [pill addTarget:[AMSettingsLinkHandler class]
+             action:@selector(onTapOpenLink:)
+   forControlEvents:UIControlEventTouchUpInside];
+
+    tv.tableHeaderView = header;
+    objc_setAssociatedObject(vc, kAMSettingsLinkBtnKey, pill, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// ============================================================================
+// Module 3: Custom XML Effects Storage & NSBundle Loader Hooks
 // ============================================================================
 
 static NSString *AMCustomEffectsDir(void) {
@@ -251,8 +512,6 @@ static NSString *AMXmlEscapeAttr(NSString *s) {
     return r;
 }
 
-// Normalizes user XML so Alight Motion's VisualEffectParser places it in category="other"
-// with the requested name and optional thumbnail.
 static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSString *slug, BOOL hasCustomThumb, NSError **outError) {
     NSString *trimmed = [rawXML stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) {
@@ -285,7 +544,6 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
     NSRange tagRange = NSMakeRange(openStart.location, (openEnd.location - openStart.location) + 1);
     NSMutableString *openTag = [[trimmed substringWithRange:tagRange] mutableCopy];
 
-    // Helper to replace or insert an XML attribute inside <effect ...>
     void (^setAttr)(NSString *, NSString *) = ^(NSString *attrName, NSString *attrVal) {
         NSString *escaped = AMXmlEscapeAttr(attrVal);
         NSString *pattern = [NSString stringWithFormat:@"\\b%@\\s*=\\s*\"[^\"]*\"", attrName];
@@ -295,23 +553,19 @@ static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSS
         if (match.location != NSNotFound) {
             [openTag replaceCharactersInRange:match withString:replacement];
         } else {
-            // Insert before closing '>'
             NSUInteger insertPos = openTag.length - 1;
             [openTag insertString:[NSString stringWithFormat:@" %@", replacement] atIndex:insertPos];
         }
     };
 
-    // Ensure unique id if missing
     NSRegularExpression *idRx = [NSRegularExpression regularExpressionWithPattern:@"\\bid\\s*=\\s*\"[^\"]+\"" options:0 error:nil];
     if ([idRx rangeOfFirstMatchInString:openTag options:0 range:NSMakeRange(0, openTag.length)].location == NSNotFound) {
         setAttr(@"id", [NSString stringWithFormat:@"com.custom.effects.%@", slug]);
     }
 
-    // Force category="other" and apply chosen display name
     setAttr(@"category", @"other");
     setAttr(@"name", displayName);
 
-    // Optional thumbnail
     if (hasCustomThumb) {
         setAttr(@"thumb", [NSString stringWithFormat:@"thumb/custom_%@.webp", slug]);
     } else {
@@ -379,7 +633,7 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
 }
 
 // ============================================================================
-// Module 2: Custom XML Effect Importer Modal UI (Matches Alight Motion Theme)
+// Module 3: Custom XML Effect Importer Modal UI & '+' in Other Category
 // ============================================================================
 
 @interface AMCustomEffectImporterVC : UIViewController <UIDocumentPickerDelegate, UIImagePickerControllerDelegate, UINavigationControllerDelegate>
@@ -398,7 +652,6 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
     self.view.backgroundColor = AMBgColor();
     self.title = @"Import XML Effect";
 
-    // Scroll container so keyboard never blocks inputs
     UIScrollView *scroll = [[UIScrollView alloc] init];
     scroll.translatesAutoresizingMaskIntoConstraints = NO;
     scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
@@ -422,7 +675,6 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
         [stack.trailingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.trailingAnchor constant:-18.0],
     ]];
 
-    // Top bar inside modal
     UIStackView *topRow = [[UIStackView alloc] init];
     topRow.axis = UILayoutConstraintAxisHorizontal;
     topRow.alignment = UIStackViewAlignmentCenter;
@@ -452,7 +704,6 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
     [importBtn.widthAnchor constraintEqualToConstant:60.0].active = YES;
     [stack addArrangedSubview:topRow];
 
-    // Effect Name
     [stack addArrangedSubview:[self makeSectionLabel:@"EFFECT NAME"]];
     self.nameField = [[UITextField alloc] init];
     self.nameField.backgroundColor = AMInputSurfaceColor();
@@ -469,7 +720,6 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
     [self.nameField.heightAnchor constraintEqualToConstant:44.0].active = YES;
     [stack addArrangedSubview:self.nameField];
 
-    // Thumbnail Row (Optional)
     [stack addArrangedSubview:[self makeSectionLabel:@"THUMBNAIL (OPTIONAL)"]];
     UIStackView *thumbRow = [[UIStackView alloc] init];
     thumbRow.axis = UILayoutConstraintAxisHorizontal;
@@ -495,7 +745,6 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
     [thumbRow addArrangedSubview:self.clearThumbBtn];
     [stack addArrangedSubview:thumbRow];
 
-    // XML Code Section
     UIStackView *xmlHdr = [[UIStackView alloc] init];
     xmlHdr.axis = UILayoutConstraintAxisHorizontal;
     xmlHdr.spacing = 8.0;
@@ -521,7 +770,6 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
     [self.xmlTextView.heightAnchor constraintEqualToConstant:210.0].active = YES;
     [stack addArrangedSubview:self.xmlTextView];
 
-    // Installed custom effects list
     [stack addArrangedSubview:[self makeSectionLabel:@"INSTALLED CUSTOM EFFECTS"]];
     self.installedListStack = [[UIStackView alloc] init];
     self.installedListStack.axis = UILayoutConstraintAxisVertical;
@@ -669,7 +917,6 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
     UIImage *img = info[UIImagePickerControllerOriginalImage];
     if (img) {
-        // Resize cleanly to 256x256 square thumbnail
         CGSize target = CGSizeMake(256, 256);
         UIGraphicsBeginImageContextWithOptions(target, NO, 1.0);
         [img drawInRect:CGRectMake(0, 0, target.width, target.height)];
@@ -742,10 +989,6 @@ static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString 
 
 @end
 
-// ============================================================================
-// Module 2: Hook EffectPickerCategoryVC to place `+` button in "Other"
-// ============================================================================
-
 static IMP gOrigEffectCatViewWillAppear = NULL;
 static const void *kAMImportPlusBtnKey = &kAMImportPlusBtnKey;
 
@@ -791,7 +1034,6 @@ static void AMHook_effectCategoryViewWillAppear(id self, SEL _cmd, BOOL animated
     }
 
     UIViewController *vc = (UIViewController *)self;
-    // Check on next runloop tick too in case title is set right after viewWillAppear
     dispatch_async(dispatch_get_main_queue(), ^{
         BOOL isOther = AMIsOtherEffectCategoryVC(vc);
         UIButton *existing = objc_getAssociatedObject(vc, kAMImportPlusBtnKey);
@@ -804,7 +1046,6 @@ static void AMHook_effectCategoryViewWillAppear(id self, SEL _cmd, BOOL animated
             return;
         }
 
-        // Circular translucent '+' button matching Alight Motion's top-left '<' back button
         UIButton *plusBtn = [UIButton buttonWithType:UIButtonTypeSystem];
         plusBtn.translatesAutoresizingMaskIntoConstraints = NO;
         plusBtn.accessibilityLabel = @"Import Custom XML Effect";
@@ -865,7 +1106,17 @@ static void AlightMotionModsInit(void) {
         gPreviewDivisor = saved;
     }
 
-    // Module 1: Preview Quality Engine + Flat White One-Tap Ladder Button
+    // Module 1: Preview Quality Engine + Immediate AVPlayer Frame Redraw + Flat White Ladder Button
+    AMSwizzleMethod(@"AVPlayer",
+                    @"replaceCurrentItemWithPlayerItem:",
+                    (IMP)AMHook_replaceCurrentItem,
+                    &gOrigReplaceCurrentItem);
+
+    AMSwizzleMethod(@"AVPlayer",
+                    @"initWithPlayerItem:",
+                    (IMP)AMHook_initWithPlayerItem,
+                    &gOrigInitWithPlayerItem);
+
     AMSwizzleMethod(@"_TtC12AlightMotion12AMCompositor",
                     @"startVideoCompositionRequest:",
                     (IMP)AMHook_startVideoCompositionRequest,
@@ -876,7 +1127,13 @@ static void AlightMotionModsInit(void) {
                     (IMP)AMHook_previewControlBarViewDidLoad,
                     &gOrigPreviewControlBarViewDidLoad);
 
-    // Module 2: Custom XML Effect Importer (NSBundle hooks + '+' in Other category)
+    // Module 2: Open Alight Motion Link inside SettingsVC
+    AMSwizzleMethod(@"_TtC12AlightMotion10SettingsVC",
+                    @"viewDidLoad",
+                    (IMP)AMHook_settingsVCViewDidLoad,
+                    &gOrigSettingsVCViewDidLoad);
+
+    // Module 3: Custom XML Effect Importer (NSBundle hooks + '+' in Other category)
     AMSwizzleMethod(@"NSBundle",
                     @"URLsForResourcesWithExtension:subdirectory:",
                     (IMP)AMHook_URLsForResourcesWithExtension,

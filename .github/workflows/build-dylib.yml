@@ -28,6 +28,8 @@ jobs:
             -framework QuartzCore \
             -framework CoreGraphics \
             -framework UniformTypeIdentifiers \
+            -framework AVFoundation \
+            -framework CoreMedia \
             -o AlightMotionMods.dylib \
             AlightMotionMods.mm
           codesign -f -s - AlightMotionMods.dylib
