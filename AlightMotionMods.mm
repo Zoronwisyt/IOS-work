@@ -1,13 +1,18 @@
 // AlightMotionMods.mm
 // Native iOS ARM64 tweak for Alight Motion 6.2.60 (build 869)
-// Module 1: After Effects-style Preview Quality GUI (Full / Half / Third / Quarter)
-//           adjacent to playButton in PreviewControlBarVC, wired to AMCompositorMetal.
-// Module 2: Native 3D Layer toggle + 3D X/Y/Z Position/Rotation UI + 3D Null Parenting
-//           4x4 matrix hierarchy engine in EditingInspectorVC.
+// 1. Preview Quality Button: Seamless white flat toolbar button next to playButton.
+//    Single-tap ladder cycle: Full -> 1/2 -> 1/3 -> 1/4 -> Full.
+//    Wired to AMCompositor -> AMCompositorMetal (preview only; exports stay Full).
+// 2. Custom XML Effects Importer: `+` button in Effects -> Other category.
+//    Import XML code (paste or Files picker), custom name, optional thumbnail.
+//    Hooked into NSBundle BuiltinEffects & BuiltinThumb so Alight Motion natively
+//    parses, displays in Other, compiles to Metal, animates, and renders them.
+// 3. 3D Layer Toggle & 3D Transform State (EditingInspectorVC).
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <simd/simd.h>
@@ -18,15 +23,30 @@ static NSString *const kAMPreviewQualityKey = @"AMModPreviewQualityDivisor";
 static NSInteger gPreviewDivisor = 1; // 1=Full, 2=Half, 3=Third, 4=Quarter
 
 // ============================================================================
-// Theme Helpers (Matches Alight Motion Dark UI)
+// Theme Helpers (Matches Alight Motion Dark UI from Reference Screenshots)
 // ============================================================================
 
-static UIColor *AMDarkSurfaceColor(void) {
-    return [UIColor colorWithRed:0.114 green:0.125 blue:0.161 alpha:0.96];
+static UIColor *AMBgColor(void) {
+    // Matches Alight Motion dark slate-indigo background (#242636)
+    return [UIColor colorWithRed:0.141 green:0.149 blue:0.212 alpha:1.0];
 }
 
-static UIColor *AMDarkBorderColor(void) {
-    return [UIColor colorWithWhite:1.0 alpha:0.16];
+static UIColor *AMSurfaceColor(void) {
+    // Slightly elevated card surface (#2E3145)
+    return [UIColor colorWithRed:0.180 green:0.192 blue:0.271 alpha:1.0];
+}
+
+static UIColor *AMInputSurfaceColor(void) {
+    return [UIColor colorWithRed:0.114 green:0.122 blue:0.176 alpha:1.0];
+}
+
+static UIColor *AMCircleBtnColor(void) {
+    // Matches the translucent dark-slate circular back button in Effects -> Other
+    return [UIColor colorWithRed:0.243 green:0.255 blue:0.345 alpha:0.85];
+}
+
+static UIColor *AMBorderColor(void) {
+    return [UIColor colorWithWhite:1.0 alpha:0.15];
 }
 
 static UIColor *AMAccentGreenColor(void) {
@@ -34,7 +54,10 @@ static UIColor *AMAccentGreenColor(void) {
 }
 
 static UIFont *AMThemeFont(CGFloat size, UIFontWeight weight) {
-    UIFont *sg = [UIFont fontWithName:@"SpaceGrotesk-Bold" size:size];
+    UIFont *sg = nil;
+    if (weight >= UIFontWeightSemibold) {
+        sg = [UIFont fontWithName:@"SpaceGrotesk-Bold" size:size];
+    }
     if (!sg) sg = [UIFont fontWithName:@"SpaceGrotesk-Medium" size:size];
     if (!sg) sg = [UIFont systemFontOfSize:size weight:weight];
     return sg;
@@ -97,7 +120,7 @@ static void AMHook_startVideoCompositionRequest(id self, SEL _cmd, id request) {
 }
 
 // ============================================================================
-// Module 1: Preview Quality UI (PreviewControlBarVC near playButton)
+// Module 1: Preview Quality UI (Seamless White Flat One-Tap Ladder Button)
 // ============================================================================
 
 static IMP gOrigPreviewControlBarViewDidLoad = NULL;
@@ -105,7 +128,6 @@ static const void *kAMQualityButtonAssocKey = &kAMQualityButtonAssocKey;
 
 @interface AMPreviewQualityHelper : NSObject
 + (void)styleQualityButton:(UIButton *)btn;
-+ (void)attachMenuToButton:(UIButton *)btn;
 + (void)cycleQuality:(UIButton *)btn;
 @end
 
@@ -113,57 +135,26 @@ static const void *kAMQualityButtonAssocKey = &kAMQualityButtonAssocKey;
 
 + (void)styleQualityButton:(UIButton *)btn {
     NSString *title = AMLabelForDivisor(gPreviewDivisor);
-    BOOL downscaled = (gPreviewDivisor > 1);
-    [btn setTitle:title forState:UIControlStateNormal];
-    [btn setTitleColor:(downscaled ? AMAccentGreenColor() : [UIColor whiteColor])
-              forState:UIControlStateNormal];
-    btn.titleLabel.font = AMThemeFont(11.0, UIFontWeightBold);
-    btn.backgroundColor = AMDarkSurfaceColor();
-    btn.layer.cornerRadius = 7.0;
-    btn.layer.borderWidth = 1.0;
-    btn.layer.borderColor = (downscaled ? [AMAccentGreenColor() colorWithAlphaComponent:0.55] : AMDarkBorderColor()).CGColor;
-    btn.clipsToBounds = YES;
-}
-
-+ (void)setDivisor:(NSInteger)divisor forButton:(UIButton *)btn {
-    if (divisor < 1 || divisor > 4) divisor = 1;
-    gPreviewDivisor = divisor;
-    [[NSUserDefaults standardUserDefaults] setInteger:divisor forKey:kAMPreviewQualityKey];
-    [self styleQualityButton:btn];
-    [self attachMenuToButton:btn];
-}
-
-+ (void)attachMenuToButton:(UIButton *)btn {
-    if (@available(iOS 14.0, *)) {
-        __weak UIButton *weakBtn = btn;
-        NSArray<NSDictionary *> *items = @[
-            @{@"title": @"Full (100%)",   @"div": @1},
-            @{@"title": @"Half (1/2)",    @"div": @2},
-            @{@"title": @"Third (1/3)",   @"div": @3},
-            @{@"title": @"Quarter (1/4)", @"div": @4},
-        ];
-        NSMutableArray<UIAction *> *actions = [NSMutableArray arrayWithCapacity:items.count];
-        for (NSDictionary *item in items) {
-            NSInteger d = [item[@"div"] integerValue];
-            UIAction *act = [UIAction actionWithTitle:item[@"title"]
-                                                image:nil
-                                           identifier:nil
-                                              handler:^(__kindof UIAction * _Nonnull action) {
-                (void)action;
-                UIButton *b = weakBtn;
-                if (b) [AMPreviewQualityHelper setDivisor:d forButton:b];
-            }];
-            act.state = (gPreviewDivisor == d) ? UIMenuElementStateOn : UIMenuElementStateOff;
-            [actions addObject:act];
-        }
-        btn.menu = [UIMenu menuWithTitle:@"Preview Quality" children:actions];
-        btn.showsMenuAsPrimaryAction = YES;
-    }
+    [UIView performWithoutAnimation:^{
+        [btn setTitle:title forState:UIControlStateNormal];
+        [btn layoutIfNeeded];
+    }];
+    [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [btn setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.55] forState:UIControlStateHighlighted];
+    btn.titleLabel.font = AMThemeFont(13.0, UIFontWeightSemibold);
+    btn.backgroundColor = [UIColor clearColor];
+    btn.layer.borderWidth = 0.0;
+    btn.layer.cornerRadius = 0.0;
+    btn.tintColor = [UIColor whiteColor];
 }
 
 + (void)cycleQuality:(UIButton *)btn {
-    NSInteger next = (gPreviewDivisor % 4) + 1;
-    [self setDivisor:next forButton:btn];
+    // Ladder: Full (1) -> Half (2) -> Third (3) -> Quarter (4) -> Full (1)
+    gPreviewDivisor = (gPreviewDivisor % 4) + 1;
+    [[NSUserDefaults standardUserDefaults] setInteger:gPreviewDivisor forKey:kAMPreviewQualityKey];
+    [self styleQualityButton:btn];
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [haptic impactOccurred];
 }
 
 @end
@@ -193,20 +184,14 @@ static void AMHook_previewControlBarViewDidLoad(id self, SEL _cmd) {
     qBtn.translatesAutoresizingMaskIntoConstraints = NO;
     qBtn.accessibilityLabel = @"Preview Quality";
     [AMPreviewQualityHelper styleQualityButton:qBtn];
-    [AMPreviewQualityHelper attachMenuToButton:qBtn];
-    if (@available(iOS 14.0, *)) {
-        // Primary action is UIMenu
-    } else {
-        [qBtn addTarget:[AMPreviewQualityHelper class]
-                 action:@selector(cycleQuality:)
-       forControlEvents:UIControlEventTouchUpInside];
-    }
+    [qBtn addTarget:[AMPreviewQualityHelper class]
+             action:@selector(cycleQuality:)
+   forControlEvents:UIControlEventTouchUpInside];
 
     [NSLayoutConstraint activateConstraints:@[
-        [qBtn.widthAnchor constraintGreaterThanOrEqualToConstant:38.0],
-        [qBtn.heightAnchor constraintEqualToConstant:26.0],
+        [qBtn.widthAnchor constraintGreaterThanOrEqualToConstant:34.0],
+        [qBtn.heightAnchor constraintEqualToConstant:30.0],
     ]];
-    qBtn.contentEdgeInsets = UIEdgeInsetsMake(0, 6, 0, 6);
 
     if (stack && [stack.arrangedSubviews containsObject:playBtn]) {
         NSUInteger idx = [stack.arrangedSubviews indexOfObject:playBtn];
@@ -223,356 +208,645 @@ static void AMHook_previewControlBarViewDidLoad(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// Module 2: Native 3D Layer State, 3D Null Parenting Matrix Engine, & Inspector UI
+// Module 2: Custom XML Effects Storage & NSBundle Loader Hooks
 // ============================================================================
 
-@interface AM3DLayerState : NSObject
-@property (nonatomic, assign) BOOL enabled3D;
-@property (nonatomic, assign) BOOL isNull;
-@property (nonatomic, assign) float posX;
-@property (nonatomic, assign) float posY;
-@property (nonatomic, assign) float posZ;
-@property (nonatomic, assign) float rotX; // degrees
-@property (nonatomic, assign) float rotY; // degrees
-@property (nonatomic, assign) float rotZ; // degrees
-@property (nonatomic, copy, nullable) NSString *parentId;
-@end
-
-@implementation AM3DLayerState
-@end
-
-@interface AM3DLayerStore : NSObject
-@property (nonatomic, strong) NSMutableDictionary<NSString *, AM3DLayerState *> *states;
-+ (instancetype)shared;
-- (AM3DLayerState *)stateForLayerId:(NSString *)layerId;
-- (simd_float4x4)localMatrixForState:(AM3DLayerState *)s;
-- (simd_float4x4)worldMatrixForLayerId:(NSString *)layerId;
-@end
-
-@implementation AM3DLayerStore
-
-+ (instancetype)shared {
-    static AM3DLayerStore *inst = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        inst = [[AM3DLayerStore alloc] init];
-        inst.states = [NSMutableDictionary dictionary];
-    });
-    return inst;
+static NSString *AMCustomEffectsDir(void) {
+    NSArray<NSString *> *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *dir = [docs.firstObject stringByAppendingPathComponent:@"CustomEffects"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
 }
 
-- (AM3DLayerState *)stateForLayerId:(NSString *)layerId {
-    if (!layerId) return nil;
-    AM3DLayerState *st = self.states[layerId];
-    if (!st) {
-        st = [[AM3DLayerState alloc] init];
-        self.states[layerId] = st;
-    }
-    return st;
+static NSString *AMCustomThumbsDir(void) {
+    NSString *dir = [AMCustomEffectsDir() stringByAppendingPathComponent:@"thumbs"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
 }
 
-static simd_float4x4 AMMakeRotationX(float deg) {
-    float r = deg * (float)(M_PI / 180.0);
-    float c = cosf(r), s = sinf(r);
-    return (simd_float4x4){{
-        {1, 0,  0, 0},
-        {0, c,  s, 0},
-        {0, -s, c, 0},
-        {0, 0,  0, 1}
-    }};
-}
-
-static simd_float4x4 AMMakeRotationY(float deg) {
-    float r = deg * (float)(M_PI / 180.0);
-    float c = cosf(r), s = sinf(r);
-    return (simd_float4x4){{
-        {c, 0, -s, 0},
-        {0, 1,  0, 0},
-        {s, 0,  c, 0},
-        {0, 0,  0, 1}
-    }};
-}
-
-static simd_float4x4 AMMakeRotationZ(float deg) {
-    float r = deg * (float)(M_PI / 180.0);
-    float c = cosf(r), s = sinf(r);
-    return (simd_float4x4){{
-        {c,  s, 0, 0},
-        {-s, c, 0, 0},
-        {0,  0, 1, 0},
-        {0,  0, 0, 1}
-    }};
-}
-
-static simd_float4x4 AMMakeTranslation(float x, float y, float z) {
-    return (simd_float4x4){{
-        {1, 0, 0, 0},
-        {0, 1, 0, 0},
-        {0, 0, 1, 0},
-        {x, y, z, 1}
-    }};
-}
-
-- (simd_float4x4)localMatrixForState:(AM3DLayerState *)s {
-    if (!s || !s.enabled3D) return matrix_identity_float4x4;
-    // After Effects Euler order: Z * Y * X, then Translation
-    simd_float4x4 t = AMMakeTranslation(s.posX, s.posY, s.posZ);
-    simd_float4x4 r = simd_mul(AMMakeRotationZ(s.rotZ), simd_mul(AMMakeRotationY(s.rotY), AMMakeRotationX(s.rotX)));
-    return simd_mul(t, r);
-}
-
-- (simd_float4x4)worldMatrixForLayerId:(NSString *)layerId {
-    if (!layerId) return matrix_identity_float4x4;
-    NSMutableArray<AM3DLayerState *> *chain = [NSMutableArray array];
-    NSMutableSet<NSString *> *visited = [NSMutableSet set];
-    NSString *cur = layerId;
-    while (cur && ![visited containsObject:cur] && chain.count < 32) {
-        [visited addObject:cur];
-        AM3DLayerState *st = self.states[cur];
-        if (!st || !st.enabled3D) break;
-        [chain addObject:st];
-        cur = st.parentId;
-    }
-    simd_float4x4 world = matrix_identity_float4x4;
-    for (NSInteger i = (NSInteger)chain.count - 1; i >= 0; --i) {
-        world = simd_mul(world, [self localMatrixForState:chain[i]]);
-    }
-    return world;
-}
-
-@end
-
-// Compact Alight-Motion-themed 3D Layer Panel attached to EditingInspectorVC
-@interface AM3DTransformOverlay : UIView
-@property (nonatomic, copy) NSString *layerId;
-@property (nonatomic, strong) NSMutableArray<UISlider *> *sliders;
-@property (nonatomic, strong) NSMutableArray<UILabel *> *valueLabels;
-- (instancetype)initWithLayerId:(NSString *)layerId;
-- (void)reloadFromState;
-@end
-
-@implementation AM3DTransformOverlay
-
-- (instancetype)initWithLayerId:(NSString *)layerId {
-    self = [super initWithFrame:CGRectZero];
-    if (self) {
-        _layerId = [layerId copy];
-        _sliders = [NSMutableArray array];
-        _valueLabels = [NSMutableArray array];
-
-        self.translatesAutoresizingMaskIntoConstraints = NO;
-        self.backgroundColor = AMDarkSurfaceColor();
-        self.layer.cornerRadius = 12.0;
-        self.layer.borderWidth = 1.0;
-        self.layer.borderColor = AMDarkBorderColor().CGColor;
-
-        UIStackView *root = [[UIStackView alloc] init];
-        root.translatesAutoresizingMaskIntoConstraints = NO;
-        root.axis = UILayoutConstraintAxisVertical;
-        root.spacing = 6.0;
-        [self addSubview:root];
-
-        [NSLayoutConstraint activateConstraints:@[
-            [root.topAnchor constraintEqualToAnchor:self.topAnchor constant:10.0],
-            [root.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-10.0],
-            [root.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:12.0],
-            [root.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12.0],
-        ]];
-
-        // Header row
-        UIStackView *hdr = [[UIStackView alloc] init];
-        hdr.axis = UILayoutConstraintAxisHorizontal;
-        hdr.alignment = UIStackViewAlignmentCenter;
-        UILabel *title = [[UILabel alloc] init];
-        title.text = @"3D Transform (X / Y / Z)";
-        title.font = AMThemeFont(12.0, UIFontWeightBold);
-        title.textColor = AMAccentGreenColor();
-        UIButton *resetBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        [resetBtn setTitle:@"Reset" forState:UIControlStateNormal];
-        [resetBtn setTitleColor:[UIColor colorWithWhite:0.78 alpha:1.0] forState:UIControlStateNormal];
-        resetBtn.titleLabel.font = AMThemeFont(11.0, UIFontWeightSemibold);
-        [resetBtn addTarget:self action:@selector(onReset) forControlEvents:UIControlEventTouchUpInside];
-        [hdr addArrangedSubview:title];
-        [hdr addArrangedSubview:resetBtn];
-        [root addArrangedSubview:hdr];
-
-        NSArray<NSDictionary *> *rows = @[
-            @{@"name": @"Rot X", @"min": @(-180.0), @"max": @(180.0), @"tag": @0},
-            @{@"name": @"Rot Y", @"min": @(-180.0), @"max": @(180.0), @"tag": @1},
-            @{@"name": @"Rot Z", @"min": @(-180.0), @"max": @(180.0), @"tag": @2},
-            @{@"name": @"Pos Z", @"min": @(-1000.0), @"max": @(1000.0), @"tag": @3},
-        ];
-
-        for (NSDictionary *r in rows) {
-            UIStackView *row = [[UIStackView alloc] init];
-            row.axis = UILayoutConstraintAxisHorizontal;
-            row.spacing = 8.0;
-            row.alignment = UIStackViewAlignmentCenter;
-
-            UILabel *lbl = [[UILabel alloc] init];
-            lbl.text = r[@"name"];
-            lbl.font = AMThemeFont(11.0, UIFontWeightSemibold);
-            lbl.textColor = [UIColor colorWithWhite:0.85 alpha:1.0];
-            [lbl.widthAnchor constraintEqualToConstant:40.0].active = YES;
-
-            UISlider *sl = [[UISlider alloc] init];
-            sl.minimumValue = [r[@"min"] floatValue];
-            sl.maximumValue = [r[@"max"] floatValue];
-            sl.tintColor = AMAccentGreenColor();
-            sl.tag = [r[@"tag"] integerValue];
-            [sl addTarget:self action:@selector(onSliderChanged:) forControlEvents:UIControlEventValueChanged];
-
-            UILabel *val = [[UILabel alloc] init];
-            val.font = AMThemeFont(11.0, UIFontWeightMedium);
-            val.textColor = [UIColor whiteColor];
-            val.textAlignment = NSTextAlignmentRight;
-            [val.widthAnchor constraintEqualToConstant:48.0].active = YES;
-
-            [row addArrangedSubview:lbl];
-            [row addArrangedSubview:sl];
-            [row addArrangedSubview:val];
-            [root addArrangedSubview:row];
-
-            [_sliders addObject:sl];
-            [_valueLabels addObject:val];
+static NSString *AMSanitizeSlug(NSString *name) {
+    NSString *lower = [name lowercaseString];
+    NSMutableString *out = [NSMutableString string];
+    for (NSUInteger i = 0; i < lower.length; ++i) {
+        unichar c = [lower characterAtIndex:i];
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+            [out appendFormat:@"%C", c];
+        } else if (c == ' ' || c == '-' || c == '_') {
+            if (out.length > 0 && [out characterAtIndex:out.length - 1] != '_') {
+                [out appendString:@"_"];
+            }
         }
-
-        [self reloadFromState];
     }
-    return self;
-}
-
-- (void)reloadFromState {
-    AM3DLayerState *st = [[AM3DLayerStore shared] stateForLayerId:self.layerId];
-    float vals[4] = { st.rotX, st.rotY, st.rotZ, st.posZ };
-    for (NSUInteger i = 0; i < 4 && i < self.sliders.count; ++i) {
-        self.sliders[i].value = vals[i];
-        self.valueLabels[i].text = (i < 3)
-            ? [NSString stringWithFormat:@"%.0f°", vals[i]]
-            : [NSString stringWithFormat:@"%.0f", vals[i]];
+    if (out.length == 0) {
+        [out appendFormat:@"fx_%lld", (long long)[[NSDate date] timeIntervalSince1970]];
     }
+    return out;
 }
 
-- (void)onSliderChanged:(UISlider *)sl {
-    AM3DLayerState *st = [[AM3DLayerStore shared] stateForLayerId:self.layerId];
-    switch (sl.tag) {
-        case 0: st.rotX = sl.value; break;
-        case 1: st.rotY = sl.value; break;
-        case 2: st.rotZ = sl.value; break;
-        case 3: st.posZ = sl.value; break;
-        default: break;
+static NSString *AMXmlEscapeAttr(NSString *s) {
+    NSString *r = [s stringByReplacingOccurrencesOfString:@"&" withString:@"&amp;"];
+    r = [r stringByReplacingOccurrencesOfString:@"\"" withString:@"&quot;"];
+    r = [r stringByReplacingOccurrencesOfString:@"<" withString:@"&lt;"];
+    r = [r stringByReplacingOccurrencesOfString:@">" withString:@"&gt;"];
+    return r;
+}
+
+// Normalizes user XML so Alight Motion's VisualEffectParser places it in category="other"
+// with the requested name and optional thumbnail.
+static NSString *AMPrepareEffectXML(NSString *rawXML, NSString *displayName, NSString *slug, BOOL hasCustomThumb, NSError **outError) {
+    NSString *trimmed = [rawXML stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) {
+        if (outError) {
+            *outError = [NSError errorWithDomain:@"AMCustomEffects" code:1
+                                        userInfo:@{NSLocalizedDescriptionKey: @"XML code is empty."}];
+        }
+        return nil;
     }
-    [self reloadFromState];
-}
 
-- (void)onReset {
-    AM3DLayerState *st = [[AM3DLayerStore shared] stateForLayerId:self.layerId];
-    st.rotX = st.rotY = st.rotZ = st.posZ = 0.0f;
-    [self reloadFromState];
-}
+    NSRange openStart = [trimmed rangeOfString:@"<effect" options:NSCaseInsensitiveSearch];
+    if (openStart.location == NSNotFound) {
+        if (outError) {
+            *outError = [NSError errorWithDomain:@"AMCustomEffects" code:2
+                                        userInfo:@{NSLocalizedDescriptionKey: @"Missing <effect ...> root tag in XML."}];
+        }
+        return nil;
+    }
 
-@end
+    NSRange searchRange = NSMakeRange(openStart.location, trimmed.length - openStart.location);
+    NSRange openEnd = [trimmed rangeOfString:@">" options:0 range:searchRange];
+    if (openEnd.location == NSNotFound) {
+        if (outError) {
+            *outError = [NSError errorWithDomain:@"AMCustomEffects" code:3
+                                        userInfo:@{NSLocalizedDescriptionKey: @"Malformed <effect> opening tag."}];
+        }
+        return nil;
+    }
 
-static IMP gOrigEditingInspectorViewDidLoad = NULL;
-static const void *kAM3DToggleBtnKey = &kAM3DToggleBtnKey;
-static const void *kAM3DOverlayKey = &kAM3DOverlayKey;
+    NSRange tagRange = NSMakeRange(openStart.location, (openEnd.location - openStart.location) + 1);
+    NSMutableString *openTag = [[trimmed substringWithRange:tagRange] mutableCopy];
 
-@interface AM3DInspectorHelper : NSObject
-+ (void)onToggle3D:(UIButton *)btn;
-@end
+    // Helper to replace or insert an XML attribute inside <effect ...>
+    void (^setAttr)(NSString *, NSString *) = ^(NSString *attrName, NSString *attrVal) {
+        NSString *escaped = AMXmlEscapeAttr(attrVal);
+        NSString *pattern = [NSString stringWithFormat:@"\\b%@\\s*=\\s*\"[^\"]*\"", attrName];
+        NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:nil];
+        NSRange match = [rx rangeOfFirstMatchInString:openTag options:0 range:NSMakeRange(0, openTag.length)];
+        NSString *replacement = [NSString stringWithFormat:@"%@=\"%@\"", attrName, escaped];
+        if (match.location != NSNotFound) {
+            [openTag replaceCharactersInRange:match withString:replacement];
+        } else {
+            // Insert before closing '>'
+            NSUInteger insertPos = openTag.length - 1;
+            [openTag insertString:[NSString stringWithFormat:@" %@", replacement] atIndex:insertPos];
+        }
+    };
 
-@implementation AM3DInspectorHelper
+    // Ensure unique id if missing
+    NSRegularExpression *idRx = [NSRegularExpression regularExpressionWithPattern:@"\\bid\\s*=\\s*\"[^\"]+\"" options:0 error:nil];
+    if ([idRx rangeOfFirstMatchInString:openTag options:0 range:NSMakeRange(0, openTag.length)].location == NSNotFound) {
+        setAttr(@"id", [NSString stringWithFormat:@"com.custom.effects.%@", slug]);
+    }
 
-+ (void)style3DButton:(UIButton *)btn active:(BOOL)active {
-    if (@available(iOS 13.0, *)) {
-        UIImage *img = [UIImage systemImageNamed:(active ? @"cube.fill" : @"cube")];
-        [btn setImage:img forState:UIControlStateNormal];
+    // Force category="other" and apply chosen display name
+    setAttr(@"category", @"other");
+    setAttr(@"name", displayName);
+
+    // Optional thumbnail
+    if (hasCustomThumb) {
+        setAttr(@"thumb", [NSString stringWithFormat:@"thumb/custom_%@.webp", slug]);
     } else {
-        [btn setTitle:@"3D" forState:UIControlStateNormal];
-    }
-    btn.tintColor = active ? AMAccentGreenColor() : [UIColor colorWithWhite:0.78 alpha:1.0];
-    btn.backgroundColor = active ? [AMAccentGreenColor() colorWithAlphaComponent:0.16] : AMDarkSurfaceColor();
-    btn.layer.cornerRadius = 7.0;
-    btn.layer.borderWidth = 1.0;
-    btn.layer.borderColor = (active ? AMAccentGreenColor() : AMDarkBorderColor()).CGColor;
-}
-
-+ (void)onToggle3D:(UIButton *)btn {
-    UIViewController *vc = objc_getAssociatedObject(btn, kAM3DToggleBtnKey);
-    if (!vc) return;
-    NSString *layerId = [NSString stringWithFormat:@"%p", vc];
-    AM3DLayerState *st = [[AM3DLayerStore shared] stateForLayerId:layerId];
-    st.enabled3D = !st.enabled3D;
-    [self style3DButton:btn active:st.enabled3D];
-
-    AM3DTransformOverlay *ov = objc_getAssociatedObject(vc, kAM3DOverlayKey);
-    if (st.enabled3D) {
-        if (!ov) {
-            ov = [[AM3DTransformOverlay alloc] initWithLayerId:layerId];
-            [vc.view addSubview:ov];
-            [NSLayoutConstraint activateConstraints:@[
-                [ov.leadingAnchor constraintEqualToAnchor:vc.view.leadingAnchor constant:12.0],
-                [ov.trailingAnchor constraintEqualToAnchor:vc.view.trailingAnchor constant:-12.0],
-                [ov.bottomAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.bottomAnchor constant:-12.0],
-            ]];
-            objc_setAssociatedObject(vc, kAM3DOverlayKey, ov, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        NSRegularExpression *thumbRx = [NSRegularExpression regularExpressionWithPattern:@"\\bthumb\\s*=\\s*\"[^\"]+\"" options:0 error:nil];
+        if ([thumbRx rangeOfFirstMatchInString:openTag options:0 range:NSMakeRange(0, openTag.length)].location == NSNotFound) {
+            setAttr(@"thumb", @"thumb/copy-bg.webp");
         }
-        ov.hidden = NO;
-        [ov reloadFromState];
-    } else if (ov) {
-        ov.hidden = YES;
     }
+
+    NSMutableString *result = [trimmed mutableCopy];
+    [result replaceCharactersInRange:tagRange withString:openTag];
+    if (![result hasPrefix:@"<?xml"]) {
+        [result insertString:@"<?xml version='1.0' encoding='UTF-8' ?>\n" atIndex:0];
+    }
+    return result;
 }
 
+static IMP gOrigURLsForResources = NULL;
+static IMP gOrigURLForResource = NULL;
+
+static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd, NSString *ext, NSString *subpath) {
+    NSArray<NSURL *> *orig = nil;
+    if (gOrigURLsForResources) {
+        orig = ((NSArray<NSURL *> *(*)(id, SEL, NSString *, NSString *))gOrigURLsForResources)(self, _cmd, ext, subpath);
+    }
+    if (self == [NSBundle mainBundle] &&
+        ext && [ext caseInsensitiveCompare:@"xml"] == NSOrderedSame &&
+        subpath && [subpath isEqualToString:@"BuiltinEffects"]) {
+        NSString *dir = AMCustomEffectsDir();
+        NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+        if (files.count > 0) {
+            NSMutableArray<NSURL *> *merged = orig ? [orig mutableCopy] : [NSMutableArray array];
+            for (NSString *fn in files) {
+                if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
+                    NSURL *u = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:fn]];
+                    [merged addObject:u];
+                }
+            }
+            return merged;
+        }
+    }
+    return orig;
+}
+
+static NSURL *AMHook_URLForResource(id self, SEL _cmd, NSString *name, NSString *ext, NSString *subpath) {
+    if (self == [NSBundle mainBundle] &&
+        name && [name hasPrefix:@"custom_"] &&
+        subpath && ([subpath isEqualToString:@"BuiltinThumb"] || [subpath isEqualToString:@"thumb"])) {
+        NSString *thumbsDir = AMCustomThumbsDir();
+        NSArray<NSString *> *candidates = @[
+            [thumbsDir stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"png"]],
+            [thumbsDir stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"webp"]],
+            [thumbsDir stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"jpg"]],
+        ];
+        for (NSString *p in candidates) {
+            if ([[NSFileManager defaultManager] fileExistsAtPath:p]) {
+                return [NSURL fileURLWithPath:p];
+            }
+        }
+    }
+    if (gOrigURLForResource) {
+        return ((NSURL *(*)(id, SEL, NSString *, NSString *, NSString *))gOrigURLForResource)(self, _cmd, name, ext, subpath);
+    }
+    return nil;
+}
+
+// ============================================================================
+// Module 2: Custom XML Effect Importer Modal UI (Matches Alight Motion Theme)
+// ============================================================================
+
+@interface AMCustomEffectImporterVC : UIViewController <UIDocumentPickerDelegate, UIImagePickerControllerDelegate, UINavigationControllerDelegate>
+@property (nonatomic, strong) UITextField *nameField;
+@property (nonatomic, strong) UITextView *xmlTextView;
+@property (nonatomic, strong) UIImageView *thumbPreview;
+@property (nonatomic, strong) UIButton *clearThumbBtn;
+@property (nonatomic, strong) UIStackView *installedListStack;
+@property (nonatomic, strong, nullable) UIImage *selectedThumb;
 @end
 
-static void AMHook_editingInspectorViewDidLoad(id self, SEL _cmd) {
-    if (gOrigEditingInspectorViewDidLoad) {
-        ((void (*)(id, SEL))gOrigEditingInspectorViewDidLoad)(self, _cmd);
-    }
+@implementation AMCustomEffectImporterVC
 
-    UIButton *parentBtn = nil;
-    SEL parentSel = NSSelectorFromString(@"parentButton");
-    if ([self respondsToSelector:parentSel]) {
-        parentBtn = ((UIButton *(*)(id, SEL))objc_msgSend)(self, parentSel);
-    }
-    if (!parentBtn || !parentBtn.superview) return;
-    if (objc_getAssociatedObject(self, kAM3DToggleBtnKey) != nil) return;
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = AMBgColor();
+    self.title = @"Import XML Effect";
 
-    UIButton *cubeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    cubeBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    cubeBtn.accessibilityLabel = @"Toggle 3D Layer";
-    [AM3DInspectorHelper style3DButton:cubeBtn active:NO];
-    objc_setAssociatedObject(cubeBtn, kAM3DToggleBtnKey, self, OBJC_ASSOCIATION_ASSIGN);
-    [cubeBtn addTarget:[AM3DInspectorHelper class]
-                action:@selector(onToggle3D:)
-      forControlEvents:UIControlEventTouchUpInside];
+    // Scroll container so keyboard never blocks inputs
+    UIScrollView *scroll = [[UIScrollView alloc] init];
+    scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+    [self.view addSubview:scroll];
+
+    UIStackView *stack = [[UIStackView alloc] init];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 14.0;
+    [scroll addSubview:stack];
 
     [NSLayoutConstraint activateConstraints:@[
-        [cubeBtn.widthAnchor constraintEqualToConstant:30.0],
-        [cubeBtn.heightAnchor constraintEqualToConstant:26.0],
+        [scroll.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [scroll.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [scroll.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [scroll.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+
+        [stack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:16.0],
+        [stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-28.0],
+        [stack.leadingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.leadingAnchor constant:18.0],
+        [stack.trailingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.trailingAnchor constant:-18.0],
     ]];
 
-    if ([parentBtn.superview isKindOfClass:[UIStackView class]]) {
-        UIStackView *sv = (UIStackView *)parentBtn.superview;
-        NSUInteger idx = [sv.arrangedSubviews indexOfObject:parentBtn];
-        if (idx != NSNotFound) {
-            [sv insertArrangedSubview:cubeBtn atIndex:idx + 1];
-        } else {
-            [sv addArrangedSubview:cubeBtn];
-        }
-    } else {
-        [parentBtn.superview addSubview:cubeBtn];
-        [NSLayoutConstraint activateConstraints:@[
-            [cubeBtn.trailingAnchor constraintEqualToAnchor:parentBtn.leadingAnchor constant:-6.0],
-            [cubeBtn.centerYAnchor constraintEqualToAnchor:parentBtn.centerYAnchor],
-        ]];
+    // Top bar inside modal
+    UIStackView *topRow = [[UIStackView alloc] init];
+    topRow.axis = UILayoutConstraintAxisHorizontal;
+    topRow.alignment = UIStackViewAlignmentCenter;
+
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [closeBtn setTitle:@"Close" forState:UIControlStateNormal];
+    [closeBtn setTitleColor:[UIColor colorWithWhite:0.78 alpha:1.0] forState:UIControlStateNormal];
+    closeBtn.titleLabel.font = AMThemeFont(15.0, UIFontWeightMedium);
+    [closeBtn addTarget:self action:@selector(onClose) forControlEvents:UIControlEventTouchUpInside];
+
+    UILabel *hdrLabel = [[UILabel alloc] init];
+    hdrLabel.text = @"Import XML Effect";
+    hdrLabel.textAlignment = NSTextAlignmentCenter;
+    hdrLabel.textColor = [UIColor whiteColor];
+    hdrLabel.font = AMThemeFont(17.0, UIFontWeightBold);
+
+    UIButton *importBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [importBtn setTitle:@"Import" forState:UIControlStateNormal];
+    [importBtn setTitleColor:AMAccentGreenColor() forState:UIControlStateNormal];
+    importBtn.titleLabel.font = AMThemeFont(15.0, UIFontWeightBold);
+    [importBtn addTarget:self action:@selector(onImport) forControlEvents:UIControlEventTouchUpInside];
+
+    [topRow addArrangedSubview:closeBtn];
+    [topRow addArrangedSubview:hdrLabel];
+    [topRow addArrangedSubview:importBtn];
+    [closeBtn.widthAnchor constraintEqualToConstant:60.0].active = YES;
+    [importBtn.widthAnchor constraintEqualToConstant:60.0].active = YES;
+    [stack addArrangedSubview:topRow];
+
+    // Effect Name
+    [stack addArrangedSubview:[self makeSectionLabel:@"EFFECT NAME"]];
+    self.nameField = [[UITextField alloc] init];
+    self.nameField.backgroundColor = AMInputSurfaceColor();
+    self.nameField.textColor = [UIColor whiteColor];
+    self.nameField.font = AMThemeFont(15.0, UIFontWeightMedium);
+    self.nameField.layer.cornerRadius = 10.0;
+    self.nameField.layer.borderWidth = 1.0;
+    self.nameField.layer.borderColor = AMBorderColor().CGColor;
+    self.nameField.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"e.g. Custom CRT Glow"
+                                                                           attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.55 alpha:1.0]}];
+    UIView *pad = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 12, 42)];
+    self.nameField.leftView = pad;
+    self.nameField.leftViewMode = UITextFieldViewModeAlways;
+    [self.nameField.heightAnchor constraintEqualToConstant:44.0].active = YES;
+    [stack addArrangedSubview:self.nameField];
+
+    // Thumbnail Row (Optional)
+    [stack addArrangedSubview:[self makeSectionLabel:@"THUMBNAIL (OPTIONAL)"]];
+    UIStackView *thumbRow = [[UIStackView alloc] init];
+    thumbRow.axis = UILayoutConstraintAxisHorizontal;
+    thumbRow.spacing = 12.0;
+    thumbRow.alignment = UIStackViewAlignmentCenter;
+
+    self.thumbPreview = [[UIImageView alloc] init];
+    self.thumbPreview.backgroundColor = AMInputSurfaceColor();
+    self.thumbPreview.contentMode = UIViewContentModeScaleAspectFill;
+    self.thumbPreview.clipsToBounds = YES;
+    self.thumbPreview.layer.cornerRadius = 10.0;
+    self.thumbPreview.layer.borderWidth = 1.0;
+    self.thumbPreview.layer.borderColor = AMBorderColor().CGColor;
+    [self.thumbPreview.widthAnchor constraintEqualToConstant:58.0].active = YES;
+    [self.thumbPreview.heightAnchor constraintEqualToConstant:58.0].active = YES;
+
+    UIButton *pickThumbBtn = [self makeActionButton:@"Choose Image" action:@selector(onPickThumb)];
+    self.clearThumbBtn = [self makeActionButton:@"Clear" action:@selector(onClearThumb)];
+    self.clearThumbBtn.hidden = YES;
+
+    [thumbRow addArrangedSubview:self.thumbPreview];
+    [thumbRow addArrangedSubview:pickThumbBtn];
+    [thumbRow addArrangedSubview:self.clearThumbBtn];
+    [stack addArrangedSubview:thumbRow];
+
+    // XML Code Section
+    UIStackView *xmlHdr = [[UIStackView alloc] init];
+    xmlHdr.axis = UILayoutConstraintAxisHorizontal;
+    xmlHdr.spacing = 8.0;
+    xmlHdr.alignment = UIStackViewAlignmentCenter;
+    [xmlHdr addArrangedSubview:[self makeSectionLabel:@"XML EFFECT CODE"]];
+    UIButton *pickFileBtn = [self makeCompactPill:@"Open .xml File" action:@selector(onPickXMLFile)];
+    UIButton *pasteBtn = [self makeCompactPill:@"Paste" action:@selector(onPasteXML)];
+    [xmlHdr addArrangedSubview:pickFileBtn];
+    [xmlHdr addArrangedSubview:pasteBtn];
+    [stack addArrangedSubview:xmlHdr];
+
+    self.xmlTextView = [[UITextView alloc] init];
+    self.xmlTextView.backgroundColor = AMInputSurfaceColor();
+    self.xmlTextView.textColor = [UIColor colorWithWhite:0.93 alpha:1.0];
+    self.xmlTextView.font = [UIFont monospacedSystemFontOfSize:12.0 weight:UIFontWeightRegular];
+    self.xmlTextView.layer.cornerRadius = 10.0;
+    self.xmlTextView.layer.borderWidth = 1.0;
+    self.xmlTextView.layer.borderColor = AMBorderColor().CGColor;
+    self.xmlTextView.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    self.xmlTextView.autocorrectionType = UITextAutocorrectionTypeNo;
+    self.xmlTextView.smartQuotesType = UITextSmartQuotesTypeNo;
+    self.xmlTextView.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
+    [self.xmlTextView.heightAnchor constraintEqualToConstant:210.0].active = YES;
+    [stack addArrangedSubview:self.xmlTextView];
+
+    // Installed custom effects list
+    [stack addArrangedSubview:[self makeSectionLabel:@"INSTALLED CUSTOM EFFECTS"]];
+    self.installedListStack = [[UIStackView alloc] init];
+    self.installedListStack.axis = UILayoutConstraintAxisVertical;
+    self.installedListStack.spacing = 8.0;
+    [stack addArrangedSubview:self.installedListStack];
+    [self reloadInstalledList];
+}
+
+- (UILabel *)makeSectionLabel:(NSString *)text {
+    UILabel *l = [[UILabel alloc] init];
+    l.text = text;
+    l.font = AMThemeFont(11.0, UIFontWeightBold);
+    l.textColor = [UIColor colorWithWhite:0.65 alpha:1.0];
+    return l;
+}
+
+- (UIButton *)makeActionButton:(NSString *)title action:(SEL)sel {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.titleLabel.font = AMThemeFont(13.0, UIFontWeightSemibold);
+    b.backgroundColor = AMSurfaceColor();
+    b.layer.cornerRadius = 8.0;
+    b.layer.borderWidth = 1.0;
+    b.layer.borderColor = AMBorderColor().CGColor;
+    b.contentEdgeInsets = UIEdgeInsetsMake(8, 12, 8, 12);
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (UIButton *)makeCompactPill:(NSString *)title action:(SEL)sel {
+    UIButton *b = [self makeActionButton:title action:sel];
+    b.titleLabel.font = AMThemeFont(11.0, UIFontWeightBold);
+    b.contentEdgeInsets = UIEdgeInsetsMake(5, 9, 5, 9);
+    return b;
+}
+
+- (void)reloadInstalledList {
+    for (UIView *v in [self.installedListStack.arrangedSubviews copy]) {
+        [self.installedListStack removeArrangedSubview:v];
+        [v removeFromSuperview];
     }
-    objc_setAssociatedObject(self, kAM3DToggleBtnKey, cubeBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSString *dir = AMCustomEffectsDir();
+    NSArray<NSString *> *files = [[[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil]
+                                  sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    NSInteger shown = 0;
+    for (NSString *fn in files) {
+        if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] != NSOrderedSame) continue;
+        shown++;
+        UIView *card = [[UIView alloc] init];
+        card.backgroundColor = AMSurfaceColor();
+        card.layer.cornerRadius = 9.0;
+
+        UIStackView *row = [[UIStackView alloc] init];
+        row.translatesAutoresizingMaskIntoConstraints = NO;
+        row.axis = UILayoutConstraintAxisHorizontal;
+        row.alignment = UIStackViewAlignmentCenter;
+        row.spacing = 8.0;
+        [card addSubview:row];
+        [NSLayoutConstraint activateConstraints:@[
+            [row.topAnchor constraintEqualToAnchor:card.topAnchor constant:8],
+            [row.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-8],
+            [row.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+            [row.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-10],
+        ]];
+
+        UILabel *lbl = [[UILabel alloc] init];
+        lbl.text = [fn stringByDeletingPathExtension];
+        lbl.textColor = [UIColor whiteColor];
+        lbl.font = AMThemeFont(13.0, UIFontWeightMedium);
+
+        UIButton *delBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        [delBtn setTitle:@"Delete" forState:UIControlStateNormal];
+        [delBtn setTitleColor:[UIColor colorWithRed:0.95 green:0.38 blue:0.42 alpha:1.0] forState:UIControlStateNormal];
+        delBtn.titleLabel.font = AMThemeFont(12.0, UIFontWeightSemibold);
+        delBtn.accessibilityIdentifier = fn;
+        [delBtn addTarget:self action:@selector(onDeleteEffect:) forControlEvents:UIControlEventTouchUpInside];
+
+        [row addArrangedSubview:lbl];
+        [row addArrangedSubview:delBtn];
+        [self.installedListStack addArrangedSubview:card];
+    }
+    if (shown == 0) {
+        UILabel *empty = [[UILabel alloc] init];
+        empty.text = @"No custom XML effects imported yet.";
+        empty.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
+        empty.font = AMThemeFont(13.0, UIFontWeightRegular);
+        [self.installedListStack addArrangedSubview:empty];
+    }
+}
+
+- (void)onClose {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)onPasteXML {
+    NSString *clip = [UIPasteboard generalPasteboard].string;
+    if (clip.length > 0) {
+        self.xmlTextView.text = clip;
+    }
+}
+
+- (void)onPickXMLFile {
+    UIDocumentPickerViewController *picker = nil;
+    if (@available(iOS 14.0, *)) {
+        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeXML, UTTypePlainText, UTTypeText]
+                                                                             asCopy:YES];
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.xml", @"public.plain-text"]
+                                                                        inMode:UIDocumentPickerModeImport];
+#pragma clang diagnostic pop
+    }
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    (void)controller;
+    NSURL *u = urls.firstObject;
+    if (!u) return;
+    NSString *txt = [NSString stringWithContentsOfURL:u encoding:NSUTF8StringEncoding error:nil];
+    if (txt.length > 0) {
+        self.xmlTextView.text = txt;
+        if (self.nameField.text.length == 0) {
+            self.nameField.text = [[u lastPathComponent] stringByDeletingPathExtension];
+        }
+    }
+}
+
+- (void)onPickThumb {
+    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)onClearThumb {
+    self.selectedThumb = nil;
+    self.thumbPreview.image = nil;
+    self.clearThumbBtn.hidden = YES;
+}
+
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
+    UIImage *img = info[UIImagePickerControllerOriginalImage];
+    if (img) {
+        // Resize cleanly to 256x256 square thumbnail
+        CGSize target = CGSizeMake(256, 256);
+        UIGraphicsBeginImageContextWithOptions(target, NO, 1.0);
+        [img drawInRect:CGRectMake(0, 0, target.width, target.height)];
+        UIImage *resized = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        self.selectedThumb = resized ?: img;
+        self.thumbPreview.image = self.selectedThumb;
+        self.clearThumbBtn.hidden = NO;
+    }
+    [picker dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)onDeleteEffect:(UIButton *)btn {
+    NSString *fn = btn.accessibilityIdentifier;
+    if (!fn) return;
+    NSString *slug = [fn stringByDeletingPathExtension];
+    [[NSFileManager defaultManager] removeItemAtPath:[AMCustomEffectsDir() stringByAppendingPathComponent:fn] error:nil];
+    [[NSFileManager defaultManager] removeItemAtPath:[AMCustomThumbsDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"custom_%@.png", slug]] error:nil];
+    [self reloadInstalledList];
+}
+
+- (void)showAlertTitle:(NSString *)t message:(NSString *)m {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:t message:m preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)onImport {
+    NSString *name = [self.nameField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (name.length == 0) {
+        [self showAlertTitle:@"Missing Name" message:@"Enter a name for the custom effect."];
+        return;
+    }
+    NSString *slug = AMSanitizeSlug(name);
+    NSError *err = nil;
+    NSString *prepared = AMPrepareEffectXML(self.xmlTextView.text, name, slug, (self.selectedThumb != nil), &err);
+    if (!prepared) {
+        [self showAlertTitle:@"Invalid XML" message:(err.localizedDescription ?: @"Could not parse XML.")];
+        return;
+    }
+
+    NSString *xmlPath = [AMCustomEffectsDir() stringByAppendingPathComponent:[slug stringByAppendingPathExtension:@"xml"]];
+    if (![prepared writeToFile:xmlPath atomically:YES encoding:NSUTF8StringEncoding error:&err]) {
+        [self showAlertTitle:@"Save Failed" message:(err.localizedDescription ?: @"Could not write XML file.")];
+        return;
+    }
+
+    if (self.selectedThumb) {
+        NSData *png = UIImagePNGRepresentation(self.selectedThumb);
+        if (png) {
+            NSString *thumbPath = [AMCustomThumbsDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"custom_%@.png", slug]];
+            [png writeToFile:thumbPath atomically:YES];
+        }
+    }
+
+    [self reloadInstalledList];
+    UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Effect Imported"
+                                                                  message:[NSString stringWithFormat:@"Saved '%@' into Other. Relaunch Alight Motion for the new effect to appear in the Other grid.", name]
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+    [done addAction:[UIAlertAction actionWithTitle:@"Done" style:UIAlertActionStyleDefault handler:^(__kindof UIAlertAction * _Nonnull a) {
+        (void)a;
+        [self dismissViewControllerAnimated:YES completion:nil];
+    }]];
+    [self presentViewController:done animated:YES completion:nil];
+}
+
+@end
+
+// ============================================================================
+// Module 2: Hook EffectPickerCategoryVC to place `+` button in "Other"
+// ============================================================================
+
+static IMP gOrigEffectCatViewWillAppear = NULL;
+static const void *kAMImportPlusBtnKey = &kAMImportPlusBtnKey;
+
+static BOOL AMViewHierarchyContainsOtherTitle(UIView *v, NSInteger depth) {
+    if (!v || depth > 5) return NO;
+    if ([v isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)v).text;
+        if (t && [t caseInsensitiveCompare:@"Other"] == NSOrderedSame) return YES;
+    }
+    for (UIView *sub in v.subviews) {
+        if (AMViewHierarchyContainsOtherTitle(sub, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+static BOOL AMIsOtherEffectCategoryVC(UIViewController *vc) {
+    if (vc.title && [vc.title caseInsensitiveCompare:@"Other"] == NSOrderedSame) return YES;
+    if (vc.navigationItem.title && [vc.navigationItem.title caseInsensitiveCompare:@"Other"] == NSOrderedSame) return YES;
+    if (vc.navigationController && AMViewHierarchyContainsOtherTitle(vc.navigationController.navigationBar, 0)) return YES;
+    if (AMViewHierarchyContainsOtherTitle(vc.view, 0)) return YES;
+    return NO;
+}
+
+@interface AMEffectImportPresenter : NSObject
++ (void)onTapPlus:(UIButton *)btn;
+@end
+
+@implementation AMEffectImportPresenter
+
++ (void)onTapPlus:(UIButton *)btn {
+    UIViewController *vc = objc_getAssociatedObject(btn, kAMImportPlusBtnKey);
+    if (!vc) return;
+    AMCustomEffectImporterVC *importer = [[AMCustomEffectImporterVC alloc] init];
+    importer.modalPresentationStyle = UIModalPresentationPageSheet;
+    [vc presentViewController:importer animated:YES completion:nil];
+}
+
+@end
+
+static void AMHook_effectCategoryViewWillAppear(id self, SEL _cmd, BOOL animated) {
+    if (gOrigEffectCatViewWillAppear) {
+        ((void (*)(id, SEL, BOOL))gOrigEffectCatViewWillAppear)(self, _cmd, animated);
+    }
+
+    UIViewController *vc = (UIViewController *)self;
+    // Check on next runloop tick too in case title is set right after viewWillAppear
+    dispatch_async(dispatch_get_main_queue(), ^{
+        BOOL isOther = AMIsOtherEffectCategoryVC(vc);
+        UIButton *existing = objc_getAssociatedObject(vc, kAMImportPlusBtnKey);
+        if (!isOther) {
+            if (existing) existing.hidden = YES;
+            return;
+        }
+        if (existing) {
+            existing.hidden = NO;
+            return;
+        }
+
+        // Circular translucent '+' button matching Alight Motion's top-left '<' back button
+        UIButton *plusBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        plusBtn.translatesAutoresizingMaskIntoConstraints = NO;
+        plusBtn.accessibilityLabel = @"Import Custom XML Effect";
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:18.0 weight:UIImageSymbolWeightMedium];
+            [plusBtn setImage:[UIImage systemImageNamed:@"plus" withConfiguration:cfg] forState:UIControlStateNormal];
+        } else {
+            [plusBtn setTitle:@"+" forState:UIControlStateNormal];
+            plusBtn.titleLabel.font = AMThemeFont(22.0, UIFontWeightMedium);
+        }
+        plusBtn.tintColor = [UIColor whiteColor];
+        plusBtn.backgroundColor = AMCircleBtnColor();
+        plusBtn.layer.cornerRadius = 19.0;
+        plusBtn.layer.borderWidth = 0.75;
+        plusBtn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.22].CGColor;
+        [NSLayoutConstraint activateConstraints:@[
+            [plusBtn.widthAnchor constraintEqualToConstant:38.0],
+            [plusBtn.heightAnchor constraintEqualToConstant:38.0],
+        ]];
+
+        objc_setAssociatedObject(plusBtn, kAMImportPlusBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
+        [plusBtn addTarget:[AMEffectImportPresenter class]
+                    action:@selector(onTapPlus:)
+          forControlEvents:UIControlEventTouchUpInside];
+
+        if (vc.navigationController && !vc.navigationController.navigationBarHidden) {
+            UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithCustomView:plusBtn];
+            vc.navigationItem.rightBarButtonItem = item;
+        } else {
+            [vc.view addSubview:plusBtn];
+            [NSLayoutConstraint activateConstraints:@[
+                [plusBtn.trailingAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.trailingAnchor constant:-16.0],
+                [plusBtn.topAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor constant:8.0],
+            ]];
+        }
+
+        objc_setAssociatedObject(vc, kAMImportPlusBtnKey, plusBtn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    });
 }
 
 // ============================================================================
-// Constructor: Install Hooks Safely on Launch
+// Constructor: Install All Hooks Safely on Launch
 // ============================================================================
 
 static void AMSwizzleMethod(NSString *className, NSString *selName, IMP replacement, IMP *outOrig) {
@@ -591,6 +865,7 @@ static void AlightMotionModsInit(void) {
         gPreviewDivisor = saved;
     }
 
+    // Module 1: Preview Quality Engine + Flat White One-Tap Ladder Button
     AMSwizzleMethod(@"_TtC12AlightMotion12AMCompositor",
                     @"startVideoCompositionRequest:",
                     (IMP)AMHook_startVideoCompositionRequest,
@@ -601,8 +876,19 @@ static void AlightMotionModsInit(void) {
                     (IMP)AMHook_previewControlBarViewDidLoad,
                     &gOrigPreviewControlBarViewDidLoad);
 
-    AMSwizzleMethod(@"_TtC12AlightMotion18EditingInspectorVC",
-                    @"viewDidLoad",
-                    (IMP)AMHook_editingInspectorViewDidLoad,
-                    &gOrigEditingInspectorViewDidLoad);
+    // Module 2: Custom XML Effect Importer (NSBundle hooks + '+' in Other category)
+    AMSwizzleMethod(@"NSBundle",
+                    @"URLsForResourcesWithExtension:subdirectory:",
+                    (IMP)AMHook_URLsForResourcesWithExtension,
+                    &gOrigURLsForResources);
+
+    AMSwizzleMethod(@"NSBundle",
+                    @"URLForResource:withExtension:subdirectory:",
+                    (IMP)AMHook_URLForResource,
+                    &gOrigURLForResource);
+
+    AMSwizzleMethod(@"_TtC12AlightMotion22EffectPickerCategoryVC",
+                    @"viewWillAppear:",
+                    (IMP)AMHook_effectCategoryViewWillAppear,
+                    &gOrigEffectCatViewWillAppear);
 }

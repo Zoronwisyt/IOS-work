@@ -27,6 +27,7 @@ jobs:
             -framework UIKit \
             -framework QuartzCore \
             -framework CoreGraphics \
+            -framework UniformTypeIdentifiers \
             -o AlightMotionMods.dylib \
             AlightMotionMods.mm
           codesign -f -s - AlightMotionMods.dylib
