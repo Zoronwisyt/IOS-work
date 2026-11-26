@@ -1608,6 +1608,9 @@ static UIViewController *AMTopMostViewController(void) {
     return vc;
 }
 
+static BOOL gAMFoldersModalOpen = NO;
+static NSArray<NSString *> *gAMCachedProjectNames = nil;
+
 static BOOL AMStringLooksLikeProjectMetadata(NSString *s) {
     if (s.length == 0 || s.length > 90) return YES;
     NSString *low = s.lowercaseString;
@@ -1616,57 +1619,148 @@ static BOOL AMStringLooksLikeProjectMetadata(NSString *s) {
     dispatch_once(&onceToken, ^{
         chrome = [NSSet setWithArray:@[
             @"your projects", @"projects", @"your templates", @"elements", @"cloud",
-            @"home", @"tutorials", @"templates", @"upload", @"new", @"alight motion",
-            @"folders", @"folder", @"all", @"edit", @"select", @"cancel", @"done",
-            @"upload an xml file from your device"
+            @"cloud projects", @"home", @"tutorials", @"templates", @"upload", @"new",
+            @"alight motion", @"folders", @"folder", @"all", @"edit", @"select",
+            @"cancel", @"done", @"upload an xml file from your device", @"more",
+            @"menu", @"profile", @"account", @"create", @"settings", @"close"
         ]];
     });
     if ([chrome containsObject:low]) return YES;
+    if ([low hasPrefix:@"folders ("]) return YES;
     if ([low hasSuffix:@"fps"] || [low hasSuffix:@"mb"] || [low hasSuffix:@"kb"] || [low hasSuffix:@"gb"]) return YES;
     if ([low rangeOfString:@"^\\d+x\\d+$" options:NSRegularExpressionSearch].location != NSNotFound) return YES;
     if ([low rangeOfString:@"^\\d{2}:\\d{2}(:\\d{2})?$" options:NSRegularExpressionSearch].location != NSNotFound) return YES;
     return NO;
 }
 
-// Finds the view rendering the "Your projects" section header (SwiftUI label or accessibility element)
-static UIView *AMFindYourProjectsHeaderView(UIView *v, NSInteger depth) {
-    if (!v || v.hidden || v.alpha < 0.05 || depth > 14) return nil;
-    if ([v isKindOfClass:[UILabel class]]) {
-        NSString *t = ((UILabel *)v).text;
-        if (t && [t.lowercaseString isEqualToString:@"your projects"]) return v;
+typedef struct {
+    BOOL foundYourProjects;
+    CGRect yourProjectsFrameInWin;
+    BOOL foundProjectsTabChrome;
+} AMProjectsScreenProbe;
+
+static void AMProbeAccessibilityObject(id obj, UIWindow *win, AMProjectsScreenProbe *probe, NSInteger depth) {
+    if (!obj || depth > 14) return;
+    if ([obj isKindOfClass:[UIView class]]) {
+        UIView *v = (UIView *)obj;
+        if (v.hidden || v.alpha < 0.05) return;
+        if ([v isKindOfClass:[UILabel class]]) {
+            NSString *t = [((UILabel *)v).text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            NSString *low = t.lowercaseString;
+            if ([low isEqualToString:@"your projects"]) {
+                probe->foundYourProjects = YES;
+                probe->yourProjectsFrameInWin = [v convertRect:v.bounds toView:win];
+            } else if ([low isEqualToString:@"your templates"] || [low containsString:@"upload an xml"]) {
+                probe->foundProjectsTabChrome = YES;
+            }
+        }
     }
-    NSString *acc = v.accessibilityLabel;
-    if (acc && [acc.lowercaseString isEqualToString:@"your projects"]) return v;
-    for (UIView *sub in v.subviews) {
-        UIView *hit = AMFindYourProjectsHeaderView(sub, depth + 1);
-        if (hit) return hit;
+    if ([obj respondsToSelector:@selector(accessibilityLabel)]) {
+        NSString *lbl = [obj accessibilityLabel];
+        if (lbl.length > 0) {
+            NSString *low = [[lbl stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+            if ([low isEqualToString:@"your projects"] || [low hasPrefix:@"your projects,"]) {
+                probe->foundYourProjects = YES;
+                if ([obj respondsToSelector:@selector(accessibilityFrame)]) {
+                    CGRect screenRect = [obj accessibilityFrame];
+                    if (!CGRectIsEmpty(screenRect)) {
+                        probe->yourProjectsFrameInWin = [win convertRect:screenRect fromWindow:nil];
+                    }
+                }
+            } else if ([low isEqualToString:@"your templates"] || [low containsString:@"upload an xml"]) {
+                probe->foundProjectsTabChrome = YES;
+            }
+        }
     }
-    return nil;
+    if ([obj respondsToSelector:@selector(accessibilityElements)]) {
+        NSArray *elems = [obj accessibilityElements];
+        if ([elems isKindOfClass:[NSArray class]] && elems.count > 0) {
+            for (id child in elems) {
+                AMProbeAccessibilityObject(child, win, probe, depth + 1);
+            }
+        } else if ([obj respondsToSelector:@selector(accessibilityElementCount)] &&
+                   [obj respondsToSelector:@selector(accessibilityElementAtIndex:)]) {
+            NSInteger cnt = [obj accessibilityElementCount];
+            if (cnt > 0 && cnt < 200) {
+                for (NSInteger i = 0; i < cnt; ++i) {
+                    id child = [obj accessibilityElementAtIndex:i];
+                    if (child && child != obj) {
+                        AMProbeAccessibilityObject(child, win, probe, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+    if ([obj isKindOfClass:[UIView class]]) {
+        for (UIView *sub in ((UIView *)obj).subviews) {
+            AMProbeAccessibilityObject(sub, win, probe, depth + 1);
+        }
+    }
 }
 
-static void AMCollectVisibleProjectNamesInView(UIView *v, NSMutableOrderedSet<NSString *> *out, NSInteger depth) {
-    if (!v || v.hidden || v.alpha < 0.05 || depth > 16) return;
-    if ([v isKindOfClass:[UILabel class]]) {
-        NSString *t = [((UILabel *)v).text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (!AMStringLooksLikeProjectMetadata(t)) {
-            [out addObject:t];
-        }
-    } else if (v.accessibilityLabel.length > 0 && v.subviews.count == 0) {
-        NSString *t = [v.accessibilityLabel stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (!AMStringLooksLikeProjectMetadata(t)) {
-            [out addObject:t];
+static void AMExtractCandidateProjectName(NSString *raw, NSMutableOrderedSet<NSString *> *out) {
+    if (raw.length == 0) return;
+    NSArray<NSString *> *lines = [raw componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    for (NSString *line in lines) {
+        NSString *firstPart = [[line componentsSeparatedByString:@", "].firstObject stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (!AMStringLooksLikeProjectMetadata(firstPart)) {
+            [out addObject:firstPart];
+            return;
         }
     }
-    for (UIView *sub in v.subviews) {
-        AMCollectVisibleProjectNamesInView(sub, out, depth + 1);
+}
+
+static void AMCollectVisibleProjectNamesInObject(id obj, NSMutableOrderedSet<NSString *> *out, NSInteger depth) {
+    if (!obj || depth > 16) return;
+    if ([obj isKindOfClass:[UIView class]]) {
+        UIView *v = (UIView *)obj;
+        if (v.hidden || v.alpha < 0.05) return;
+        if ([v isKindOfClass:[UILabel class]]) {
+            AMExtractCandidateProjectName(((UILabel *)v).text, out);
+        }
+    }
+    if ([obj respondsToSelector:@selector(accessibilityLabel)]) {
+        NSString *lbl = [obj accessibilityLabel];
+        if (lbl.length > 0) {
+            AMExtractCandidateProjectName(lbl, out);
+        }
+    }
+    if ([obj respondsToSelector:@selector(accessibilityElements)]) {
+        NSArray *elems = [obj accessibilityElements];
+        if ([elems isKindOfClass:[NSArray class]] && elems.count > 0) {
+            for (id child in elems) {
+                AMCollectVisibleProjectNamesInObject(child, out, depth + 1);
+            }
+        } else if ([obj respondsToSelector:@selector(accessibilityElementCount)] &&
+                   [obj respondsToSelector:@selector(accessibilityElementAtIndex:)]) {
+            NSInteger cnt = [obj accessibilityElementCount];
+            if (cnt > 0 && cnt < 200) {
+                for (NSInteger i = 0; i < cnt; ++i) {
+                    id child = [obj accessibilityElementAtIndex:i];
+                    if (child && child != obj) {
+                        AMCollectVisibleProjectNamesInObject(child, out, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+    if ([obj isKindOfClass:[UIView class]]) {
+        for (UIView *sub in ((UIView *)obj).subviews) {
+            AMCollectVisibleProjectNamesInObject(sub, out, depth + 1);
+        }
     }
 }
 
 static NSArray<NSString *> *AMDiscoverAllProjectNames(void) {
     NSMutableOrderedSet<NSString *> *names = [NSMutableOrderedSet orderedSet];
-    UIWindow *win = AMKeyWindow();
-    if (win) {
-        AMCollectVisibleProjectNamesInView(win, names, 0);
+    if (gAMCachedProjectNames.count > 0) {
+        [names addObjectsFromArray:gAMCachedProjectNames];
+    }
+    if (!gAMFoldersModalOpen) {
+        UIWindow *win = AMKeyWindow();
+        if (win) {
+            AMCollectVisibleProjectNamesInObject(win, names, 0);
+        }
     }
     // Also include any project names already stored in folders so they remain manageable
     for (NSDictionary *f in AMLoadProjectFolders()) {
@@ -1894,11 +1988,20 @@ static NSArray<NSString *> *AMDiscoverAllProjectNames(void) {
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    gAMFoldersModalOpen = YES;
     self.folders = AMLoadProjectFolders();
     [self.tableView reloadData];
 }
 
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    if (self.isBeingDismissed || self.navigationController.isBeingDismissed) {
+        gAMFoldersModalOpen = NO;
+    }
+}
+
 - (void)onClose {
+    gAMFoldersModalOpen = NO;
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
@@ -2101,34 +2204,43 @@ static NSArray<NSString *> *AMDiscoverAllProjectNames(void) {
 - (void)tick {
     UIWindow *win = AMKeyWindow();
     if (!win) return;
-    UIViewController *top = AMTopMostViewController();
-    // Hide when a modal sheet (like our own folders sheet or settings) is presented
-    if (top != win.rootViewController) {
+    if (gAMFoldersModalOpen) {
         self.foldersPill.hidden = YES;
         return;
     }
-    UIView *hdr = AMFindYourProjectsHeaderView(win, 0);
-    if (!hdr) {
+
+    AMProjectsScreenProbe probe = { NO, CGRectZero, NO };
+    AMProbeAccessibilityObject(win, win, &probe, 0);
+
+    if (!probe.foundYourProjects && !probe.foundProjectsTabChrome) {
         self.foldersPill.hidden = YES;
         return;
     }
+
     [self ensurePillInWindow:win];
     [self refreshPillBadge];
-    CGRect hdrFrame = [hdr convertRect:hdr.bounds toView:win];
     CGSize pillSize = self.foldersPill.bounds.size;
-    if (pillSize.width < 84.0) pillSize.width = 84.0;
-    if (pillSize.height < 30.0) pillSize.height = 30.0;
+    if (pillSize.width < 92.0) pillSize.width = 92.0;
+    if (pillSize.height < 32.0) pillSize.height = 32.0;
+
     CGFloat x = win.bounds.size.width - pillSize.width - 16.0;
-    CGFloat y = CGRectGetMidY(hdrFrame) - (pillSize.height * 0.5);
-    if (y < win.safeAreaInsets.top + 8.0) {
-        self.foldersPill.hidden = YES;
-        return;
+    CGFloat y = 0.0;
+    if (probe.foundYourProjects && !CGRectIsEmpty(probe.yourProjectsFrameInWin) &&
+        CGRectGetMidY(probe.yourProjectsFrameInWin) > win.safeAreaInsets.top + 40.0 &&
+        CGRectGetMidY(probe.yourProjectsFrameInWin) < win.bounds.size.height - win.safeAreaInsets.bottom - 90.0) {
+        y = CGRectGetMidY(probe.yourProjectsFrameInWin) - (pillSize.height * 0.5);
+    } else {
+        // Fallback: neatly docked bottom-right above the tab bar when "Your projects" is scrolled off-screen
+        y = win.bounds.size.height - win.safeAreaInsets.bottom - 112.0;
     }
+
     self.foldersPill.frame = CGRectMake(x, y, pillSize.width, pillSize.height);
     self.foldersPill.hidden = NO;
 }
 
 - (void)onTapFoldersPill {
+    // Snapshot visible project names from Your projects BEFORE presenting the modal sheet
+    gAMCachedProjectNames = AMDiscoverAllProjectNames();
     UIViewController *top = AMTopMostViewController();
     if (!top) return;
     AMProjectFoldersVC *vc = [[AMProjectFoldersVC alloc] init];
