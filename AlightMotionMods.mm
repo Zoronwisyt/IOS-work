@@ -25,6 +25,7 @@
 #import <stdint.h>
 #import <stdlib.h>
 #import <dlfcn.h>
+#import <sys/xattr.h>
 
 static NSString *const kAMPreviewQualityKey = @"AMModPreviewQualityDivisor";
 static NSInteger gPreviewDivisor = 1; // 1=Full, 2=Half, 3=Third, 4=Quarter
@@ -1599,7 +1600,7 @@ static BOOL AMIsOnHomepage(UIWindow *win) {
 }
 
 static NSString *AMExtractXMLAttr(NSString *tag, NSString *attrName) {
-    NSString *pattern = [NSString stringWithFormat:@"\\b%@\\s*=\\s*\"([^\"]+)\"", attrName];
+    NSString *pattern = [NSString stringWithFormat:@"\\b%@\\s*=\\s*[\"']([^\"']+)[\"']", attrName];
     NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:pattern options:NSRegularExpressionCaseInsensitive error:nil];
     NSTextCheckingResult *m = [rx firstMatchInString:tag options:0 range:NSMakeRange(0, tag.length)];
     if (!m || m.numberOfRanges < 2) return nil;
@@ -1734,56 +1735,101 @@ static void AMScanSQLiteForProjects(NSString *dbPath,
     p_close(db);
 }
 
-// Scans Alight Motion's real local project storage (Documents & Application Support)
-// for SQLite/CoreData project databases, <scene title="..."> XMLs (with or without .xml),
-// project metadata JSONs, and .amproj files.
+// Reads Alight Motion's `com.alightcreative.motion.sceneinfo` extended attribute (JSON or plist)
+static NSDictionary<NSString *, NSString *> *AMReadSceneInfoXattr(NSString *filePath) {
+    const char *path = filePath.UTF8String;
+    if (!path) return nil;
+    ssize_t sz = getxattr(path, "com.alightcreative.motion.sceneinfo", NULL, 0, 0, 0);
+    if (sz <= 0 || sz > 65536) return nil;
+    NSMutableData *buf = [NSMutableData dataWithLength:(NSUInteger)sz];
+    ssize_t got = getxattr(path, "com.alightcreative.motion.sceneinfo", buf.mutableBytes, (size_t)sz, 0, 0);
+    if (got <= 0) return nil;
+
+    id obj = [NSJSONSerialization JSONObjectWithData:buf options:0 error:nil];
+    if (![obj isKindOfClass:[NSDictionary class]]) {
+        obj = [NSPropertyListSerialization propertyListWithData:buf options:NSPropertyListImmutable format:NULL error:nil];
+    }
+    if (![obj isKindOfClass:[NSDictionary class]]) return nil;
+    NSDictionary *d = (NSDictionary *)obj;
+    NSString *title = [d[@"title"] isKindOfClass:[NSString class]] ? d[@"title"] :
+                      ([d[@"name"] isKindOfClass:[NSString class]] ? d[@"name"] : nil);
+    title = [title stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (title.length == 0) return nil;
+
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    if (d[@"width"] && d[@"height"]) {
+        [parts addObject:[NSString stringWithFormat:@"%@x%@", d[@"width"], d[@"height"]]];
+    }
+    if (d[@"fps"]) {
+        [parts addObject:[NSString stringWithFormat:@"%@fps", d[@"fps"]]];
+    }
+    NSString *meta = parts.count > 0 ? [parts componentsJoinedByString:@"  •  "] : @"Alight Motion Project";
+    return @{@"title": title, @"meta": meta, @"path": filePath};
+}
+
+// Scans Alight Motion's real local project storage:
+//   1. NSLibraryDirectory (`Library/` — where Alight Motion stores project `.xml` files
+//      with `com.alightcreative.motion.sceneinfo` xattrs and `<scene title="...">` headers)
+//   2. NSDocumentDirectory (`Documents/` — user-imported `.amproj` / `.xml` files)
 static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDisk(void) {
     NSMutableArray<NSDictionary<NSString *, NSString *> *> *results = [NSMutableArray array];
+    NSMutableSet<NSString *> *seenPaths = [NSMutableSet set];
     NSMutableSet<NSString *> *seenTitles = [NSMutableSet set];
     NSFileManager *fm = [NSFileManager defaultManager];
 
     NSMutableArray<NSString *> *roots = [NSMutableArray array];
+    NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    NSString *appSup = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+    if (lib) [roots addObject:lib];
     if (docs) [roots addObject:docs];
-    if (appSup) [roots addObject:appSup];
 
-    NSSet<NSString *> *skipDirs = [NSSet setWithArray:@[
-        @"CustomEffects", @"ProjectFolders", @"Firebase", @"Google", @"Amplitude",
-        @"Caches", @"Logs", @"Crashlytics", @"com.apple.nsurlsessiond", @"Inbox"
+    NSSet<NSString *> *skipTopDirs = [NSSet setWithArray:@[
+        @"Caches", @"Preferences", @"Cookies", @"SplashBoard", @"Saved Application State",
+        @"HTTPStorages", @"WebKit", @"CustomEffects", @"ProjectFolders", @"Firebase",
+        @"Google", @"Amplitude", @"Logs", @"Crashlytics", @"com.apple.nsurlsessiond", @"Inbox"
     ]];
 
     for (NSString *root in roots) {
         NSDirectoryEnumerator<NSString *> *en = [fm enumeratorAtPath:root];
         NSString *rel = nil;
         NSInteger scanned = 0;
-        while ((rel = [en nextObject]) != nil && scanned < 3000) {
+        while ((rel = [en nextObject]) != nil && scanned < 6000) {
             scanned++;
             NSString *firstComp = rel.pathComponents.firstObject ?: @"";
-            if ([skipDirs containsObject:firstComp]) {
+            if ([skipTopDirs containsObject:firstComp]) {
                 [en skipDescendants];
                 continue;
             }
             NSString *full = [root stringByAppendingPathComponent:rel];
+            if ([seenPaths containsObject:full]) continue;
+
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+
             NSString *ext = rel.pathExtension.lowercaseString;
             NSString *fnameLow = rel.lastPathComponent.lowercaseString;
 
-            if ([ext isEqualToString:@"sqlite"] || [ext isEqualToString:@"sqlite3"] || [ext isEqualToString:@"db"]) {
-                if ([fnameLow containsString:@"remoteconfig"] || [fnameLow containsString:@"vng_vision"] ||
-                    [fnameLow containsString:@"google"] || [fnameLow containsString:@"firebase"] ||
-                    [fnameLow containsString:@"amplitude"] || [fnameLow containsString:@"cache"]) {
-                    continue;
+            // 1. Check `com.alightcreative.motion.sceneinfo` xattr first (fast, authoritative)
+            if ([ext isEqualToString:@"xml"] || ext.length == 0 || [ext isEqualToString:@"amproj"]) {
+                NSDictionary<NSString *, NSString *> *xinfo = AMReadSceneInfoXattr(full);
+                if (xinfo) {
+                    NSString *t = xinfo[@"title"];
+                    if (t.length > 0 && ![seenTitles containsObject:t]) {
+                        [seenTitles addObject:t];
+                        [seenPaths addObject:full];
+                        [results addObject:xinfo];
+                        continue;
+                    }
                 }
-                AMScanSQLiteForProjects(full, results, seenTitles);
-            } else if ([ext isEqualToString:@"xml"] || ext.length == 0) {
-                BOOL isDir = NO;
-                if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+            }
+
+            // 2. Parse `.xml` (or extensionless XML) for `<scene ... title="..." ...>`
+            if ([ext isEqualToString:@"xml"] || ext.length == 0) {
                 NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:full];
-                NSData *head = [fh readDataOfLength:2048];
+                NSData *head = [fh readDataOfLength:8192];
                 [fh closeFile];
                 if (head.length < 16) continue;
-                // Check for SQLite header even on extensionless DB files ("SQLite format 3\0")
-                if (head.length >= 16 && memcmp(head.bytes, "SQLite format 3", 15) == 0) {
+                if (memcmp(head.bytes, "SQLite format 3", 15) == 0) {
                     AMScanSQLiteForProjects(full, results, seenTitles);
                     continue;
                 }
@@ -1796,6 +1842,7 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
                 NSString *title = AMExtractXMLAttr(tag, @"title");
                 if (title.length == 0 || [seenTitles containsObject:title]) continue;
                 [seenTitles addObject:title];
+                [seenPaths addObject:full];
 
                 NSString *w = AMExtractXMLAttr(tag, @"width");
                 NSString *h = AMExtractXMLAttr(tag, @"height");
@@ -1805,32 +1852,18 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *AMLoadUserProjectsFromDi
                 if (fps.length > 0) [parts addObject:[NSString stringWithFormat:@"%@fps", fps]];
                 NSString *meta = parts.count > 0 ? [parts componentsJoinedByString:@"  •  "] : @"Alight Motion Project";
                 [results addObject:@{@"title": title, @"meta": meta, @"path": full}];
-            } else if ([ext isEqualToString:@"json"]) {
-                NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
-                unsigned long long fsize = [attrs fileSize];
-                if (fsize == 0 || fsize > 262144) continue;
-                NSData *d = [NSData dataWithContentsOfFile:full];
-                if (d.length == 0) continue;
-                id obj = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-                if (![obj isKindOfClass:[NSDictionary class]]) continue;
-                NSDictionary *dict = (NSDictionary *)obj;
-                BOOL looksLikeProj = (dict[@"fps"] != nil || dict[@"width"] != nil || dict[@"scene"] != nil || dict[@"projectId"] != nil || dict[@"duration"] != nil);
-                if (!looksLikeProj) continue;
-                NSString *title = [dict[@"title"] isKindOfClass:[NSString class]] ? dict[@"title"] :
-                                  ([dict[@"name"] isKindOfClass:[NSString class]] ? dict[@"name"] : nil);
-                title = [title stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-                if (title.length == 0 || [seenTitles containsObject:title]) continue;
-                [seenTitles addObject:title];
-
-                NSMutableArray<NSString *> *parts = [NSMutableArray array];
-                if (dict[@"width"] && dict[@"height"]) [parts addObject:[NSString stringWithFormat:@"%@x%@", dict[@"width"], dict[@"height"]]];
-                if (dict[@"fps"]) [parts addObject:[NSString stringWithFormat:@"%@fps", dict[@"fps"]]];
-                NSString *meta = parts.count > 0 ? [parts componentsJoinedByString:@"  •  "] : @"Alight Motion Project";
-                [results addObject:@{@"title": title, @"meta": meta, @"path": full}];
+            } else if ([ext isEqualToString:@"sqlite"] || [ext isEqualToString:@"sqlite3"] || [ext isEqualToString:@"db"]) {
+                if ([fnameLow containsString:@"remoteconfig"] || [fnameLow containsString:@"vng_vision"] ||
+                    [fnameLow containsString:@"google"] || [fnameLow containsString:@"firebase"] ||
+                    [fnameLow containsString:@"amplitude"] || [fnameLow containsString:@"cache"]) {
+                    continue;
+                }
+                AMScanSQLiteForProjects(full, results, seenTitles);
             } else if ([ext isEqualToString:@"amproj"]) {
                 NSString *title = [[rel lastPathComponent] stringByDeletingPathExtension];
                 if (title.length == 0 || [seenTitles containsObject:title]) continue;
                 [seenTitles addObject:title];
+                [seenPaths addObject:full];
                 [results addObject:@{@"title": title, @"meta": @"Alight Motion Package (.amproj)", @"path": full}];
             }
         }
