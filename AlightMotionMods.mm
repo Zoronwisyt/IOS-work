@@ -1784,11 +1784,8 @@ static UIViewController *AMFindMainVCInHierarchy(UIViewController *vc, NSInteger
 
 static BOOL AMVCTreeContainsEditor(UIViewController *vc, NSInteger depth) {
     if (!vc || depth > 10) return NO;
-    if (vc.presentedViewController != nil) return YES;
     NSString *clsName = NSStringFromClass([vc class]) ?: @"";
     if ([clsName containsString:@"ProjectEdit"] ||
-        [clsName containsString:@"CreateProject"] ||
-        [clsName containsString:@"NewProject"] ||
         [clsName containsString:@"PreviewControlBar"] ||
         [clsName containsString:@"EffectPicker"] ||
         [clsName containsString:@"SettingsVC"] ||
@@ -1808,21 +1805,18 @@ static BOOL AMVCTreeContainsEditor(UIViewController *vc, NSInteger depth) {
     return NO;
 }
 
-static BOOL AMIsOnHomepage(UIWindow *win) {
-    if (!win || !win.rootViewController) return NO;
-    if (gAMSearchModalOpen || gAMFoldersModalOpen) return NO;
-    UIViewController *root = win.rootViewController;
-    if (root.presentedViewController != nil) return NO;
-    if ([root isKindOfClass:[UINavigationController class]]) {
-        UINavigationController *nav = (UINavigationController *)root;
-        if (nav.viewControllers.count > 1) return NO;
+static BOOL AMVCTreeHasPresentedModal(UIViewController *vc, NSInteger depth) {
+    if (!vc || depth > 10) return NO;
+    if (vc.presentedViewController != nil) return YES;
+    for (UIViewController *child in vc.childViewControllers) {
+        if (AMVCTreeHasPresentedModal(child, depth + 1)) return YES;
     }
-    UIViewController *mainVC = AMFindMainVCInHierarchy(root, 0);
-    if (!mainVC || !mainVC.isViewLoaded || mainVC.view.window != win) return NO;
-    if (mainVC.presentedViewController != nil) return NO;
-    if (AMVCTreeContainsEditor(root, 0)) return NO;
+    return NO;
+}
 
-    // Hide overlays when any modal sheet, alert, or popup covers the homepage in win.
+static BOOL AMHomepageModalCovering(UIWindow *win, UIViewController *mainVC) {
+    if (!win || !mainVC) return NO;
+    if (AMVCTreeHasPresentedModal(win.rootViewController, 0)) return YES;
     UIView *hostView = mainVC.view;
     while (hostView && hostView.superview != win) {
         hostView = hostView.superview;
@@ -1834,18 +1828,24 @@ static BOOL AMIsOnHomepage(UIWindow *win) {
             for (NSUInteger i = hostIdx + 1; i < subs.count; i++) {
                 UIView *sib = subs[i];
                 if (sib.hidden || sib.alpha < 0.02) continue;
-                NSString *cls = NSStringFromClass([sib class]) ?: @"";
-                if ([cls hasPrefix:@"AMHomepage"]) continue;
-                if ([sib isKindOfClass:[UIButton class]] &&
-                    ([sib.accessibilityLabel isEqualToString:@"Search Projects"] ||
-                     [sib.accessibilityLabel isEqualToString:@"Create Folder"] ||
-                     [sib.accessibilityLabel isEqualToString:@"Assign Folder"])) {
-                    continue;
-                }
-                return NO;
+                return YES;
             }
         }
     }
+    return NO;
+}
+
+static BOOL AMIsOnHomepage(UIWindow *win) {
+    if (!win || !win.rootViewController) return NO;
+    if (gAMSearchModalOpen || gAMFoldersModalOpen) return NO;
+    UIViewController *root = win.rootViewController;
+    if ([root isKindOfClass:[UINavigationController class]]) {
+        UINavigationController *nav = (UINavigationController *)root;
+        if (nav.viewControllers.count > 1) return NO;
+    }
+    UIViewController *mainVC = AMFindMainVCInHierarchy(root, 0);
+    if (!mainVC || !mainVC.isViewLoaded || mainVC.view.window != win) return NO;
+    if (AMVCTreeContainsEditor(root, 0)) return NO;
     return YES;
 }
 
@@ -4574,7 +4574,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     self.cachedProjectTitles = titles;
 }
 
-- (void)ensureButtonsInWindow:(UIWindow *)win {
+- (void)ensureButtonsInHostView:(UIView *)hostView {
     if (!self.searchButton) {
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
         btn.accessibilityLabel = @"Search Projects";
@@ -4644,8 +4644,8 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     }
 
     for (UIView *v in @[self.inlineFoldersView, self.searchButton, self.foldersButton, self.assignFolderButton]) {
-        if (v.superview != win) [win addSubview:v];
-        [win bringSubviewToFront:v];
+        if (v.superview != hostView) [hostView addSubview:v];
+        [hostView bringSubviewToFront:v];
     }
 }
 
@@ -4660,18 +4660,24 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
         return;
     }
 
+    UIViewController *mainVC = AMFindMainVCInHierarchy(win.rootViewController, 0);
+    UIView *hostView = (mainVC && mainVC.isViewLoaded && mainVC.view.window == win) ? mainVC.view : win;
+
+    // When a native modal sheet (e.g. Create Project) covers the homepage, leave our HUD
+    // subviews attached inside mainVC.view untouched so they stay naturally behind the sheet
+    // and dim with the backdrop instead of disappearing.
+    if (AMHomepageModalCovering(win, mainVC)) {
+        return;
+    }
+
     [self refreshProjectCacheIfNeeded:NO];
-    [self ensureButtonsInWindow:win];
+    [self ensureButtonsInHostView:hostView];
 
     AMHomepageProbeInfo probe = AMProbeHomepageAndTrackSelection(win,
                                                                  self.cachedProjectTitles ?: [NSSet set],
                                                                  self.trackedSelectedTitles);
 
     if (probe.isModalSheetOpen) {
-        self.searchButton.hidden = YES;
-        self.foldersButton.hidden = YES;
-        self.assignFolderButton.hidden = YES;
-        self.inlineFoldersView.hidden = YES;
         return;
     }
 
@@ -4687,7 +4693,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
             ? (CGRectGetMinY(probe.bottomBarFrame) - 14.0)
             : (win.bounds.size.height - win.safeAreaInsets.bottom - 72.0);
         CGFloat y = barTopY - h - 10.0;
-        self.assignFolderButton.frame = CGRectMake(x, y, w, h);
+        self.assignFolderButton.frame = [hostView convertRect:CGRectMake(x, y, w, h) fromView:win];
         self.assignFolderButton.hidden = NO;
         return;
     }
@@ -4697,7 +4703,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
     CGFloat size = 34.0;
     CGFloat sx = win.bounds.size.width - 16.0 - 36.0 - 10.0 - size;
     CGFloat sy = win.safeAreaInsets.top + 8.0;
-    self.searchButton.frame = CGRectMake(sx, sy, size, size);
+    self.searchButton.frame = [hostView convertRect:CGRectMake(sx, sy, size, size) fromView:win];
     self.searchButton.hidden = NO;
 
     if (probe.hasYourProjects) {
@@ -4709,7 +4715,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
             CGFloat fh = 30.0;
             CGFloat fx = win.bounds.size.width - 16.0 - fw;
             CGFloat fy = midY - (fh * 0.5);
-            self.foldersButton.frame = CGRectMake(fx, fy, fw, fh);
+            self.foldersButton.frame = [hostView convertRect:CGRectMake(fx, fy, fw, fh) fromView:win];
             self.foldersButton.hidden = NO;
 
             [self.inlineFoldersView reloadForce:NO diskProjects:self.cachedDiskProjects ?: @[]];
@@ -4717,7 +4723,7 @@ trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
             CGFloat maxH = MAX(0.0, (win.bounds.size.height - win.safeAreaInsets.bottom - 78.0) - topY);
             CGFloat h = [self.inlineFoldersView desiredHeightWithMaxHeight:maxH];
             if (h > 10.0) {
-                self.inlineFoldersView.frame = CGRectMake(0.0, topY, win.bounds.size.width, h);
+                self.inlineFoldersView.frame = [hostView convertRect:CGRectMake(0.0, topY, win.bounds.size.width, h) fromView:win];
                 self.inlineFoldersView.hidden = NO;
             } else {
                 self.inlineFoldersView.hidden = YES;
