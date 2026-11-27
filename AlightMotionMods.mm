@@ -7123,7 +7123,8 @@ static volatile double gAMLastMemoryPressureEpoch = 0.0;
             [ud setBool:YES forKey:kAMBackupAutoSaveEnabledKey];
         }
         if ([ud objectForKey:kAMBackupLocalMirrorKey] == nil) {
-            [ud setBool:YES forKey:kAMBackupLocalMirrorKey];
+            // Default local container mirror to OFF so SideStore iPhone installs don't spike RAM/disk on first background
+            [ud setBool:NO forKey:kAMBackupLocalMirrorKey];
         }
         [ud synchronize];
     }
@@ -14670,37 +14671,36 @@ extern "C" size_t malloc_zone_pressure_relief(void *zone, size_t goal);
 
 static IMP gOrigALSdkInitWithConfig = NULL;
 static void AMHook_alSdkInitWithConfig(id self, SEL _cmd, id config, void (^completion)(id)) {
+    // IMPORTANT: Never call completion(nil)! Swift bridges ALSdk's handler as (ALSdkConfiguration) -> Void (_Nonnull)
+    // and resumes CheckedContinuation<ALSdkConfiguration, Never> with a NULL pointer, causing an instant launch crash.
+    // Leaving the async ad-SDK bootstrap task unresumed prevents WebView/mediator spin-up with zero CPU/RAM and zero crash.
     (void)self;
     (void)_cmd;
     (void)config;
-    if (completion) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            completion(nil);
-        });
-    }
+    (void)completion;
 }
 
 static IMP gOrigALSdkInitWithCompletion = NULL;
 static void AMHook_alSdkInitWithCompletion(id self, SEL _cmd, void (^completion)(id)) {
     (void)self;
     (void)_cmd;
-    if (completion) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            completion(nil);
-        });
-    }
+    (void)completion;
 }
 
 static IMP gOrigGADMobileAdsStart = NULL;
 static void AMHook_gadMobileAdsStart(id self, SEL _cmd, void (^completion)(id)) {
+    // IMPORTANT: Never call completion(nil)! GADMobileAds startWithCompletionHandler: expects _Nonnull GADInitializationStatus.
     (void)self;
     (void)_cmd;
-    if (completion) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            completion(nil);
-        });
-    }
+    (void)completion;
 }
+
+static IMP gOrigSafeDKStartImpressions = NULL;
+static void AMHook_safeDKNoop(id self, SEL _cmd) {
+    (void)self;
+    (void)_cmd;
+}
+static IMP gOrigSafeDKStartClicks = NULL;
 
 static IMP gOrigAppAttestGenerateKey = NULL;
 static void AMHook_appAttestGenerateKey(id self, SEL _cmd, void (^completion)(NSString *, NSError *)) {
@@ -14807,6 +14807,7 @@ static NSSet<NSString *> *AMSkippedDocsSubdirs(void) {
 @interface AMSafeDocumentsEnumerator : NSDirectoryEnumerator
 @property (nonatomic, strong) NSDirectoryEnumerator *inner;
 @property (nonatomic, copy) NSString *docsPrefix;
+@property (nonatomic, strong) NSMutableArray *batchKeepAlive;
 @end
 
 @implementation AMSafeDocumentsEnumerator
@@ -14847,11 +14848,19 @@ static NSSet<NSString *> *AMSkippedDocsSubdirs(void) {
         state->mutationsPtr = &state->extra[0];
         state->state = 1;
     }
+    if (!_batchKeepAlive) {
+        _batchKeepAlive = [NSMutableArray arrayWithCapacity:len];
+    } else {
+        [_batchKeepAlive removeAllObjects];
+    }
     state->itemsPtr = buffer;
     NSUInteger n = 0;
     while (n < len) {
         id obj = [self nextObject];
         if (!obj) break;
+        // Retain obj in _batchKeepAlive across the entire NSFastEnumeration batch so ARC's loop-scoped release
+        // does not free obj while Swift's FontInfoDatabase reads __unsafe_unretained buffer[0..n-1]!
+        [_batchKeepAlive addObject:obj];
         buffer[n++] = obj;
     }
     return n;
@@ -15162,6 +15171,14 @@ static void AlightMotionModsInit(void) {
                     @"startWithCompletionHandler:",
                     (IMP)AMHook_gadMobileAdsStart,
                     &gOrigGADMobileAdsStart);
+    AMSwizzleMethod(@"SafeDKAdsManager",
+                    @"startImpressionInterception",
+                    (IMP)AMHook_safeDKNoop,
+                    &gOrigSafeDKStartImpressions);
+    AMSwizzleMethod(@"SafeDKAdsManager",
+                    @"startClicksInterception",
+                    (IMP)AMHook_safeDKNoop,
+                    &gOrigSafeDKStartClicks);
     AMSwizzleMethod(@"DCAppAttestService",
                     @"generateKeyWithCompletionHandler:",
                     (IMP)AMHook_appAttestGenerateKey,
