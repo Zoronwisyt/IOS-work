@@ -18817,7 +18817,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-2";
+                static NSString *const kAMModBuildVersion = @"2026.11.27-3";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
@@ -18831,7 +18831,7 @@ static void AlightMotionModsInit(void) {
                     NSString *remoteVer = [info[@"version"] isKindOfClass:[NSString class]] ? info[@"version"] : nil;
                     if (!remoteVer.length || [remoteVer isEqualToString:kAMModBuildVersion]) return;
                     NSString *notes = [info[@"notes"] isKindOfClass:[NSString class]] ? info[@"notes"] : @"New build synced on GitHub.";
-                    NSString *dlStr = [info[@"downloadURL"] isKindOfClass:[NSString class]] ? info[@"downloadURL"] : @"https://github.com/Zoronwisyt/Very-Good-IPA/releases/latest";
+                    NSString *dlStr = [info[@"downloadURL"] isKindOfClass:[NSString class]] ? info[@"downloadURL"] : @"https://github.com/Zoronwisyt/Very-Good-IPA/releases/latest/download/AlightMotion_Modded.ipa";
                     dispatch_async(dispatch_get_main_queue(), ^{
                         UIWindow *win = nil;
                         if (@available(iOS 13.0, *)) {
@@ -18847,15 +18847,38 @@ static void AlightMotionModsInit(void) {
                         UIViewController *topVC = win.rootViewController;
                         while (topVC.presentedViewController) topVC = topVC.presentedViewController;
                         if (!topVC) return;
+                        UIApplication *app = [UIApplication sharedApplication];
+                        BOOL hasSideStore = [app canOpenURL:[NSURL URLWithString:@"sidestore://"]];
+                        BOOL hasAltStore = !hasSideStore && [app canOpenURL:[NSURL URLWithString:@"altstore://"]];
                         NSString *msg = [NSString stringWithFormat:@"Rock Motion IPA v%@ is synced on GitHub.\n\n%@", remoteVer, notes];
                         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Update Available"
                                                                                     message:msg
                                                                              preferredStyle:UIAlertControllerStyleAlert];
-                        [ac addAction:[UIAlertAction actionWithTitle:@"Update Now" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                        NSString *updateTitle = hasSideStore ? @"Update in SideStore" : (hasAltStore ? @"Update in AltStore" : @"Update Now");
+                        [ac addAction:[UIAlertAction actionWithTitle:updateTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                             (void)a;
-                            NSURL *dlURL = [NSURL URLWithString:dlStr];
-                            if (dlURL) [[UIApplication sharedApplication] openURL:dlURL options:@{} completionHandler:nil];
+                            NSString *encodedDl = [dlStr stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+                            encodedDl = [encodedDl stringByReplacingOccurrencesOfString:@"&" withString:@"%26"];
+                            NSURL *targetURL = nil;
+                            if (hasSideStore && encodedDl) {
+                                targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"sidestore://install?url=%@", encodedDl]];
+                            } else if (hasAltStore && encodedDl) {
+                                targetURL = [NSURL URLWithString:[NSString stringWithFormat:@"altstore://install?url=%@", encodedDl]];
+                            } else {
+                                targetURL = [NSURL URLWithString:dlStr];
+                            }
+                            if (targetURL) [app openURL:targetURL options:@{} completionHandler:nil];
                         }]];
+                        if (hasSideStore || hasAltStore) {
+                            NSString *repoTitle = hasSideStore ? @"Add SideStore Repo" : @"Add AltStore Repo";
+                            NSString *scheme = hasSideStore ? @"sidestore" : @"altstore";
+                            [ac addAction:[UIAlertAction actionWithTitle:repoTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                                (void)a;
+                                NSString *srcUrl = @"https%3A%2F%2Fraw.githubusercontent.com%2FZoronwisyt%2FVery-Good-IPA%2Fmain%2Fsource.json";
+                                NSURL *repoURL = [NSURL URLWithString:[NSString stringWithFormat:@"%@://source?url=%@", scheme, srcUrl]];
+                                if (repoURL) [app openURL:repoURL options:@{} completionHandler:nil];
+                            }]];
+                        }
                         [ac addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:nil]];
                         [topVC presentViewController:ac animated:YES completion:nil];
                     });
