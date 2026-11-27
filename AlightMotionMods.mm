@@ -18721,12 +18721,7 @@ static void AMCopyFontsFromDirectoryTree(NSURL *rootURL,
     hud.layer.shadowRadius = 12.0;
     hud.layer.shadowOffset = CGSizeMake(0.0, 4.0);
 
-    UIActivityIndicatorView *spin = nil;
-    if (@available(iOS 13.0, *)) {
-        spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
-    } else {
-        spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleWhite];
-    }
+    UIActivityIndicatorView *spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
     spin.translatesAutoresizingMaskIntoConstraints = NO;
     spin.color = [UIColor colorWithRed:0.0 green:1.0 blue:0.659 alpha:1.0];
     [spin startAnimating];
@@ -18771,8 +18766,8 @@ static void AMCopyFontsFromDirectoryTree(NSURL *rootURL,
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSString *docsDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: @"";
         NSFileManager *fm = [NSFileManager defaultManager];
-        NSUInteger imported = 0;
-        NSUInteger skipped = 0;
+        __block NSUInteger imported = 0;
+        __block NSUInteger skipped = 0;
         NSMutableArray<NSString *> *errors = [NSMutableArray array];
 
         if (zipMode) {
