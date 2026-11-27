@@ -9594,11 +9594,20 @@ static void AMHook_layerParentingWillDisplayCell(id self, SEL _cmd, UITableView 
     cell.contentView.alpha = 1.0;
 }
 
+static void AMRot3DSyncAfterParentingChange(void *holder);
+
 static void AMHook_layerParentingDidSelectRow(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) {
     id navVC = objc_getAssociatedObject(self, kAMMultiParentNavKey);
     if (!navVC) {
         if (gOrigLayerParentingDidSelectRow) {
             ((void (*)(id, SEL, UITableView *, NSIndexPath *))gOrigLayerParentingDidSelectRow)(self, _cmd, tableView, indexPath);
+        }
+        Ivar hIv = class_getInstanceVariable([self class], "holder");
+        void *holder = hIv ? *(void **)((uint8_t *)(__bridge void *)self + ivar_getOffset(hIv)) : NULL;
+        if (holder) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                AMRot3DSyncAfterParentingChange(holder);
+            });
         }
         return;
     }
@@ -9661,6 +9670,7 @@ static void AMHook_layerParentingDidSelectRow(id self, SEL _cmd, UITableView *ta
             gAMMultiParentCtx.selectedCount = 0;
         }
         if (selIds) free(selIds);
+        AMRot3DSyncAfterParentingChange(holder);
         AMSwiftRelease(holder, slide);
     }
 
@@ -14586,9 +14596,11 @@ static UIImage *AMAutoBeatsTabIcon(void) {
 //            + Trackpad + Tick Ruler + Per-Axis Keyframes & Easing Graph)
 // ============================================================================
 
-static const int kAMRot3DMaxSlots = 16;
-static const int kAMRot3DTrackCount = 6; // 0=RotX, 1=RotY, 2=RotZ, 3=PivotX, 4=PivotY, 5=PivotZ
+static const int kAMRot3DMaxShaderSlots = 16; // GPU shader slots 1..16 (visual layers)
+static const int kAMRot3DMaxSlots = 32;       // Virtual controller slots 17..32 (Null objects)
+static const int kAMRot3DTrackCount = 6;      // 0=RotX, 1=RotY, 2=RotZ, 3=PivotX, 4=PivotY, 5=PivotZ
 static const int kAMRot3DMaxKeyframesPerTrack = 64;
+static const float kAMRot3DDefaultFov = 32.0f; // After Effects 50mm cinema lens (non-stretchy)
 
 typedef struct {
     int64_t timeMs;
@@ -14610,10 +14622,11 @@ typedef struct {
 typedef struct {
     BOOL active;
     BOOL enabled;
+    BOOL isNull;
     uint64_t elementId;
     int64_t startTimeMs;
     int64_t endTimeMs;
-    float fov;          // 20..120 deg (Jex default = 60)
+    float fov;          // 12..90 deg (AE 50mm default = 32)
     float zOffset;      // -300..+300 (perspective Z shift)
     float bend;         // -180..+180 deg (Jex curved 3D plane bend)
     float lighting;     // 0..1 directional 3D shading
@@ -14622,9 +14635,19 @@ typedef struct {
     AMRot3DTrackC tracks[kAMRot3DTrackCount];
 } AMRot3DSlotRuntime;
 
+typedef struct {
+    uint64_t elementId;
+    uint64_t parentId;
+    uint8_t elementType; // 0=shape, 1=text, 2=scene, 3=drawing, 4=audio, 5=camera, 6=nullObject
+    uint8_t hidden;
+} AMRot3DElementLinkC;
+
 static os_unfair_lock gAMRot3DRuntimeLock = OS_UNFAIR_LOCK_INIT;
 static AMRot3DSlotRuntime gAMRot3DSlots[kAMRot3DMaxSlots + 1];
-static AMPuppetTransformSnapshot gAMRot3DTransforms[kAMRot3DMaxSlots + 1];
+static AMPuppetTransformSnapshot gAMRot3DTransforms[kAMRot3DMaxShaderSlots + 1];
+static AMRot3DElementLinkC gAMRot3DElements[256];
+static int gAMRot3DElementCount = 0;
+static BOOL gAMRot3DHasActiveCamera = NO;
 static volatile int64_t gAMRot3DEditorCurrentTimeMs = 0;
 static volatile uint64_t gAMRot3DActiveElementId = 0;
 static volatile int gAMRot3DActiveTrackIndex = 0;
@@ -14632,6 +14655,41 @@ static volatile BOOL gAMRot3DPanelVisible = NO;
 static volatile int gAMRot3DLastTransformSlotNotified = 0;
 
 static NSString *const kAMRot3DTransformUpdatedNotification = @"AMRot3DTransformUpdatedNotification";
+
+// After Effects 36mm full-frame equivalent focal length (mm) from vertical FOV (deg)
+static float AMRot3DFocalLengthMM(float fovDeg) {
+    float f = fminf(fmaxf(fovDeg, 10.0f), 110.0f);
+    float t = tanf(f * (float)(M_PI / 360.0));
+    return (t > 0.001f) ? (18.0f / t) : 50.0f;
+}
+
+// After Effects natural camera distance: avoids wide-angle pointy/stretchy corners,
+// and compensates for Alight Motion's native Camera projection when a Camera layer is active.
+static float AMRot3DComputeCameraDist(float fovDeg, const float layerToScreen[16], BOOL hasActiveCamera) {
+    float f = fminf(fmaxf(fovDeg, 12.0f), 95.0f);
+    float baseDist = 0.5f / tanf(f * (float)(M_PI / 360.0));
+    if (layerToScreen) {
+        float col0 = hypotf(layerToScreen[0], layerToScreen[1]);
+        float col1 = hypotf(layerToScreen[4], layerToScreen[5]);
+        float wPersp = fabsf(layerToScreen[3]) + fabsf(layerToScreen[7]);
+        if (hasActiveCamera || wPersp > 0.0005f) {
+            float avgScale = 0.5f * (col0 + col1);
+            if (!isfinite(avgScale) || avgScale < 0.15f) avgScale = 0.15f;
+            float zoomComp = 1.0f / sqrtf(avgScale);
+            if (zoomComp < 0.85f) zoomComp = 0.85f;
+            if (zoomComp > 2.40f) zoomComp = 2.40f;
+            // Flatten double-perspective distortion when Alight Motion Camera is active (AE 50mm-85mm feel)
+            float camDist = baseDist * 1.45f * zoomComp;
+            if (camDist < 2.15f) camDist = 2.15f;
+            return camDist;
+        }
+    } else if (hasActiveCamera) {
+        float camDist = baseDist * 1.45f;
+        if (camDist < 2.15f) camDist = 2.15f;
+        return camDist;
+    }
+    return baseDist;
+}
 
 static float AMRot3DDefaultForTrack(int track) {
     if (track == 3 || track == 4) return 0.5f; // PivotX / PivotY center
@@ -14805,7 +14863,7 @@ static NSString *AMRot3DEffectIdForSlot(int slot) {
 static NSString *AMRot3DBuildSlotXML(int slot) {
     return [NSString stringWithFormat:
         @"<?xml version='1.0' encoding='UTF-8' ?>\n"
-        @"<effect id=\"com.alightcreative.effects.am_rot3d_slot_%d\" compat=\"acScreenNorm-y\" name=\"3D Rotate\" desc=\"Jex Motion 3D Layer Rotation.\" category=\"3d\" tags=\"3d,rotate,perspective\" thumb=\"thumb/flip.webp\" internal=\"true\" overdraw=\"true\" max-overdraw=\"1.0\" maxOverdraw=\"1.0\">\n"
+        @"<effect id=\"com.alightcreative.effects.am_rot3d_slot_%d\" compat=\"acScreenNorm-y\" name=\"3D Rotate\" desc=\"Jex Motion 3D Layer Rotation.\" category=\"3d\" tags=\"3d,rotate,perspective\" thumb=\"thumb/flip.webp\" internal=\"true\" overdraw=\"true\" max-overdraw=\"1.5\" maxOverdraw=\"1.5\">\n"
         @"    <params>\n"
         @"        <texture id=\"inputImg\" srcType=\"content\" />\n"
         @"        <float id=\"amRot3DMagic\" value=\"244853.75\" />\n"
@@ -14938,10 +14996,10 @@ static NSArray<NSURL *> *AMEnsureRot3DSlotXMLs(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSString *dir = AMRot3DSlotsDir();
-        NSString *verFile = [dir stringByAppendingPathComponent:@".rot3d_xml_v1"];
+        NSString *verFile = [dir stringByAppendingPathComponent:@".rot3d_xml_v2"];
         BOOL needsWrite = ![[NSFileManager defaultManager] fileExistsAtPath:verFile];
-        NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:kAMRot3DMaxSlots];
-        for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
+        NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:kAMRot3DMaxShaderSlots];
+        for (int s = 1; s <= kAMRot3DMaxShaderSlots; ++s) {
             NSString *p = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"am_rot3d_slot_%d.xml", s]];
             if (needsWrite || ![[NSFileManager defaultManager] fileExistsAtPath:p]) {
                 NSString *xml = AMRot3DBuildSlotXML(s);
@@ -14950,14 +15008,33 @@ static NSArray<NSURL *> *AMEnsureRot3DSlotXMLs(void) {
             [urls addObject:[NSURL fileURLWithPath:p]];
         }
         if (needsWrite) {
-            [@"1" writeToFile:verFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [@"2" writeToFile:verFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }
         cached = [urls copy];
     });
     return cached;
 }
 
+static uint64_t AMRot3DFindParentIdLocked(uint64_t eid) {
+    if (eid == 0) return 0;
+    for (int i = 0; i < gAMRot3DElementCount; ++i) {
+        if (gAMRot3DElements[i].elementId == eid) return gAMRot3DElements[i].parentId;
+    }
+    return 0;
+}
+
+static const AMRot3DSlotRuntime *AMRot3DFindSlotByElementIdLocked(uint64_t eid) {
+    if (eid == 0) return NULL;
+    for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
+        if (gAMRot3DSlots[s].active && gAMRot3DSlots[s].enabled && gAMRot3DSlots[s].elementId == eid) {
+            return &gAMRot3DSlots[s];
+        }
+    }
+    return NULL;
+}
+
 static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float headerFloats[16], const uint8_t *inBytes, float *outBuf, NSUInteger pLen, id encoder, SEL _cmd, IMP origFn) {
+    if (slot < 1 || slot > kAMRot3DMaxShaderSlots) return;
     float shaderTimeSec = *(const float *)(inBytes + 0x110);
     for (int k = 0; k < magicIdx && k < 16; ++k) {
         outBuf[k] = headerFloats[k];
@@ -14996,7 +15073,7 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
     if (tr->timeMode != 2 && rt->startTimeMs > 0) {
         evalTimeMs = rt->startTimeMs + (int64_t)llround((double)shaderTimeSec * 1000.0);
     }
-    if (gAMRot3DPanelVisible && rt->active && rt->elementId == gAMRot3DActiveElementId && gAMPreviewPlayerPaused) {
+    if (gAMRot3DPanelVisible && gAMPreviewPlayerPaused) {
         int64_t edMs = gAMRot3DEditorCurrentTimeMs;
         if (llabs(evalTimeMs - edMs) <= 60) {
             evalTimeMs = edMs;
@@ -15010,22 +15087,78 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
         float px = AMRot3DEvalTrackAtMs(&rt->tracks[3], evalTimeMs);
         float py = AMRot3DEvalTrackAtMs(&rt->tracks[4], evalTimeMs);
         float pz = AMRot3DEvalTrackAtMs(&rt->tracks[5], evalTimeMs) / 500.0f;
-        float fov = fminf(fmaxf(rt->fov, 15.0f), 140.0f);
-        float camDist = 0.5f / tanf(fov * (float)(M_PI / 360.0));
+        float fov = (rt->fov >= 12.0f && rt->fov <= 95.0f) ? rt->fov : kAMRot3DDefaultFov;
         float zOff = rt->zOffset / 500.0f;
         float bendRad = rt->bend * (float)(M_PI / 180.0);
         float lightAmt = fminf(fmaxf(rt->lighting, 0.0f), 1.0f);
         float bfMode = (float)rt->backfaceMode;
 
-        // Exact identity fast-path when all transforms are zero (zero resampling blur)
-        BOOL isIdentity = (fabsf(rx) < 0.001f && fabsf(ry) < 0.001f && fabsf(rz) < 0.001f &&
-                           fabsf(pz) < 0.0005f && fabsf(zOff) < 0.0005f && fabsf(bendRad) < 0.005f &&
-                           lightAmt < 0.001f);
-        if (isIdentity) {
+        BOOL localHasRot = (fabsf(rx) >= 0.001f || fabsf(ry) >= 0.001f || fabsf(rz) >= 0.001f);
+        BOOL anyActive = (localHasRot || fabsf(pz) >= 0.0005f || fabsf(zOff) >= 0.0005f ||
+                          fabsf(bendRad) >= 0.005f || lightAmt >= 0.001f);
+
+        float R[16];
+        AMRot3DMat4Angles(R, rx, ry, rz);
+
+        // Compose After Effects 3D parent / Null object hierarchy (child -> parent Null -> grandparent Null)
+        uint64_t curAnc = AMRot3DFindParentIdLocked(rt->elementId);
+        uint64_t visited[8];
+        int depth = 0;
+        while (curAnc != 0 && depth < 8) {
+            BOOL seen = (curAnc == rt->elementId);
+            for (int v = 0; v < depth; ++v) {
+                if (visited[v] == curAnc) { seen = YES; break; }
+            }
+            if (seen) break;
+            visited[depth++] = curAnc;
+
+            const AMRot3DSlotRuntime *ancRt = AMRot3DFindSlotByElementIdLocked(curAnc);
+            if (ancRt) {
+                float aRx = AMRot3DEvalTrackAtMs(&ancRt->tracks[0], evalTimeMs);
+                float aRy = AMRot3DEvalTrackAtMs(&ancRt->tracks[1], evalTimeMs);
+                float aRz = AMRot3DEvalTrackAtMs(&ancRt->tracks[2], evalTimeMs);
+                float aPx = AMRot3DEvalTrackAtMs(&ancRt->tracks[3], evalTimeMs);
+                float aPy = AMRot3DEvalTrackAtMs(&ancRt->tracks[4], evalTimeMs);
+                float aPz = AMRot3DEvalTrackAtMs(&ancRt->tracks[5], evalTimeMs) / 500.0f;
+                float aZOff = ancRt->zOffset / 500.0f;
+                float aBend = ancRt->bend * (float)(M_PI / 180.0);
+                float aLight = fminf(fmaxf(ancRt->lighting, 0.0f), 1.0f);
+                BOOL ancHasRot = (fabsf(aRx) >= 0.001f || fabsf(aRy) >= 0.001f || fabsf(aRz) >= 0.001f);
+                BOOL ancActive = (ancHasRot || fabsf(aPz) >= 0.0005f || fabsf(aZOff) >= 0.0005f ||
+                                  fabsf(aBend) >= 0.005f || aLight >= 0.001f);
+                if (ancActive) {
+                    anyActive = YES;
+                    if (ancHasRot) {
+                        float Ranc[16], Rmul[16];
+                        AMRot3DMat4Angles(Ranc, aRx, aRy, aRz);
+                        AMRot3DMat4Mul(Rmul, Ranc, R);
+                        memcpy(R, Rmul, sizeof(R));
+                    }
+                    zOff += aZOff;
+                    pz += aPz;
+                    // Map Null's screen-space 3D pivot into child layer-norm coordinates so all children orbit rigidly around the Null!
+                    if (ancRt->isNull || !localHasRot) {
+                        CGPoint nullPivInChild = AMPuppetMulRowMat4(CGPointMake(aPx, aPy), tr->screenToLayer);
+                        if (isfinite(nullPivInChild.x) && isfinite(nullPivInChild.y)) {
+                            px = (float)nullPivInChild.x;
+                            py = (float)nullPivInChild.y;
+                        }
+                    }
+                    if (fabsf(bendRad) < 0.005f && fabsf(aBend) >= 0.005f) bendRad = aBend;
+                    if (lightAmt < 0.001f && aLight >= 0.001f) lightAmt = aLight;
+                    if (bfMode < 0.5f && ancRt->backfaceMode > 0) bfMode = (float)ancRt->backfaceMode;
+                    if (fabsf(fov - kAMRot3DDefaultFov) < 0.5f && ancRt->fov >= 12.0f && ancRt->fov <= 95.0f) {
+                        fov = ancRt->fov;
+                    }
+                }
+            }
+            curAnc = AMRot3DFindParentIdLocked(curAnc);
+        }
+
+        if (!anyActive) {
             outBuf[magicIdx + 2] = 0.0f;
         } else {
-            float R[16];
-            AMRot3DMat4Angles(R, rx, ry, rz);
+            float camDist = AMRot3DComputeCameraDist(fov, tr->layerToScreen, gAMRot3DHasActiveCamera);
             // Upload R^T rows (= columns of column-major R)
             outBuf[magicIdx + 2]  = 1.0f;
             outBuf[magicIdx + 3]  = R[0];  outBuf[magicIdx + 4]  = R[1];  outBuf[magicIdx + 5]  = R[2];
@@ -15146,9 +15279,10 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
             @"slot": @(slot),
             @"elementId": @(elementId),
             @"enabled": @(YES),
+            @"isNull": @(slot > kAMRot3DMaxShaderSlots),
             @"startTimeMs": @(0),
             @"endTimeMs": @(5000),
-            @"fov": @(60.0),
+            @"fov": @(kAMRot3DDefaultFov),
             @"zOffset": @(0.0),
             @"bend": @(0.0),
             @"lighting": @(0.0),
@@ -15208,11 +15342,12 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
         if (!d) continue;
         rt->active = YES;
         rt->enabled = (d[@"enabled"] == nil) ? YES : [d[@"enabled"] boolValue];
+        rt->isNull = (d[@"isNull"] != nil) ? [d[@"isNull"] boolValue] : (s > kAMRot3DMaxShaderSlots);
         rt->elementId = [d[@"elementId"] unsignedLongLongValue];
         rt->startTimeMs = [d[@"startTimeMs"] longLongValue];
         rt->endTimeMs = [d[@"endTimeMs"] longLongValue];
-        rt->fov = d[@"fov"] ? [d[@"fov"] floatValue] : 60.0f;
-        if (rt->fov < 15.0f || rt->fov > 140.0f) rt->fov = 60.0f;
+        rt->fov = d[@"fov"] ? [d[@"fov"] floatValue] : kAMRot3DDefaultFov;
+        if (rt->fov < 12.0f || rt->fov > 95.0f) rt->fov = kAMRot3DDefaultFov;
         rt->zOffset = [d[@"zOffset"] floatValue];
         rt->bend = [d[@"bend"] floatValue];
         rt->lighting = [d[@"lighting"] floatValue];
@@ -15248,135 +15383,175 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
 
 // --- Native SceneElement Effect Attachment for 3D Rotation Slots ---
 
-static AMPuppetAttachCtx gAMRot3DAttachCtx;
-
 static int AMRot3DMatchSlotFromSwiftString(uint64_t strLo, uint64_t strHi, intptr_t slide) {
     typedef uint8_t (*AMStrEqFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint8_t);
     AMStrEqFn strEq = (AMStrEqFn)(0x1025b7bb8ULL + slide);
-    static AMSwiftString slotStrs[kAMRot3DMaxSlots + 1];
+    static AMSwiftString slotStrs[kAMRot3DMaxShaderSlots + 1];
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
+        for (int s = 1; s <= kAMRot3DMaxShaderSlots; ++s) {
             slotStrs[s] = AMMakeSwiftString(AMRot3DEffectIdForSlot(s));
         }
     });
-    for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
+    for (int s = 1; s <= kAMRot3DMaxShaderSlots; ++s) {
         if (strLo == slotStrs[s].lo && strHi == slotStrs[s].hi) return s;
         if (strEq && (strEq(strLo, strHi, slotStrs[s].lo, slotStrs[s].hi, 0) & 1)) return s;
     }
     return 0;
 }
 
-static void AMRot3DAttachEditCallback(void *scenePtr) {
-    if (!scenePtr || gAMRot3DAttachCtx.targetElementId == 0) return;
-    intptr_t slide = AMMainBinarySlide();
+typedef struct {
+    uint64_t targetElementId;
+    BOOL shouldAttachIfMissing;
+    BOOL isNullTarget;
+    int assignedSlot;
+    int64_t startTimeMs;
+    int64_t endTimeMs;
+    int linkedDescendantCount;
+    int boundChildCount;
+    struct {
+        int slot;
+        uint64_t elementId;
+        int64_t startMs;
+        int64_t endMs;
+    } boundChildren[kAMRot3DMaxShaderSlots];
+} AMRot3DAttachCtx;
 
+static AMRot3DAttachCtx gAMRot3DAttachCtx;
+
+static void AMRot3DCaptureHierarchyFromScenePtr(void *scenePtr, intptr_t slide) {
+    if (!scenePtr) return;
     typedef void *(*MetaFn)(uintptr_t);
-    typedef void (*DestroyFn)(void *, void *);
-    typedef void *(*BridgeRetainFn)(void *);
-
     void *sceneMeta = ((MetaFn)(0x1003c6b10ULL + slide))(0);
     void *elMeta = ((MetaFn)(0x1003e0404ULL + slide))(0);
-    void *efMeta = ((MetaFn)(0x100459f90ULL + slide))(0);
-    if (!sceneMeta || !elMeta || !efMeta) return;
-
+    if (!sceneMeta || !elMeta) return;
     int32_t elementsOff = *(int32_t *)((uint8_t *)sceneMeta + 0x1c);
+    void *arrStorage = *(void **)((uint8_t *)scenePtr + elementsOff);
+    if (!arrStorage) return;
+
     void *elVWT = *(void **)((uint8_t *)elMeta - 8);
     uint8_t elAlignMask = *(uint8_t *)((uint8_t *)elVWT + 0x50);
     size_t elStride = *(size_t *)((uint8_t *)elVWT + 0x48);
-    int32_t startOff = *(int32_t *)((uint8_t *)elMeta + 0x14);
-    int32_t endOff = *(int32_t *)((uint8_t *)elMeta + 0x18);
-    int32_t vfxOff = *(int32_t *)((uint8_t *)elMeta + 0x78);
+    int32_t typeOff = *(int32_t *)((uint8_t *)elMeta + 0x10);
+    int32_t idOff = *(int32_t *)((uint8_t *)elMeta + 0x1c);
+    int32_t parentIdOff = *(int32_t *)((uint8_t *)elMeta + 0x94);
+    int32_t hiddenOff = *(int32_t *)((uint8_t *)elMeta + 0x98);
 
-    void *efVWT = *(void **)((uint8_t *)efMeta - 8);
-    uint8_t efAlignMask = *(uint8_t *)((uint8_t *)efVWT + 0x50);
-    size_t efSize = *(size_t *)((uint8_t *)efVWT + 0x40);
-    size_t efStride = *(size_t *)((uint8_t *)efVWT + 0x48);
-    int32_t efIdOff = *(int32_t *)((uint8_t *)efMeta + 0x14);
-    int32_t efParamsOff = *(int32_t *)((uint8_t *)efMeta + 0x18);
-    int32_t efRenderGroupOff = *(int32_t *)((uint8_t *)efMeta + 0x1c);
-    int32_t efDisabledOff = *(int32_t *)((uint8_t *)efMeta + 0x20);
-    int32_t efLocalOff = *(int32_t *)((uint8_t *)efMeta + 0x24);
-    int32_t efHiddenOff = *(int32_t *)((uint8_t *)efMeta + 0x28);
-
-    void *makeUnique = dlsym(RTLD_DEFAULT, "$sSa36_makeUniqueAndReserveCapacityIfNotUniqueyyF");
-    void **elementsField = (void **)((uint8_t *)scenePtr + elementsOff);
-    if (makeUnique && *elementsField) {
-        struct { uint64_t selfPtr, metaPtr, fnPtr; } uArgs = {
-            (uint64_t)elementsField, (uint64_t)elMeta, (uint64_t)makeUnique
-        };
-        __asm__ volatile(
-            "mov x9, %0\n"
-            "ldr x20, [x9, #0]\n"
-            "ldr x0,  [x9, #8]\n"
-            "ldr x16, [x9, #16]\n"
-            "blr x16\n"
-            :
-            : "r"(&uArgs)
-            : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
-              "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
-              "x16", "x17", "x20", "x30", "memory"
-        );
-    }
-
-    void *arrStorage = *elementsField;
-    if (!arrStorage) return;
     int64_t count = *(int64_t *)((uint8_t *)arrStorage + 0x10);
+    if (count < 0) count = 0;
+    if (count > 256) count = 256;
     size_t elHdrOff = (0x20 + (size_t)elAlignMask) & ~(size_t)elAlignMask;
     uint8_t *basePtr = (uint8_t *)arrStorage + elHdrOff;
-    size_t efHdrOff = (0x20 + (size_t)efAlignMask) & ~(size_t)efAlignMask;
 
-    BOOL usedSlots[kAMRot3DMaxSlots + 1];
-    memset(usedSlots, 0, sizeof(usedSlots));
-    uint8_t *targetEl = NULL;
-    int existingSlot = 0;
-
+    AMRot3DElementLinkC tmp[256];
+    BOOL hasCam = NO;
     for (int64_t i = 0; i < count; ++i) {
         uint8_t *elPtr = basePtr + (size_t)i * elStride;
-        uint64_t eid = *(uint64_t *)(elPtr + 0x18);
-        void *vfxArr = *(void **)(elPtr + vfxOff);
-        if (vfxArr) {
-            int64_t vcnt = *(int64_t *)((uint8_t *)vfxArr + 0x10);
-            if (vcnt > 0 && vcnt < 256) {
-                uint8_t *efBase = (uint8_t *)vfxArr + efHdrOff;
-                for (int64_t j = 0; j < vcnt; ++j) {
-                    uint8_t *efPtr = efBase + (size_t)j * efStride;
-                    uint64_t slo = *(uint64_t *)(efPtr + efIdOff);
-                    uint64_t shi = *(uint64_t *)(efPtr + efIdOff + 8);
-                    int matched = AMRot3DMatchSlotFromSwiftString(slo, shi, slide);
-                    if (matched >= 1 && matched <= kAMRot3DMaxSlots) {
-                        usedSlots[matched] = YES;
-                        if (eid == gAMRot3DAttachCtx.targetElementId && existingSlot == 0) {
-                            existingSlot = matched;
-                        }
-                    }
-                }
+        tmp[i].elementId = *(uint64_t *)(elPtr + idOff);
+        uint8_t isNil = *(uint8_t *)(elPtr + parentIdOff + 8);
+        tmp[i].parentId = isNil ? 0 : *(uint64_t *)(elPtr + parentIdOff);
+        tmp[i].elementType = *(uint8_t *)(elPtr + typeOff);
+        tmp[i].hidden = *(uint8_t *)(elPtr + hiddenOff);
+        if (tmp[i].elementType == 5 && tmp[i].hidden == 0) hasCam = YES;
+    }
+
+    os_unfair_lock_lock(&gAMRot3DRuntimeLock);
+    memcpy(gAMRot3DElements, tmp, (size_t)count * sizeof(AMRot3DElementLinkC));
+    gAMRot3DElementCount = (int)count;
+    gAMRot3DHasActiveCamera = hasCam;
+    os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
+}
+
+static BOOL AMRot3DRefreshHierarchyFromHolder(void *holder, uint64_t queryElementId, uint8_t *outType) {
+    if (outType) *outType = 0xFF;
+    if (!holder) return NO;
+    intptr_t slide = AMMainBinarySlide();
+    typedef void *(*MetaFn)(uintptr_t);
+    typedef void (*DestroyFn)(void *, void *);
+    void *sceneMeta = ((MetaFn)(0x1003c6b10ULL + slide))(0);
+    if (!sceneMeta) return NO;
+    void *sceneVWT = *(void **)((uint8_t *)sceneMeta - 8);
+    size_t sceneSize = *(size_t *)((uint8_t *)sceneVWT + 0x40);
+    uint8_t *sceneBuf = (uint8_t *)calloc(1, sceneSize + 32);
+    if (!sceneBuf) return NO;
+
+    AMSwiftRetain(holder, slide);
+    struct { uint64_t outBuf, holderPtr, fn; } csArgs = {
+        (uint64_t)sceneBuf, (uint64_t)holder, (uint64_t)(0x10039109cULL + slide)
+    };
+    __asm__ volatile(
+        "mov x9, %0\n"
+        "ldr x8,  [x9, #0]\n"
+        "ldr x20, [x9, #8]\n"
+        "ldr x16, [x9, #16]\n"
+        "blr x16\n"
+        :
+        : "r"(&csArgs)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+          "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+          "x16", "x17", "x20", "x30", "memory",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"
+    );
+    AMSwiftRelease(holder, slide);
+
+    AMRot3DCaptureHierarchyFromScenePtr(sceneBuf, slide);
+    ((DestroyFn)(0x1000199c0ULL + slide))(sceneBuf, (void *)(0x1003c6b10ULL + slide));
+    free(sceneBuf);
+
+    if (queryElementId != 0 && outType) {
+        os_unfair_lock_lock(&gAMRot3DRuntimeLock);
+        for (int i = 0; i < gAMRot3DElementCount; ++i) {
+            if (gAMRot3DElements[i].elementId == queryElementId) {
+                *outType = gAMRot3DElements[i].elementType;
+                break;
             }
         }
-        if (eid == gAMRot3DAttachCtx.targetElementId) {
-            targetEl = elPtr;
+        os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
+    }
+    return YES;
+}
+
+static BOOL AMIsEditingPanelShowingNullLayer(id panelVC, NSInteger origCount) {
+    if (!panelVC || origCount >= 4) return NO;
+    intptr_t slide = AMMainBinarySlide();
+    Ivar holderIvar = class_getInstanceVariable([panelVC class], "holder");
+    void *holder = holderIvar ? *(void **)((uint8_t *)(__bridge void *)panelVC + ivar_getOffset(holderIvar)) : NULL;
+    if (!holder) return NO;
+    uint64_t *selIds = NULL;
+    NSUInteger selCount = 0;
+    uint64_t targetId = 0;
+    if (AMReadHolderSelectedIds(holder, slide, &selIds, &selCount) && selCount == 1) {
+        targetId = selIds[0];
+    }
+    if (selIds) free(selIds);
+    if (targetId == 0) return NO;
+    uint8_t elType = 0xFF;
+    AMRot3DRefreshHierarchyFromHolder(holder, targetId, &elType);
+    return (elType == 6); // SceneElementType.nullObject
+}
+
+static BOOL AMRot3DIsDescendantOfInArray(uint64_t eid, uint64_t ancId, const uint8_t *basePtr, int64_t count, size_t elStride, int32_t idOff, int32_t parentIdOff) {
+    uint64_t cur = eid;
+    for (int depth = 0; depth < 8 && cur != 0; ++depth) {
+        uint64_t nextP = 0;
+        for (int64_t i = 0; i < count; ++i) {
+            const uint8_t *el = basePtr + (size_t)i * elStride;
+            if (*(const uint64_t *)(el + idOff) == cur) {
+                uint8_t isNil = *(const uint8_t *)(el + parentIdOff + 8);
+                nextP = isNil ? 0 : *(const uint64_t *)(el + parentIdOff);
+                break;
+            }
         }
+        if (nextP == ancId) return YES;
+        cur = nextP;
     }
+    return NO;
+}
 
-    if (!targetEl) return;
-    gAMRot3DAttachCtx.startTimeMs = *(int64_t *)(targetEl + startOff);
-    gAMRot3DAttachCtx.endTimeMs = *(int64_t *)(targetEl + endOff);
-
-    if (existingSlot > 0) {
-        gAMRot3DAttachCtx.assignedSlot = existingSlot;
-        return;
-    }
-    if (!gAMRot3DAttachCtx.shouldAttachIfMissing) return;
-
-    int chosenSlot = [[AMRot3DStore shared] slotForElementId:gAMRot3DAttachCtx.targetElementId];
-    if (chosenSlot < 1 || chosenSlot > kAMRot3DMaxSlots || usedSlots[chosenSlot]) {
-        chosenSlot = 0;
-        for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
-            if (!usedSlots[s]) { chosenSlot = s; break; }
-        }
-    }
-    if (chosenSlot == 0) chosenSlot = 1;
-
+static void AMRot3DAttachSlotToElement(uint8_t *targetEl, int chosenSlot, void *efMeta, size_t efSize, int32_t efIdOff, int32_t efParamsOff, int32_t efRenderGroupOff, int32_t efDisabledOff, int32_t efLocalOff, int32_t efHiddenOff, intptr_t slide) {
+    (void)efMeta;
+    typedef void (*DestroyFn)(void *, void *);
+    typedef void *(*BridgeRetainFn)(void *);
     void *emptyDict = dlsym(RTLD_DEFAULT, "_swiftEmptyDictionarySingleton");
     void *emptySet = dlsym(RTLD_DEFAULT, "_swiftEmptySetSingleton");
     if (!emptyDict || !emptySet) return;
@@ -15428,12 +15603,180 @@ static void AMRot3DAttachEditCallback(void *scenePtr) {
 
     ((DestroyFn)(0x1000199c0ULL + slide))(efBuf, (void *)(0x100459f90ULL + slide));
     free(efBuf);
-
-    gAMRot3DAttachCtx.assignedSlot = chosenSlot;
-    gAMRot3DAttachCtx.didAttach = YES;
 }
 
-static int AMRot3DSyncOrAttachEffect(void *holder, uint64_t elementId, BOOL attachIfMissing, int64_t *outStartMs, int64_t *outEndMs) {
+static void AMRot3DAttachEditCallback(void *scenePtr) {
+    if (!scenePtr) return;
+    intptr_t slide = AMMainBinarySlide();
+    AMRot3DCaptureHierarchyFromScenePtr(scenePtr, slide);
+    if (gAMRot3DAttachCtx.targetElementId == 0) return;
+
+    typedef void *(*MetaFn)(uintptr_t);
+    void *sceneMeta = ((MetaFn)(0x1003c6b10ULL + slide))(0);
+    void *elMeta = ((MetaFn)(0x1003e0404ULL + slide))(0);
+    void *efMeta = ((MetaFn)(0x100459f90ULL + slide))(0);
+    if (!sceneMeta || !elMeta || !efMeta) return;
+
+    int32_t elementsOff = *(int32_t *)((uint8_t *)sceneMeta + 0x1c);
+    void *elVWT = *(void **)((uint8_t *)elMeta - 8);
+    uint8_t elAlignMask = *(uint8_t *)((uint8_t *)elVWT + 0x50);
+    size_t elStride = *(size_t *)((uint8_t *)elVWT + 0x48);
+    int32_t typeOff = *(int32_t *)((uint8_t *)elMeta + 0x10);
+    int32_t startOff = *(int32_t *)((uint8_t *)elMeta + 0x14);
+    int32_t endOff = *(int32_t *)((uint8_t *)elMeta + 0x18);
+    int32_t idOff = *(int32_t *)((uint8_t *)elMeta + 0x1c);
+    int32_t vfxOff = *(int32_t *)((uint8_t *)elMeta + 0x78);
+    int32_t parentIdOff = *(int32_t *)((uint8_t *)elMeta + 0x94);
+
+    void *efVWT = *(void **)((uint8_t *)efMeta - 8);
+    uint8_t efAlignMask = *(uint8_t *)((uint8_t *)efVWT + 0x50);
+    size_t efSize = *(size_t *)((uint8_t *)efVWT + 0x40);
+    size_t efStride = *(size_t *)((uint8_t *)efVWT + 0x48);
+    int32_t efIdOff = *(int32_t *)((uint8_t *)efMeta + 0x14);
+    int32_t efParamsOff = *(int32_t *)((uint8_t *)efMeta + 0x18);
+    int32_t efRenderGroupOff = *(int32_t *)((uint8_t *)efMeta + 0x1c);
+    int32_t efDisabledOff = *(int32_t *)((uint8_t *)efMeta + 0x20);
+    int32_t efLocalOff = *(int32_t *)((uint8_t *)efMeta + 0x24);
+    int32_t efHiddenOff = *(int32_t *)((uint8_t *)efMeta + 0x28);
+
+    void *makeUnique = dlsym(RTLD_DEFAULT, "$sSa36_makeUniqueAndReserveCapacityIfNotUniqueyyF");
+    void **elementsField = (void **)((uint8_t *)scenePtr + elementsOff);
+    if (makeUnique && *elementsField) {
+        struct { uint64_t selfPtr, metaPtr, fnPtr; } uArgs = {
+            (uint64_t)elementsField, (uint64_t)elMeta, (uint64_t)makeUnique
+        };
+        __asm__ volatile(
+            "mov x9, %0\n"
+            "ldr x20, [x9, #0]\n"
+            "ldr x0,  [x9, #8]\n"
+            "ldr x16, [x9, #16]\n"
+            "blr x16\n"
+            :
+            : "r"(&uArgs)
+            : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+              "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+              "x16", "x17", "x20", "x30", "memory"
+        );
+    }
+
+    void *arrStorage = *elementsField;
+    if (!arrStorage) return;
+    int64_t count = *(int64_t *)((uint8_t *)arrStorage + 0x10);
+    size_t elHdrOff = (0x20 + (size_t)elAlignMask) & ~(size_t)elAlignMask;
+    uint8_t *basePtr = (uint8_t *)arrStorage + elHdrOff;
+    size_t efHdrOff = (0x20 + (size_t)efAlignMask) & ~(size_t)efAlignMask;
+
+    BOOL usedSlots[kAMRot3DMaxShaderSlots + 1];
+    memset(usedSlots, 0, sizeof(usedSlots));
+    int elExistingSlot[256];
+    memset(elExistingSlot, 0, sizeof(elExistingSlot));
+    uint8_t *targetEl = NULL;
+    uint8_t targetType = 0;
+    int existingSlot = 0;
+
+    int64_t scanN = (count < 256) ? count : 256;
+    for (int64_t i = 0; i < scanN; ++i) {
+        uint8_t *elPtr = basePtr + (size_t)i * elStride;
+        uint64_t eid = *(uint64_t *)(elPtr + idOff);
+        void *vfxArr = *(void **)(elPtr + vfxOff);
+        if (vfxArr) {
+            int64_t vcnt = *(int64_t *)((uint8_t *)vfxArr + 0x10);
+            if (vcnt > 0 && vcnt < 256) {
+                uint8_t *efBase = (uint8_t *)vfxArr + efHdrOff;
+                for (int64_t j = 0; j < vcnt; ++j) {
+                    uint8_t *efPtr = efBase + (size_t)j * efStride;
+                    uint64_t slo = *(uint64_t *)(efPtr + efIdOff);
+                    uint64_t shi = *(uint64_t *)(efPtr + efIdOff + 8);
+                    int matched = AMRot3DMatchSlotFromSwiftString(slo, shi, slide);
+                    if (matched >= 1 && matched <= kAMRot3DMaxShaderSlots) {
+                        usedSlots[matched] = YES;
+                        if (elExistingSlot[i] == 0) elExistingSlot[i] = matched;
+                        if (eid == gAMRot3DAttachCtx.targetElementId && existingSlot == 0) {
+                            existingSlot = matched;
+                        }
+                    }
+                }
+            }
+        }
+        if (eid == gAMRot3DAttachCtx.targetElementId) {
+            targetEl = elPtr;
+            targetType = *(uint8_t *)(elPtr + typeOff);
+        }
+    }
+
+    if (!targetEl) return;
+    gAMRot3DAttachCtx.startTimeMs = *(int64_t *)(targetEl + startOff);
+    gAMRot3DAttachCtx.endTimeMs = *(int64_t *)(targetEl + endOff);
+    gAMRot3DAttachCtx.isNullTarget = (targetType == 6);
+
+    if (targetType == 6) {
+        // Null Object: assign virtual controller slot 17..32 and auto-attach GPU slots 1..16 to all linked visible descendants!
+        int nullSlot = [[AMRot3DStore shared] slotForElementId:gAMRot3DAttachCtx.targetElementId];
+        if (nullSlot <= kAMRot3DMaxShaderSlots || nullSlot > kAMRot3DMaxSlots) {
+            nullSlot = 0;
+            for (int s = kAMRot3DMaxShaderSlots + 1; s <= kAMRot3DMaxSlots; ++s) {
+                if (![[AMRot3DStore shared] layerDictForSlot:s create:NO elementId:0]) { nullSlot = s; break; }
+            }
+            if (nullSlot == 0) nullSlot = kAMRot3DMaxShaderSlots + 1;
+        }
+        gAMRot3DAttachCtx.assignedSlot = nullSlot;
+
+        for (int64_t i = 0; i < scanN; ++i) {
+            uint8_t *elPtr = basePtr + (size_t)i * elStride;
+            uint8_t tp = *(uint8_t *)(elPtr + typeOff);
+            if (tp > 3) continue; // Only visual layers (shape/text/scene/drawing)
+            uint64_t cid = *(uint64_t *)(elPtr + idOff);
+            if (cid == gAMRot3DAttachCtx.targetElementId) continue;
+            if (!AMRot3DIsDescendantOfInArray(cid, gAMRot3DAttachCtx.targetElementId, basePtr, scanN, elStride, idOff, parentIdOff)) continue;
+
+            gAMRot3DAttachCtx.linkedDescendantCount++;
+            int cSlot = elExistingSlot[i];
+            if (cSlot == 0 && gAMRot3DAttachCtx.shouldAttachIfMissing) {
+                int pref = [[AMRot3DStore shared] slotForElementId:cid];
+                if (pref >= 1 && pref <= kAMRot3DMaxShaderSlots && !usedSlots[pref]) {
+                    cSlot = pref;
+                } else {
+                    for (int s = 1; s <= kAMRot3DMaxShaderSlots; ++s) {
+                        if (!usedSlots[s]) { cSlot = s; break; }
+                    }
+                }
+                if (cSlot >= 1 && cSlot <= kAMRot3DMaxShaderSlots) {
+                    usedSlots[cSlot] = YES;
+                    AMRot3DAttachSlotToElement(elPtr, cSlot, efMeta, efSize, efIdOff, efParamsOff, efRenderGroupOff, efDisabledOff, efLocalOff, efHiddenOff, slide);
+                }
+            }
+            if (cSlot >= 1 && cSlot <= kAMRot3DMaxShaderSlots && gAMRot3DAttachCtx.boundChildCount < kAMRot3DMaxShaderSlots) {
+                int idx = gAMRot3DAttachCtx.boundChildCount++;
+                gAMRot3DAttachCtx.boundChildren[idx].slot = cSlot;
+                gAMRot3DAttachCtx.boundChildren[idx].elementId = cid;
+                gAMRot3DAttachCtx.boundChildren[idx].startMs = *(int64_t *)(elPtr + startOff);
+                gAMRot3DAttachCtx.boundChildren[idx].endMs = *(int64_t *)(elPtr + endOff);
+            }
+        }
+        return;
+    }
+
+    if (existingSlot > 0) {
+        gAMRot3DAttachCtx.assignedSlot = existingSlot;
+        return;
+    }
+    if (!gAMRot3DAttachCtx.shouldAttachIfMissing) return;
+
+    int chosenSlot = [[AMRot3DStore shared] slotForElementId:gAMRot3DAttachCtx.targetElementId];
+    if (chosenSlot < 1 || chosenSlot > kAMRot3DMaxShaderSlots || usedSlots[chosenSlot]) {
+        chosenSlot = 0;
+        for (int s = 1; s <= kAMRot3DMaxShaderSlots; ++s) {
+            if (!usedSlots[s]) { chosenSlot = s; break; }
+        }
+    }
+    if (chosenSlot == 0) chosenSlot = 1;
+
+    AMRot3DAttachSlotToElement(targetEl, chosenSlot, efMeta, efSize, efIdOff, efParamsOff, efRenderGroupOff, efDisabledOff, efLocalOff, efHiddenOff, slide);
+    gAMRot3DAttachCtx.assignedSlot = chosenSlot;
+}
+
+static int AMRot3DSyncOrAttachEffect(void *holder, uint64_t elementId, BOOL attachIfMissing, int64_t *outStartMs, int64_t *outEndMs, int *outLinkedCount) {
+    if (outLinkedCount) *outLinkedCount = 0;
     if (!holder || elementId == 0) return 0;
     intptr_t slide = AMMainBinarySlide();
 
@@ -15464,14 +15807,44 @@ static int AMRot3DSyncOrAttachEffect(void *holder, uint64_t elementId, BOOL atta
 
     if (outStartMs) *outStartMs = gAMRot3DAttachCtx.startTimeMs;
     if (outEndMs) *outEndMs = gAMRot3DAttachCtx.endTimeMs;
+    if (outLinkedCount) *outLinkedCount = gAMRot3DAttachCtx.linkedDescendantCount;
+
+    for (int i = 0; i < gAMRot3DAttachCtx.boundChildCount; ++i) {
+        [[AMRot3DStore shared] bindSlot:gAMRot3DAttachCtx.boundChildren[i].slot
+                            toElementId:gAMRot3DAttachCtx.boundChildren[i].elementId
+                            startTimeMs:gAMRot3DAttachCtx.boundChildren[i].startMs
+                              endTimeMs:gAMRot3DAttachCtx.boundChildren[i].endMs];
+    }
+
     int slot = gAMRot3DAttachCtx.assignedSlot;
     if (slot >= 1 && slot <= kAMRot3DMaxSlots) {
+        NSMutableDictionary *d = [[AMRot3DStore shared] layerDictForSlot:slot create:YES elementId:elementId];
+        if (d) d[@"isNull"] = @(gAMRot3DAttachCtx.isNullTarget);
         [[AMRot3DStore shared] bindSlot:slot
                             toElementId:elementId
                             startTimeMs:gAMRot3DAttachCtx.startTimeMs
                               endTimeMs:gAMRot3DAttachCtx.endTimeMs];
     }
     return slot;
+}
+
+static void AMRot3DSyncAfterParentingChange(void *holder) {
+    if (!holder) return;
+    AMRot3DRefreshHierarchyFromHolder(holder, 0, NULL);
+    // If any Null already has an active 3D slot, ensure its newly linked descendants have GPU 3D slots attached!
+    uint64_t activeNullIds[16];
+    int nNulls = 0;
+    os_unfair_lock_lock(&gAMRot3DRuntimeLock);
+    for (int s = kAMRot3DMaxShaderSlots + 1; s <= kAMRot3DMaxSlots && nNulls < 16; ++s) {
+        if (gAMRot3DSlots[s].active && gAMRot3DSlots[s].elementId != 0) {
+            activeNullIds[nNulls++] = gAMRot3DSlots[s].elementId;
+        }
+    }
+    os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
+    for (int i = 0; i < nNulls; ++i) {
+        AMRot3DSyncOrAttachEffect(holder, activeNullIds[i], YES, NULL, NULL, NULL);
+    }
+    if (nNulls > 0) AMForceImmediatePreviewRedraw();
 }
 
 // --- Crisp Alight Motion Vector Icon for 3D Rotate Card ---
@@ -15528,6 +15901,7 @@ static UIImage *AMRot3DTabIcon(void) {
 @property (nonatomic, assign) int64_t currentTimeMs;
 @property (nonatomic, assign) int activeAxis; // 0=X, 1=Y, 2=Z
 @property (nonatomic, assign) BOOL showGizmo;
+@property (nonatomic, assign) BOOL isNullController;
 @end
 
 @implementation AMRot3DCanvasOverlayView {
@@ -15570,10 +15944,20 @@ static UIImage *AMRot3DTabIcon(void) {
 - (BOOL)getSnapshot:(AMPuppetTransformSnapshot *)outSnap runtime:(AMRot3DSlotRuntime *)outRt {
     if (self.slot < 1 || self.slot > kAMRot3DMaxSlots) return NO;
     os_unfair_lock_lock(&gAMRot3DRuntimeLock);
-    if (outSnap) *outSnap = gAMRot3DTransforms[self.slot];
+    if (outSnap) {
+        if (self.slot <= kAMRot3DMaxShaderSlots) {
+            *outSnap = gAMRot3DTransforms[self.slot];
+        } else {
+            memset(outSnap, 0, sizeof(*outSnap));
+            // Virtual screen-space snapshot for Null controller gizmo
+            outSnap->layerSize[0] = (float)fmax(self.bounds.size.width, 1.0);
+            outSnap->layerSize[1] = (float)fmax(self.bounds.size.height, 1.0);
+            outSnap->valid = NO;
+        }
+    }
     if (outRt) *outRt = gAMRot3DSlots[self.slot];
     os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
-    return outSnap ? outSnap->valid : YES;
+    return outSnap ? (outSnap->valid || self.isNullController) : YES;
 }
 
 - (CGPoint)viewPointFromLayerNorm:(CGPoint)ln snapshot:(const AMPuppetTransformSnapshot *)snap {
@@ -15631,8 +16015,8 @@ static UIImage *AMRot3DTabIcon(void) {
     [self evalCurrentState:&rt euler:euler pivot:piv];
     AMRot3DMat4Angles(R, euler[0], euler[1], euler[2]);
     float asp = (snap.layerSize[1] > 1.0f) ? (snap.layerSize[0] / snap.layerSize[1]) : 1.0f;
-    float fov = fminf(fmaxf(rt.fov, 15.0f), 140.0f);
-    float cd = 0.5f / tanf(fov * (float)(M_PI / 360.0));
+    float fov = (rt.fov >= 12.0f && rt.fov <= 95.0f) ? rt.fov : kAMRot3DDefaultFov;
+    float cd = AMRot3DComputeCameraDist(fov, snap.valid ? snap.layerToScreen : NULL, gAMRot3DHasActiveCamera);
     float zOff = rt.zOffset / 500.0f;
     float ringR = 0.36f * fminf(asp, 1.0f);
     if (ringR < 0.22f) ringR = 0.22f;
@@ -15676,14 +16060,22 @@ static UIImage *AMRot3DTabIcon(void) {
 - (BOOL)pointInsideProjectedQuad:(CGPoint)pt {
     AMPuppetTransformSnapshot snap;
     AMRot3DSlotRuntime rt;
-    if (![self getSnapshot:&snap runtime:&rt] || !rt.active || !snap.valid) return NO;
+    if (![self getSnapshot:&snap runtime:&rt] || !rt.active) return NO;
     float euler[3], piv[3], R[16];
     [self evalCurrentState:&rt euler:euler pivot:piv];
     AMRot3DMat4Angles(R, euler[0], euler[1], euler[2]);
     float asp = (snap.layerSize[1] > 1.0f) ? (snap.layerSize[0] / snap.layerSize[1]) : 1.0f;
-    float fov = fminf(fmaxf(rt.fov, 15.0f), 140.0f);
-    float cd = 0.5f / tanf(fov * (float)(M_PI / 360.0));
+    float fov = (rt.fov >= 12.0f && rt.fov <= 95.0f) ? rt.fov : kAMRot3DDefaultFov;
+    float cd = AMRot3DComputeCameraDist(fov, snap.valid ? snap.layerToScreen : NULL, gAMRot3DHasActiveCamera);
     float zOff = rt.zOffset / 500.0f;
+    if (self.isNullController && !snap.valid) {
+        CGPoint pivPt = CGPointZero;
+        if ([self projectLocal3D:0 y:0 z:0 R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&pivPt outZ:NULL]) {
+            return hypot(pt.x - pivPt.x, pt.y - pivPt.y) <= 95.0;
+        }
+        return NO;
+    }
+    if (!snap.valid) return NO;
     float qx[4] = { (0.0f - piv[0]) * asp, (1.0f - piv[0]) * asp, (1.0f - piv[0]) * asp, (0.0f - piv[0]) * asp };
     float qy[4] = { (0.0f - piv[1]),       (0.0f - piv[1]),       (1.0f - piv[1]),       (1.0f - piv[1]) };
     CGPoint quad[4];
@@ -15901,22 +16293,25 @@ static UIImage *AMRot3DTabIcon(void) {
     // Always draw miniature Jex 3D ViewCube in top-right of preview
     [self drawViewCubeInContext:ctx rotationMatrix:R];
 
-    if (!self.showGizmo || !snap.valid) return;
+    if (!self.showGizmo || (!snap.valid && !self.isNullController)) return;
 
     float asp = (snap.layerSize[1] > 1.0f) ? (snap.layerSize[0] / snap.layerSize[1]) : 1.0f;
-    float fov = fminf(fmaxf(rt.fov, 15.0f), 140.0f);
-    float cd = 0.5f / tanf(fov * (float)(M_PI / 360.0));
+    float fov = (rt.fov >= 12.0f && rt.fov <= 95.0f) ? rt.fov : kAMRot3DDefaultFov;
+    float cd = AMRot3DComputeCameraDist(fov, snap.valid ? snap.layerToScreen : NULL, gAMRot3DHasActiveCamera);
     float zOff = rt.zOffset / 500.0f;
 
-    // 1. Projected 3D layer quad outline
-    float qx[4] = { (0.0f - piv[0]) * asp, (1.0f - piv[0]) * asp, (1.0f - piv[0]) * asp, (0.0f - piv[0]) * asp };
-    float qy[4] = { (0.0f - piv[1]),       (0.0f - piv[1]),       (1.0f - piv[1]),       (1.0f - piv[1]) };
+    // 1. Projected 3D layer quad outline (skip full quad for virtual Null controller)
+    BOOL quadOk = NO;
     CGPoint quadPts[4];
-    BOOL quadOk = YES;
-    for (int i = 0; i < 4; ++i) {
-        if (![self projectLocal3D:qx[i] y:qy[i] z:-piv[2] R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&quadPts[i] outZ:NULL]) {
-            quadOk = NO;
-            break;
+    if (snap.valid) {
+        float qx[4] = { (0.0f - piv[0]) * asp, (1.0f - piv[0]) * asp, (1.0f - piv[0]) * asp, (0.0f - piv[0]) * asp };
+        float qy[4] = { (0.0f - piv[1]),       (0.0f - piv[1]),       (1.0f - piv[1]),       (1.0f - piv[1]) };
+        quadOk = YES;
+        for (int i = 0; i < 4; ++i) {
+            if (![self projectLocal3D:qx[i] y:qy[i] z:-piv[2] R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&quadPts[i] outZ:NULL]) {
+                quadOk = NO;
+                break;
+            }
         }
     }
     if (quadOk) {
@@ -16503,10 +16898,13 @@ static UIImage *AMRot3DTabIcon(void) {
 @interface AMRot3DPanelVC : UIViewController <AMRot3DCanvasOverlayDelegate>
 @property (nonatomic, assign) void *holder;
 @property (nonatomic, assign) uint64_t elementId;
+@property (nonatomic, assign) BOOL isNullLayer;
 @end
 
 @implementation AMRot3DPanelVC {
     int _slot;
+    int _linkedChildCount;
+    int _syncTickCounter;
     int64_t _startTimeMs;
     int64_t _endTimeMs;
     int _activeTab;       // 0=RotX, 1=RotY, 2=RotZ, 3=Pivot, 4=Lens
@@ -16624,13 +17022,14 @@ static UIImage *AMRot3DTabIcon(void) {
     AMInstallPuppetMetalHook();
     if (_holder) {
         AMSwiftRetain(_holder, AMMainBinarySlide());
-        _slot = AMRot3DSyncOrAttachEffect(_holder, self.elementId, YES, &_startTimeMs, &_endTimeMs);
+        _slot = AMRot3DSyncOrAttachEffect(_holder, self.elementId, YES, &_startTimeMs, &_endTimeMs, &_linkedChildCount);
+        if (gAMRot3DAttachCtx.isNullTarget) self.isNullLayer = YES;
         _lastPolledTimeMs = AMReadHolderCurrentTime(_holder, AMMainBinarySlide());
         gAMRot3DEditorCurrentTimeMs = _lastPolledTimeMs;
     }
     if (_slot < 1) {
         _slot = [[AMRot3DStore shared] slotForElementId:self.elementId];
-        if (_slot < 1) _slot = 1;
+        if (_slot < 1) _slot = self.isNullLayer ? (kAMRot3DMaxShaderSlots + 1) : 1;
         [[AMRot3DStore shared] bindSlot:_slot toElementId:self.elementId startTimeMs:_startTimeMs endTimeMs:_endTimeMs];
     }
 
@@ -16684,6 +17083,7 @@ static UIImage *AMRot3DTabIcon(void) {
     if (_canvasOverlay && _canvasOverlay.superview == pv) {
         _canvasOverlay.frame = pv.bounds;
         _canvasOverlay.slot = _slot;
+        _canvasOverlay.isNullController = self.isNullLayer;
         _canvasOverlay.activeAxis = (_activeTab <= 2) ? _activeTab : 0;
         _canvasOverlay.showGizmo = showG;
         _canvasOverlay.currentTimeMs = [self currentTimeMs];
@@ -16696,6 +17096,7 @@ static UIImage *AMRot3DTabIcon(void) {
     _canvasOverlay.delegate = self;
     _canvasOverlay.previewView = pv;
     _canvasOverlay.slot = _slot;
+    _canvasOverlay.isNullController = self.isNullLayer;
     _canvasOverlay.activeAxis = (_activeTab <= 2) ? _activeTab : 0;
     _canvasOverlay.showGizmo = showG;
     _canvasOverlay.currentTimeMs = [self currentTimeMs];
@@ -16720,6 +17121,10 @@ static UIImage *AMRot3DTabIcon(void) {
     if (!stillSelected) {
         [self.navigationController popViewControllerAnimated:NO];
         return;
+    }
+    if (++_syncTickCounter >= 15) {
+        _syncTickCounter = 0;
+        AMRot3DRefreshHierarchyFromHolder(_holder, 0, NULL);
     }
     int64_t t = [self currentTimeMs];
     if (_canvasOverlay) {
@@ -16923,7 +17328,9 @@ static UIImage *AMRot3DTabIcon(void) {
     [lensScroll addSubview:lensStack];
 
     NSDictionary *ld = [self layerDict];
-    [self addSliderRowTo:lensStack label:&_fovLbl slider:&_fovSlider min:20.0f max:120.0f val:(ld[@"fov"] ? [ld[@"fov"] floatValue] : 60.0f) tag:0];
+    float initFov = ld[@"fov"] ? [ld[@"fov"] floatValue] : kAMRot3DDefaultFov;
+    if (initFov < 12.0f || initFov > 90.0f) initFov = kAMRot3DDefaultFov;
+    [self addSliderRowTo:lensStack label:&_fovLbl slider:&_fovSlider min:12.0f max:90.0f val:initFov tag:0];
     [self addSliderRowTo:lensStack label:&_zDepthLbl slider:&_zDepthSlider min:-300.0f max:300.0f val:[ld[@"zOffset"] floatValue] tag:1];
     [self addSliderRowTo:lensStack label:&_bendLbl slider:&_bendSlider min:-180.0f max:180.0f val:[ld[@"bend"] floatValue] tag:2];
     [self addSliderRowTo:lensStack label:&_lightLbl slider:&_lightSlider min:0.0f max:1.0f val:[ld[@"lighting"] floatValue] tag:3];
@@ -17142,9 +17549,13 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
     float pz = [self evalTrack:5 atMs:tMs];
 
     if (_activeTab == 3) {
-        _padReadout.text = [NSString stringWithFormat:@"P %.0f%%  %.0f%%  Z %.0f", px * 100.0f, py * 100.0f, pz];
+        _padReadout.text = self.isNullLayer
+            ? [NSString stringWithFormat:@"Null(%d) P %.0f%% %.0f%% Z %.0f", _linkedChildCount, px * 100.0f, py * 100.0f, pz]
+            : [NSString stringWithFormat:@"P %.0f%%  %.0f%%  Z %.0f", px * 100.0f, py * 100.0f, pz];
     } else {
-        _padReadout.text = [NSString stringWithFormat:@"X %.1f°  Y %.1f°  Z %.1f°", rx, ry, rz];
+        _padReadout.text = self.isNullLayer
+            ? [NSString stringWithFormat:@"Null(%d) X %.0f° Y %.0f° Z %.0f°", _linkedChildCount, rx, ry, rz]
+            : [NSString stringWithFormat:@"X %.1f°  Y %.1f°  Z %.1f°", rx, ry, rz];
     }
 
     int tr = [self activeTrackIndex];
@@ -17194,7 +17605,7 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
         ? @"1 finger: Anchor X/Y\n2 fingers: Anchor Z"
         : @"1 finger: Pitch X / Yaw Y\n2 fingers: Roll Z";
 
-    _fovLbl.text = [NSString stringWithFormat:@"Perspective FOV: %.0f°", _fovSlider.value];
+    _fovLbl.text = [NSString stringWithFormat:@"AE Lens: %.0fmm (%.0f°)%@", AMRot3DFocalLengthMM(_fovSlider.value), _fovSlider.value, gAMRot3DHasActiveCamera ? @" · Cam" : @""];
     _zDepthLbl.text = [NSString stringWithFormat:@"Depth Z: %.0f", _zDepthSlider.value];
     _bendLbl.text = [NSString stringWithFormat:@"3D Curve Bend: %.0f°", _bendSlider.value];
     _lightLbl.text = [NSString stringWithFormat:@"3D Shading Light: %.0f%%", _lightSlider.value * 100.0f];
@@ -17327,9 +17738,9 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
 - (void)onResetActive {
     if (_activeTab == 4) {
         NSMutableDictionary *ld = [self layerDict];
-        ld[@"fov"] = @(60.0); ld[@"zOffset"] = @(0.0); ld[@"bend"] = @(0.0);
+        ld[@"fov"] = @(kAMRot3DDefaultFov); ld[@"zOffset"] = @(0.0); ld[@"bend"] = @(0.0);
         ld[@"lighting"] = @(0.0); ld[@"backfaceMode"] = @(0);
-        _fovSlider.value = 60.0f; _zDepthSlider.value = 0.0f; _bendSlider.value = 0.0f;
+        _fovSlider.value = kAMRot3DDefaultFov; _zDepthSlider.value = 0.0f; _bendSlider.value = 0.0f;
         _lightSlider.value = 0.0f; _backfaceSeg.selectedSegmentIndex = 0;
         [[AMRot3DStore shared] save];
         [self refreshControls];
@@ -17381,7 +17792,7 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
     else if (sl.tag == 2) { ld[@"bend"] = @(sl.value); rt->bend = sl.value; }
     else if (sl.tag == 3) { ld[@"lighting"] = @(sl.value); rt->lighting = sl.value; }
     os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
-    if (sl.tag == 0) _fovLbl.text = [NSString stringWithFormat:@"Perspective FOV: %.0f°", sl.value];
+    if (sl.tag == 0) _fovLbl.text = [NSString stringWithFormat:@"AE Lens: %.0fmm (%.0f°)%@", AMRot3DFocalLengthMM(sl.value), sl.value, gAMRot3DHasActiveCamera ? @" · Cam" : @""];
     else if (sl.tag == 1) _zDepthLbl.text = [NSString stringWithFormat:@"Depth Z: %.0f", sl.value];
     else if (sl.tag == 2) _bendLbl.text = [NSString stringWithFormat:@"3D Curve Bend: %.0f°", sl.value];
     else if (sl.tag == 3) _lightLbl.text = [NSString stringWithFormat:@"3D Shading Light: %.0f%%", sl.value * 100.0f];
@@ -17503,20 +17914,22 @@ static NSInteger AMHook_editingPanelNumItems(id self, SEL _cmd, UICollectionView
         : 0;
     if (orig >= 4) return orig + 2; // Puppet + 3D Rotate
     if (AMIsEditingPanelShowingAudioLayer(self, orig)) return orig + 1;
+    if (AMIsEditingPanelShowingNullLayer(self, orig)) return orig + 1; // 3D Rotate on Null Objects
     return orig;
 }
 
 static CGSize AMHook_editingPanelSizeForItem(id self, SEL _cmd, UICollectionView *cv, UICollectionViewLayout *layout, NSIndexPath *indexPath) {
     NSInteger orig = AMEditingPanelOrigCount(self, cv, indexPath.section);
     BOOL isAudio = (orig < 4) && AMIsEditingPanelShowingAudioLayer(self, orig);
-    if (orig < 4 && !isAudio) {
+    BOOL isNull = (orig < 4) && !isAudio && AMIsEditingPanelShowingNullLayer(self, orig);
+    if (orig < 4 && !isAudio && !isNull) {
         if (gOrigEditingPanelSizeForItem) {
             return ((CGSize (*)(id, SEL, UICollectionView *, UICollectionViewLayout *, NSIndexPath *))gOrigEditingPanelSizeForItem)(
                 self, _cmd, cv, layout, indexPath);
         }
         return CGSizeMake(80.0, 64.0);
     }
-    NSInteger total = isAudio ? (orig + 1) : (orig + 2);
+    NSInteger total = (isAudio || isNull) ? (orig + 1) : (orig + 2);
     NSInteger rows = (total >= 4) ? 2 : 1;
     NSInteger cols = total;
     if (rows == 2) {
@@ -17544,7 +17957,8 @@ static CGSize AMHook_editingPanelSizeForItem(id self, SEL _cmd, UICollectionView
 static UICollectionViewCell *AMHook_editingPanelCellForItem(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
     NSInteger orig = AMEditingPanelOrigCount(self, cv, indexPath.section);
     BOOL isPuppet = (orig >= 4 && indexPath.row == orig);
-    BOOL isRot3D = (orig >= 4 && indexPath.row == orig + 1);
+    BOOL isNullRot3D = (orig < 4 && indexPath.row == orig && AMIsEditingPanelShowingNullLayer(self, orig));
+    BOOL isRot3D = (orig >= 4 && indexPath.row == orig + 1) || isNullRot3D;
     BOOL isAutoBeats = (!isPuppet && !isRot3D && orig < 4 && indexPath.row == orig && AMIsEditingPanelShowingAudioLayer(self, orig));
     if (isPuppet || isRot3D || isAutoBeats) {
         UICollectionViewCell *cell = [cv dequeueReusableCellWithReuseIdentifier:@"EditingPanelCell" forIndexPath:indexPath];
@@ -17584,7 +17998,8 @@ static UICollectionViewCell *AMHook_editingPanelCellForItem(id self, SEL _cmd, U
 static void AMHook_editingPanelDidSelectItem(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
     NSInteger orig = AMEditingPanelOrigCount(self, cv, indexPath.section);
     BOOL isPuppet = (orig >= 4 && indexPath.row == orig);
-    BOOL isRot3D = (orig >= 4 && indexPath.row == orig + 1);
+    BOOL isNullRot3D = (orig < 4 && indexPath.row == orig && AMIsEditingPanelShowingNullLayer(self, orig));
+    BOOL isRot3D = (orig >= 4 && indexPath.row == orig + 1) || isNullRot3D;
     BOOL isAutoBeats = (!isPuppet && !isRot3D && orig < 4 && indexPath.row == orig && AMIsEditingPanelShowingAudioLayer(self, orig));
     if (isPuppet || isRot3D || isAutoBeats) {
         [cv deselectItemAtIndexPath:indexPath animated:YES];
@@ -17613,6 +18028,7 @@ static void AMHook_editingPanelDidSelectItem(id self, SEL _cmd, UICollectionView
                 AMRot3DPanelVC *rvc = [[AMRot3DPanelVC alloc] init];
                 rvc.holder = holder;
                 rvc.elementId = targetId;
+                rvc.isNullLayer = isNullRot3D;
                 [vc.navigationController pushViewController:rvc animated:YES];
             } else {
                 AMPuppetPanelVC *pvc = [[AMPuppetPanelVC alloc] init];
