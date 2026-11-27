@@ -13880,9 +13880,9 @@ static UIImage *AMAutoBeatsTabIcon(void) {
     // Waveform + Beat Preview Strip
     _waveformView = [[AMAutoBeatsWaveformView alloc] init];
     _waveformView.translatesAutoresizingMaskIntoConstraints = NO;
-    __weak typeof(self) weakSelf = self;
+    __weak __typeof__(self) weakSelf = self;
     _waveformView.onSeekTimeMs = ^(int64_t timeMs) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
+        __strong __typeof__(weakSelf) strongSelf = weakSelf;
         if (strongSelf && strongSelf.holder) {
             AMPuppetSeekHolderToTimeMs(strongSelf.holder, timeMs);
         }
@@ -14087,11 +14087,11 @@ static UIImage *AMAutoBeatsTabIcon(void) {
     _applyButton.alpha = 0.5;
 
     AMAutoBeatsAudioInfo infoCopy = _audioInfo;
-    __weak typeof(self) weakSelf = self;
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_USER_INITIATED, 0), ^{
+    __weak __typeof__(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         AMAutoBeatsAnalysisResult result = AMAutoBeatsAnalyzeAudio(infoCopy);
         dispatch_async(dispatch_get_main_queue(), ^{
-            __strong typeof(weakSelf) strongSelf = weakSelf;
+            __strong __typeof__(weakSelf) strongSelf = weakSelf;
             if (!strongSelf || strongSelf->_analysisGen != gen) return;
             [strongSelf->_spinner stopAnimating];
             strongSelf->_analysis = result;
@@ -14160,9 +14160,9 @@ static UIImage *AMAutoBeatsTabIcon(void) {
     AMAutoBeatsApplyBookmarks(self.holder, _analysis.clipStartMs, _analysis.clipEndMs, YES, times, &removed, &added);
     [_applyButton setTitle:@"Applied ✓" forState:UIControlStateNormal];
     _countBadge.text = [NSString stringWithFormat:@"%ld markers set", (long)added];
-    __weak typeof(self) weakSelf = self;
+    __weak __typeof__(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
+        __strong __typeof__(weakSelf) strongSelf = weakSelf;
         if (strongSelf) {
             [strongSelf->_applyButton setTitle:@"Apply" forState:UIControlStateNormal];
         }
