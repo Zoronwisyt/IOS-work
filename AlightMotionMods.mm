@@ -161,6 +161,69 @@ static void AMForceImmediatePreviewRedraw(void) {
     }
 }
 
+static BOOL gAMLiveRedrawInFlight = NO;
+static BOOL gAMLiveRedrawPending = NO;
+static uint64_t gAMLiveRedrawSeq = 0;
+
+static void AMRequestCoalescedPreviewRedraw(void) {
+    AVPlayer *player = gActivePreviewPlayer;
+    if (!player) return;
+    AVPlayerItem *item = player.currentItem;
+    if (!item) return;
+
+    // If playing, AVPlayer already pulls new frames continuously (no seek needed).
+    if (player.rate != 0.0f) return;
+
+    if (gAMLiveRedrawInFlight) {
+        gAMLiveRedrawPending = YES;
+        return;
+    }
+
+    gAMLiveRedrawInFlight = YES;
+    gAMLiveRedrawPending = NO;
+    uint64_t seq = ++gAMLiveRedrawSeq;
+
+    AVVideoComposition *vc = item.videoComposition;
+    if (vc) {
+        AVVideoComposition *copied = [vc copy];
+        if (copied) {
+            item.videoComposition = copied;
+        }
+    }
+
+    CMTime cur = player.currentTime;
+    if (!CMTIME_IS_NUMERIC(cur)) {
+        gAMLiveRedrawInFlight = NO;
+        return;
+    }
+
+    // Safety timeout so in-flight gate can never stall if AVPlayer drops a callback
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        if (gAMLiveRedrawInFlight && gAMLiveRedrawSeq == seq) {
+            gAMLiveRedrawInFlight = NO;
+            if (gAMLiveRedrawPending) {
+                gAMLiveRedrawPending = NO;
+                AMRequestCoalescedPreviewRedraw();
+            }
+        }
+    });
+
+    [player seekToTime:cur
+       toleranceBefore:kCMTimeZero
+        toleranceAfter:kCMTimeZero
+     completionHandler:^(BOOL finished) {
+        (void)finished;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (gAMLiveRedrawSeq != seq) return;
+            gAMLiveRedrawInFlight = NO;
+            if (gAMLiveRedrawPending) {
+                gAMLiveRedrawPending = NO;
+                AMRequestCoalescedPreviewRedraw();
+            }
+        });
+    }];
+}
+
 static IMP gOrigStartVideoCompReq = NULL;
 static ptrdiff_t gCompImplOffset = -1;
 static ptrdiff_t gDynaResOffset = -1;
@@ -8383,6 +8446,7 @@ static void AMHook_mtlSetFragmentBytes(id self, SEL _cmd, const void *bytes, NSU
         os_unfair_lock_lock(&gAMPuppetRuntimeLock);
         AMPuppetTransformSnapshot *tr = &gAMPuppetTransforms[slot];
         BOOL wasValid = tr->valid;
+        BOOL matrixChanged = (!wasValid || memcmp(tr->layerToScreen, inBytes + 0x80, 16 * sizeof(float)) != 0);
         memcpy(tr->screenToLayer, inBytes + 0x40, 16 * sizeof(float));
         memcpy(tr->layerToScreen, inBytes + 0x80, 16 * sizeof(float));
         memcpy(tr->screenSize, inBytes + 0xD0, 2 * sizeof(float));
@@ -8391,7 +8455,7 @@ static void AMHook_mtlSetFragmentBytes(id self, SEL _cmd, const void *bytes, NSU
         tr->valid = YES;
 
         AMPuppetSlotRuntime *rt = &gAMPuppetSlots[slot];
-        if (!wasValid || (gAMPuppetPanelVisible && rt->active && rt->elementId == gAMPuppetActiveElementId)) {
+        if (matrixChanged && (!wasValid || (gAMPuppetPanelVisible && rt->active && rt->elementId == gAMPuppetActiveElementId))) {
             notifyTransform = YES;
         }
 
@@ -9930,10 +9994,13 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     kf[@"p2x"] = @(_graphView.p2x);
     kf[@"p2y"] = @(_graphView.p2y);
     kf[@"stepCount"] = @(_graphView.stepCount);
-    if (saveDisk) [[AMPuppetStore shared] save];
-    else [[AMPuppetStore shared] syncAllToRuntime];
+    if (saveDisk) {
+        [[AMPuppetStore shared] save];
+    } else {
+        [[AMPuppetStore shared] syncAllToRuntime];
+    }
     [self updateInfoLabel];
-    AMForceImmediatePreviewRedraw();
+    AMRequestCoalescedPreviewRedraw();
     if (self.onDidModify) self.onDidModify();
 }
 
@@ -10698,27 +10765,79 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     }
 }
 
+static void AMPuppetFastUpdatePinInRuntime(int slot, NSInteger pinIdx, float x, float y, int64_t timeMs) {
+    if (slot < 1 || slot > kAMPuppetMaxSlots || pinIdx < 0 || pinIdx >= kAMPuppetMaxPins) return;
+    os_unfair_lock_lock(&gAMPuppetRuntimeLock);
+    AMPuppetSlotRuntime *rt = &gAMPuppetSlots[slot];
+    if (rt->active && pinIdx < rt->pinCount) {
+        AMPuppetPinC *pc = &rt->pins[pinIdx];
+        pc->currX = x;
+        pc->currY = y;
+        if (pc->keyframeCount > 0) {
+            int match = -1;
+            for (int k = 0; k < pc->keyframeCount; ++k) {
+                if (llabs(pc->keyframes[k].timeMs - timeMs) <= 20) {
+                    match = k;
+                    break;
+                }
+            }
+            if (match >= 0) {
+                pc->keyframes[match].x = x;
+                pc->keyframes[match].y = y;
+            } else if (pc->keyframeCount < kAMPuppetMaxKeyframesPerPin) {
+                int ins = pc->keyframeCount;
+                while (ins > 0 && pc->keyframes[ins - 1].timeMs > timeMs) {
+                    pc->keyframes[ins] = pc->keyframes[ins - 1];
+                    ins--;
+                }
+                AMPuppetKeyframeC kf = { timeMs, x, y, 0, 0.42f, 0.0f, 0.58f, 1.0f, 4.0f };
+                pc->keyframes[ins] = kf;
+                pc->keyframeCount++;
+            }
+        }
+    }
+    os_unfair_lock_unlock(&gAMPuppetRuntimeLock);
+}
+
+static void AMPuppetFastUpdateRigidityInRuntime(int slot, float rigidity) {
+    if (slot < 1 || slot > kAMPuppetMaxSlots) return;
+    os_unfair_lock_lock(&gAMPuppetRuntimeLock);
+    if (gAMPuppetSlots[slot].active) {
+        gAMPuppetSlots[slot].rigidity = rigidity;
+    }
+    os_unfair_lock_unlock(&gAMPuppetRuntimeLock);
+}
+
 - (void)setPinIndex:(NSInteger)idx position:(CGPoint)ln ended:(BOOL)ended {
     NSMutableArray *pins = [self pinsArray];
     if (idx < 0 || idx >= (NSInteger)pins.count) return;
     NSMutableDictionary *pd = pins[idx];
     float x = (float)ln.x, y = (float)ln.y;
+    int64_t tMs = [self currentTimeMs];
     pd[@"currX"] = @(x);
     pd[@"currY"] = @(y);
     NSArray *kfs = pd[@"keyframes"];
     // Exact AE + Alight Motion auto-keyframe: if pin is already animated (>=1 keyframe), moving at new time records a keyframe!
     if (kfs.count > 0) {
-        [self upsertKeyframeOnPin:pd timeMs:[self currentTimeMs] x:x y:y];
+        [self upsertKeyframeOnPin:pd timeMs:tMs x:x y:y];
     }
     if (ended) {
         [[AMPuppetStore shared] save];
         [self rebuildPinChips];
         AMPuppetRedrawAllKeyframeViews();
+        [self refreshControls];
+        AMRequestCoalescedPreviewRedraw();
     } else {
-        [[AMPuppetStore shared] syncAllToRuntime];
+        AMPuppetFastUpdatePinInRuntime(_slot, idx, x, y, tMs);
+        _coordLabel.text = [NSString stringWithFormat:@"Pin %ld   X: %.0f%%  Y: %.0f%%",
+                            (long)(_selectedPinIndex + 1), x * 100.0, y * 100.0];
+        if (_canvasOverlay) {
+            _canvasOverlay.selectedPinIndex = _selectedPinIndex;
+            _canvasOverlay.currentTimeMs = tMs;
+            [_canvasOverlay setNeedsDisplay];
+        }
+        AMRequestCoalescedPreviewRedraw();
     }
-    [self refreshControls];
-    AMForceImmediatePreviewRedraw();
 }
 
 - (void)nudgeSelectedPinByDelta:(CGPoint)d ended:(BOOL)ended {
@@ -10912,9 +11031,9 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
 - (void)onStiffnessChanged:(UISlider *)slider {
     NSMutableDictionary *ld = [self layerDict];
     ld[@"rigidity"] = @(slider.value);
-    [[AMPuppetStore shared] syncAllToRuntime];
-    [self refreshControls];
-    AMForceImmediatePreviewRedraw();
+    AMPuppetFastUpdateRigidityInRuntime(_slot, slider.value);
+    _stiffnessLabel.text = [NSString stringWithFormat:@"Stiffness: %.2f", slider.value];
+    AMRequestCoalescedPreviewRedraw();
 }
 
 - (void)onStiffnessEnded:(UISlider *)slider {
