@@ -4158,6 +4158,10 @@ static void AMWalkAccessibilityElements(id obj,
                                         NSMutableSet<NSValue *> *visited,
                                         void (^visitor)(id elem, NSString *label, CGRect screenFrame)) {
     if (!obj || depth > 20) return;
+    if ([obj isKindOfClass:[UIView class]]) {
+        UIView *v = (UIView *)obj;
+        if (v.hidden || v.alpha < 0.02) return;
+    }
     NSValue *ptrVal = [NSValue valueWithPointer:(__bridge const void *)obj];
     if ([visited containsObject:ptrVal]) return;
     [visited addObject:ptrVal];
@@ -6790,6 +6794,8 @@ static void AMQueueSequentialAmprojImports(NSArray<NSURL *> *urls) {
 @property (nonatomic, assign) NSTimeInterval lastDiskRefresh;
 + (instancetype)shared;
 - (void)start;
+- (void)tick;
+- (void)scheduleImmediateTick;
 @end
 
 @implementation AMHomepageSearchOverlayManager
@@ -6812,11 +6818,23 @@ static void AMQueueSequentialAmprojImports(NSArray<NSURL *> *urls) {
                                                      name:UIApplicationDidBecomeActiveNotification
                                                    object:nil];
         [self onAppDidBecomeActive];
-        self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:0.35
+        self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:0.15
                                                           target:self
                                                         selector:@selector(tick)
                                                         userInfo:nil
                                                          repeats:YES];
+    });
+}
+
+- (void)scheduleImmediateTick {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self tick];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self tick];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self tick];
     });
 }
 
@@ -6999,9 +7017,10 @@ static void AMQueueSequentialAmprojImports(NSArray<NSURL *> *urls) {
 
     if (probe.hasYourProjects) {
         CGFloat midY = CGRectGetMidY(probe.yourProjectsFrame);
+        CGFloat midX = CGRectGetMidX(probe.yourProjectsFrame);
         CGFloat minVisY = win.safeAreaInsets.top + 58.0;
         CGFloat maxVisY = win.bounds.size.height - win.safeAreaInsets.bottom - 75.0;
-        if (midY > minVisY && midY < maxVisY) {
+        if (midY > minVisY && midY < maxVisY && midX > 0.0 && midX < win.bounds.size.width) {
             CGFloat fw = 102.0;
             CGFloat fh = 30.0;
             CGFloat fx = win.bounds.size.width - 16.0 - fw;
@@ -7741,6 +7760,49 @@ static void AMHook_exportSessionSetAudioMix(id self, SEL _cmd, AVAudioMix *audio
     [(AVAssetExportSession *)self setAudioTimePitchAlgorithm:AVAudioTimePitchAlgorithmVarispeed];
 }
 
+static IMP gOrigWindowSendEvent = NULL;
+static void AMHook_windowSendEvent(id self, SEL _cmd, UIEvent *event) {
+    if (gOrigWindowSendEvent) {
+        ((void (*)(id, SEL, UIEvent *))gOrigWindowSendEvent)(self, _cmd, event);
+    }
+    if (event.type == UIEventTypeTouches && [self isKindOfClass:[UIWindow class]]) {
+        UIWindow *win = (UIWindow *)self;
+        CGFloat barTop = win.bounds.size.height - win.safeAreaInsets.bottom - 95.0;
+        for (UITouch *t in [event touchesForWindow:win]) {
+            if (t.phase == UITouchPhaseBegan || t.phase == UITouchPhaseEnded) {
+                if ([t locationInView:win].y >= barTop) {
+                    [[AMHomepageSearchOverlayManager shared] scheduleImmediateTick];
+                    break;
+                }
+            }
+        }
+    }
+}
+
+static IMP gOrigTabBarControllerSetSelectedIndex = NULL;
+static void AMHook_tabBarControllerSetSelectedIndex(id self, SEL _cmd, NSUInteger idx) {
+    if (gOrigTabBarControllerSetSelectedIndex) {
+        ((void (*)(id, SEL, NSUInteger))gOrigTabBarControllerSetSelectedIndex)(self, _cmd, idx);
+    }
+    [[AMHomepageSearchOverlayManager shared] scheduleImmediateTick];
+}
+
+static IMP gOrigTabBarControllerSetSelectedVC = NULL;
+static void AMHook_tabBarControllerSetSelectedVC(id self, SEL _cmd, UIViewController *vc) {
+    if (gOrigTabBarControllerSetSelectedVC) {
+        ((void (*)(id, SEL, UIViewController *))gOrigTabBarControllerSetSelectedVC)(self, _cmd, vc);
+    }
+    [[AMHomepageSearchOverlayManager shared] scheduleImmediateTick];
+}
+
+static IMP gOrigTabBarSetSelectedItem = NULL;
+static void AMHook_tabBarSetSelectedItem(id self, SEL _cmd, UITabBarItem *item) {
+    if (gOrigTabBarSetSelectedItem) {
+        ((void (*)(id, SEL, UITabBarItem *))gOrigTabBarSetSelectedItem)(self, _cmd, item);
+    }
+    [[AMHomepageSearchOverlayManager shared] scheduleImmediateTick];
+}
+
 static void AMSwizzleMethod(NSString *className, NSString *selName, IMP replacement, IMP *outOrig) {
     Class cls = NSClassFromString(className);
     if (!cls) return;
@@ -7870,6 +7932,23 @@ static void AlightMotionModsInit(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         AMInstallCustomEffectCategoryIfNeeded();
     });
+
+    AMSwizzleMethod(@"UIWindow",
+                    @"sendEvent:",
+                    (IMP)AMHook_windowSendEvent,
+                    &gOrigWindowSendEvent);
+    AMSwizzleMethod(@"UITabBarController",
+                    @"setSelectedIndex:",
+                    (IMP)AMHook_tabBarControllerSetSelectedIndex,
+                    &gOrigTabBarControllerSetSelectedIndex);
+    AMSwizzleMethod(@"UITabBarController",
+                    @"setSelectedViewController:",
+                    (IMP)AMHook_tabBarControllerSetSelectedVC,
+                    &gOrigTabBarControllerSetSelectedVC);
+    AMSwizzleMethod(@"UITabBar",
+                    @"setSelectedItem:",
+                    (IMP)AMHook_tabBarSetSelectedItem,
+                    &gOrigTabBarSetSelectedItem);
 
     [[AMHomepageSearchOverlayManager shared] start];
 }
