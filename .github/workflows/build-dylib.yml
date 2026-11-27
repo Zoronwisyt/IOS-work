@@ -31,6 +31,7 @@ jobs:
             -framework AVFoundation \
             -framework CoreMedia \
             -framework Metal \
+            -framework Accelerate \
             -o AlightMotionMods.dylib \
             AlightMotionMods.mm
           codesign -f -s - AlightMotionMods.dylib

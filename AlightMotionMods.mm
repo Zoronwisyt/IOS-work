@@ -22,7 +22,10 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <Metal/Metal.h>
+#import <Accelerate/Accelerate.h>
 #import <os/lock.h>
+#import <vector>
+#import <algorithm>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <math.h>
@@ -12623,7 +12626,1556 @@ static void AMPuppetFastUpdateRigidityInRuntime(int slot, float rigidity) {
 
 @end
 
-// --- Native EditingPanelVC Hooks (Adds exact Alight Motion 'Puppet' Card!) ---
+// ============================================================================
+// Module 8: CapCut-Style Auto Beats (Spectral Flux + Beat Grid + Native Bookmarks)
+// ============================================================================
+
+struct AMAutoBeatCandidate {
+    int64_t timelineMs;
+    float strength;      // 0.0 .. 1.0 normalized
+    float lowEnergy;     // bass/kick energy
+    float midEnergy;     // snare/clap energy
+    float highEnergy;    // hi-hat/transient energy
+    uint8_t tier;        // 1=light/in-between, 2=mid/snare, 3=strong/kick, 4=downbeat/drop
+    bool isGridBeat;
+    bool isHalfBeat;
+    bool isPercussiveHit;
+};
+
+struct AMAutoBeatsAudioInfo {
+    BOOL valid;
+    BOOL isAudio;
+    uint64_t elementId;
+    int64_t startTimeMs;
+    int64_t endTimeMs;
+    int64_t inTimeMs;
+    int64_t outTimeMs;
+    float speedFactor;
+    BOOL loop;
+    NSURL * __strong assetURL;
+    NSInteger existingBookmarksInRange;
+};
+
+struct AMAutoBeatsAnalysisResult {
+    BOOL ok;
+    NSString * __strong errorMessage;
+    double estimatedBPM;
+    int64_t clipStartMs;
+    int64_t clipEndMs;
+    std::vector<float> waveformPeaks;
+    std::vector<AMAutoBeatCandidate> gridBeats;
+    std::vector<AMAutoBeatCandidate> percussiveHits;
+};
+
+static NSURL *AMResolveExistingAudioURL(NSURL *rawURL) {
+    if (!rawURL) return nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (rawURL.isFileURL && rawURL.path.length > 0 && [fm fileExistsAtPath:rawURL.path]) {
+        return rawURL;
+    }
+    NSString *fileName = rawURL.lastPathComponent;
+    if (fileName.length == 0) return rawURL;
+    NSArray<NSString *> *roots = @[
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: @"",
+        NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject ?: @""
+    ];
+    for (NSString *root in roots) {
+        if (root.length == 0) continue;
+        NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
+        NSString *rel = nil;
+        while ((rel = [en nextObject]) != nil) {
+            if ([rel.lastPathComponent isEqualToString:fileName]) {
+                NSString *full = [root stringByAppendingPathComponent:rel];
+                if ([fm fileExistsAtPath:full]) {
+                    return [NSURL fileURLWithPath:full];
+                }
+            }
+        }
+    }
+    return rawURL;
+}
+
+static AMAutoBeatsAudioInfo AMReadAudioLayerInfo(void *holder, uint64_t elementId) {
+    AMAutoBeatsAudioInfo info = {};
+    info.speedFactor = 1.0f;
+    if (!holder || elementId == 0) return info;
+
+    intptr_t slide = AMMainBinarySlide();
+    typedef void *(*MetaFn)(uintptr_t);
+    typedef void (*DestroyFn)(void *, void *);
+    typedef unsigned (*GetEnumTagSPFn)(const void *, unsigned, void *);
+
+    void *sceneMeta = ((MetaFn)(0x1003c6b10ULL + slide))(0);
+    void *elMeta = ((MetaFn)(0x1003e0404ULL + slide))(0);
+    void *urlMeta = ((MetaFn)(0x1025b2098ULL + slide))(0);
+    if (!sceneMeta || !elMeta || !urlMeta) return info;
+
+    void *sceneVWT = *(void **)((uint8_t *)sceneMeta - 8);
+    size_t sceneSize = *(size_t *)((uint8_t *)sceneVWT + 0x40);
+    uint8_t *sceneBuf = (uint8_t *)calloc(1, sceneSize + 32);
+    if (!sceneBuf) return info;
+
+    // Call holder.currentScene (0x10039109c) read-only
+    AMSwiftRetain(holder, slide);
+    struct { uint64_t outBuf, holderPtr, fn; } csArgs = {
+        (uint64_t)sceneBuf, (uint64_t)holder, (uint64_t)(0x10039109cULL + slide)
+    };
+    __asm__ volatile(
+        "mov x9, %0\n"
+        "ldr x8,  [x9, #0]\n"
+        "ldr x20, [x9, #8]\n"
+        "ldr x16, [x9, #16]\n"
+        "blr x16\n"
+        :
+        : "r"(&csArgs)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+          "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+          "x16", "x17", "x20", "x30", "memory",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"
+    );
+    typedef void (*ReleaseFn)(void *);
+    ((ReleaseFn)(0x1025bb80cULL + slide))(holder);
+
+    int32_t bmOff = *(int32_t *)((uint8_t *)sceneMeta + 0x14);
+    int32_t elementsOff = *(int32_t *)((uint8_t *)sceneMeta + 0x1c);
+    void *elVWT = *(void **)((uint8_t *)elMeta - 8);
+    uint8_t elAlignMask = *(uint8_t *)((uint8_t *)elVWT + 0x50);
+    size_t elStride = *(size_t *)((uint8_t *)elVWT + 0x48);
+
+    int32_t typeOff = *(int32_t *)((uint8_t *)elMeta + 0x10);
+    int32_t startOff = *(int32_t *)((uint8_t *)elMeta + 0x14);
+    int32_t endOff = *(int32_t *)((uint8_t *)elMeta + 0x18);
+    int32_t idOff = *(int32_t *)((uint8_t *)elMeta + 0x1c);
+    int32_t srcOff = *(int32_t *)((uint8_t *)elMeta + 0x44);
+    int32_t speedOff = *(int32_t *)((uint8_t *)elMeta + 0x48);
+    int32_t inOff = *(int32_t *)((uint8_t *)elMeta + 0x50);
+    int32_t outOff = *(int32_t *)((uint8_t *)elMeta + 0x54);
+    int32_t loopOff = *(int32_t *)((uint8_t *)elMeta + 0x58);
+
+    void *arrStorage = *(void **)(sceneBuf + elementsOff);
+    if (arrStorage) {
+        int64_t count = *(int64_t *)((uint8_t *)arrStorage + 0x10);
+        size_t elHdrOff = (0x20 + (size_t)elAlignMask) & ~(size_t)elAlignMask;
+        uint8_t *basePtr = (uint8_t *)arrStorage + elHdrOff;
+        for (int64_t i = 0; i < count; ++i) {
+            uint8_t *elPtr = basePtr + (size_t)i * elStride;
+            uint64_t eid = *(uint64_t *)(elPtr + idOff);
+            if (eid != elementId) continue;
+
+            uint8_t elType = *(uint8_t *)(elPtr + typeOff);
+            info.valid = YES;
+            info.isAudio = (elType == 4);
+            info.elementId = eid;
+            info.startTimeMs = *(int64_t *)(elPtr + startOff);
+            info.endTimeMs = *(int64_t *)(elPtr + endOff);
+            info.inTimeMs = *(int64_t *)(elPtr + inOff);
+            info.outTimeMs = *(int64_t *)(elPtr + outOff);
+            float spd = *(float *)(elPtr + speedOff);
+            info.speedFactor = (isfinite(spd) && spd > 0.05f && spd < 32.0f) ? spd : 1.0f;
+            info.loop = (*(uint8_t *)(elPtr + loopOff) != 0);
+
+            if (info.isAudio) {
+                void *urlVWT = *(void **)((uint8_t *)urlMeta - 8);
+                GetEnumTagSPFn getTag = *(GetEnumTagSPFn *)((uint8_t *)urlVWT + 0x30);
+                if (getTag && getTag(elPtr + srcOff, 1, urlMeta) == 0) {
+                    void *bridged = NULL;
+                    struct { uint64_t urlPtr, fn; } brArgs = {
+                        (uint64_t)(elPtr + srcOff), (uint64_t)(0x1025b1f60ULL + slide)
+                    };
+                    __asm__ volatile(
+                        "mov x9, %1\n"
+                        "ldr x20, [x9, #0]\n"
+                        "ldr x16, [x9, #8]\n"
+                        "blr x16\n"
+                        "mov %0, x0\n"
+                        : "=r"(bridged)
+                        : "r"(&brArgs)
+                        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+                          "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+                          "x16", "x17", "x20", "x30", "memory"
+                    );
+                    if (bridged) {
+                        NSURL *u = CFBridgingRelease(bridged);
+                        info.assetURL = AMResolveExistingAudioURL(u);
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    // Count existing bookmarks inside [startTimeMs, endTimeMs]
+    if (info.valid && info.endTimeMs > info.startTimeMs) {
+        void *bmDict = *(void **)(sceneBuf + bmOff);
+        if (bmDict) {
+            int64_t bmCount = *(int64_t *)((uint8_t *)bmDict + 0x10);
+            if (bmCount > 0) {
+                uint8_t scale = *(uint8_t *)((uint8_t *)bmDict + 0x20);
+                if (scale < 30) {
+                    uint64_t cap = 1ULL << scale;
+                    int64_t *keys = *(int64_t **)((uint8_t *)bmDict + 0x30);
+                    uint64_t *bitmap = (uint64_t *)((uint8_t *)bmDict + 0x40);
+                    if (keys) {
+                        NSInteger inRange = 0;
+                        for (uint64_t b = 0; b < cap; ++b) {
+                            if ((bitmap[b >> 6] >> (b & 63)) & 1ULL) {
+                                int64_t tMs = keys[b];
+                                if (tMs >= info.startTimeMs - 15 && tMs <= info.endTimeMs + 15) {
+                                    inRange++;
+                                }
+                            }
+                        }
+                        info.existingBookmarksInRange = inRange;
+                    }
+                }
+            }
+        }
+    }
+
+    ((DestroyFn)(0x1000199c0ULL + slide))(sceneBuf, (void *)(0x1003c6b10ULL + slide));
+    free(sceneBuf);
+    return info;
+}
+
+static BOOL AMIsEditingPanelShowingAudioLayer(id panelVC, NSInteger origCount) {
+    if (!panelVC || origCount >= 4) return NO;
+    intptr_t slide = AMMainBinarySlide();
+    Ivar holderIvar = class_getInstanceVariable([panelVC class], "holder");
+    void *holder = holderIvar ? *(void **)((uint8_t *)(__bridge void *)panelVC + ivar_getOffset(holderIvar)) : NULL;
+    if (!holder) return NO;
+
+    uint64_t *selIds = NULL;
+    NSUInteger selCount = 0;
+    uint64_t targetId = 0;
+    if (AMReadHolderSelectedIds(holder, slide, &selIds, &selCount) && selCount == 1) {
+        targetId = selIds[0];
+    }
+    if (selIds) free(selIds);
+    if (targetId == 0) return NO;
+
+    AMAutoBeatsAudioInfo info = AMReadAudioLayerInfo(holder, targetId);
+    return (info.valid && info.isAudio);
+}
+
+// --- Atomic Native Scene.bookmarks Mutation ---
+
+struct AMAutoBeatsEditCtx {
+    int64_t clearStartMs;
+    int64_t clearEndMs;
+    BOOL clearExistingInRange;
+    const int64_t *addTimesMs;
+    NSUInteger addCount;
+    NSInteger removedCount;
+    NSInteger addedCount;
+};
+
+static AMAutoBeatsEditCtx gAMAutoBeatsEditCtx;
+
+static void AMAutoBeatsEditCallback(void *scenePtr) {
+    if (!scenePtr) return;
+    intptr_t slide = AMMainBinarySlide();
+    typedef void *(*MetaFn)(uintptr_t);
+    typedef void (*BookmarkMutFn)(void *, int64_t);
+
+    void *sceneMeta = ((MetaFn)(0x1003c6b10ULL + slide))(0);
+    if (!sceneMeta) return;
+    BookmarkMutFn removeBookmark = (BookmarkMutFn)(0x1008649a8ULL + slide);
+    BookmarkMutFn addBookmark = (BookmarkMutFn)(0x100864a4cULL + slide);
+
+    if (gAMAutoBeatsEditCtx.clearExistingInRange) {
+        int32_t bmOff = *(int32_t *)((uint8_t *)sceneMeta + 0x14);
+        void *bmDict = *(void **)((uint8_t *)scenePtr + bmOff);
+        std::vector<int64_t> toRemove;
+        if (bmDict) {
+            int64_t bmCount = *(int64_t *)((uint8_t *)bmDict + 0x10);
+            uint8_t scale = *(uint8_t *)((uint8_t *)bmDict + 0x20);
+            if (bmCount > 0 && scale < 30) {
+                uint64_t cap = 1ULL << scale;
+                int64_t *keys = *(int64_t **)((uint8_t *)bmDict + 0x30);
+                uint64_t *bitmap = (uint64_t *)((uint8_t *)bmDict + 0x40);
+                if (keys) {
+                    for (uint64_t b = 0; b < cap; ++b) {
+                        if ((bitmap[b >> 6] >> (b & 63)) & 1ULL) {
+                            int64_t tMs = keys[b];
+                            if (tMs >= gAMAutoBeatsEditCtx.clearStartMs - 15 &&
+                                tMs <= gAMAutoBeatsEditCtx.clearEndMs + 15) {
+                                toRemove.push_back(tMs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (int64_t tMs : toRemove) {
+            removeBookmark(scenePtr, tMs);
+            gAMAutoBeatsEditCtx.removedCount++;
+        }
+    }
+
+    if (gAMAutoBeatsEditCtx.addTimesMs && gAMAutoBeatsEditCtx.addCount > 0) {
+        for (NSUInteger i = 0; i < gAMAutoBeatsEditCtx.addCount; ++i) {
+            int64_t tMs = gAMAutoBeatsEditCtx.addTimesMs[i];
+            if (tMs < 0) continue;
+            addBookmark(scenePtr, tMs);
+            gAMAutoBeatsEditCtx.addedCount++;
+        }
+    }
+}
+
+static void AMAutoBeatsApplyBookmarks(void *holder,
+                                      int64_t clipStartMs,
+                                      int64_t clipEndMs,
+                                      BOOL clearExistingInRange,
+                                      const std::vector<int64_t> &beatTimesMs,
+                                      NSInteger *outRemoved,
+                                      NSInteger *outAdded) {
+    if (!holder) return;
+    intptr_t slide = AMMainBinarySlide();
+
+    memset(&gAMAutoBeatsEditCtx, 0, sizeof(gAMAutoBeatsEditCtx));
+    gAMAutoBeatsEditCtx.clearStartMs = clipStartMs;
+    gAMAutoBeatsEditCtx.clearEndMs = clipEndMs;
+    gAMAutoBeatsEditCtx.clearExistingInRange = clearExistingInRange;
+    gAMAutoBeatsEditCtx.addTimesMs = beatTimesMs.empty() ? NULL : beatTimesMs.data();
+    gAMAutoBeatsEditCtx.addCount = beatTimesMs.size();
+
+    struct { uint64_t cb, holderPtr, fn; } peArgs = {
+        (uint64_t)AMAutoBeatsEditCallback, (uint64_t)holder, (uint64_t)(0x100392588ULL + slide)
+    };
+    __asm__ volatile(
+        "mov x9, %0\n"
+        "mov w0, #4\n"
+        "mov x1, #0\n"
+        "mov w2, #2\n"
+        "ldr x3,  [x9, #0]\n"
+        "mov x4, #0\n"
+        "ldr x20, [x9, #8]\n"
+        "ldr x16, [x9, #16]\n"
+        "blr x16\n"
+        :
+        : "r"(&peArgs)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+          "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+          "x16", "x17", "x20", "x30", "memory",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"
+    );
+
+    if (outRemoved) *outRemoved = gAMAutoBeatsEditCtx.removedCount;
+    if (outAdded) *outAdded = gAMAutoBeatsEditCtx.addedCount;
+}
+
+// --- DSP Beat Detection Engine (Spectral Flux -> Consistent DP Grid -> Strength Hierarchy) ---
+
+static AMAutoBeatsAnalysisResult AMAutoBeatsAnalyzeAudio(const AMAutoBeatsAudioInfo &info) {
+    AMAutoBeatsAnalysisResult res;
+    res.ok = NO;
+    res.estimatedBPM = 120.0;
+    res.clipStartMs = info.startTimeMs;
+    res.clipEndMs = info.endTimeMs;
+
+    if (!info.valid || !info.assetURL) {
+        res.errorMessage = @"Audio file not found for this layer.";
+        return res;
+    }
+    int64_t clipDurMs = info.endTimeMs - info.startTimeMs;
+    if (clipDurMs < 200) {
+        res.errorMessage = @"Audio clip is too short to analyze.";
+        return res;
+    }
+
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:info.assetURL options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
+    NSArray<AVAssetTrack *> *tracks = [asset tracksWithMediaType:AVMediaTypeAudio];
+    if (tracks.count == 0) {
+        res.errorMessage = @"No audio track found in media.";
+        return res;
+    }
+    AVAssetTrack *audioTrack = tracks.firstObject;
+
+    NSError *err = nil;
+    AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&err];
+    if (!reader || err) {
+        res.errorMessage = err.localizedDescription ?: @"Could not open audio reader.";
+        return res;
+    }
+
+    const double kSampleRate = 22050.0;
+    double assetDurSec = CMTimeGetSeconds(asset.duration);
+    if (!isfinite(assetDurSec) || assetDurSec <= 0.05) assetDurSec = 600.0;
+
+    double inSec = fmax(0.0, (double)info.inTimeMs / 1000.0);
+    double speed = (double)info.speedFactor;
+    double neededSrcSec = ((double)clipDurMs / 1000.0) * speed;
+    // Cap decoded source to 12 minutes max for safe mobile RAM budget (~63 MB float PCM)
+    if (neededSrcSec > 720.0) neededSrcSec = 720.0;
+    double decodeStartSec = fmin(inSec, fmax(0.0, assetDurSec - 0.1));
+    double decodeDurSec = info.loop ? fmin(assetDurSec - decodeStartSec, neededSrcSec) : fmin(assetDurSec - decodeStartSec, neededSrcSec);
+    if (decodeDurSec < 0.2) {
+        decodeStartSec = 0.0;
+        decodeDurSec = fmin(assetDurSec, neededSrcSec);
+    }
+
+    reader.timeRange = CMTimeRangeMake(CMTimeMakeWithSeconds(decodeStartSec, 44100),
+                                       CMTimeMakeWithSeconds(decodeDurSec + 0.1, 44100));
+
+    NSDictionary *outputSettings = @{
+        AVFormatIDKey: @(kAudioFormatLinearPCM),
+        AVSampleRateKey: @(kSampleRate),
+        AVNumberOfChannelsKey: @1,
+        AVLinearPCMBitDepthKey: @32,
+        AVLinearPCMIsFloatKey: @YES,
+        AVLinearPCMIsBigEndianKey: @NO,
+        AVLinearPCMIsNonInterleaved: @NO
+    };
+    AVAssetReaderTrackOutput *output = [[AVAssetReaderTrackOutput alloc] initWithTrack:audioTrack outputSettings:outputSettings];
+    output.alwaysCopiesSampleData = NO;
+    if (![reader canAddOutput:output]) {
+        res.errorMessage = @"Unsupported audio format.";
+        return res;
+    }
+    [reader addOutput:output];
+    if (![reader startReading]) {
+        res.errorMessage = reader.error.localizedDescription ?: @"Failed to decode audio.";
+        return res;
+    }
+
+    std::vector<float> pcm;
+    pcm.reserve((size_t)(decodeDurSec * kSampleRate) + 4096);
+    while (reader.status == AVAssetReaderStatusReading) {
+        CMSampleBufferRef sbuf = [output copyNextSampleBuffer];
+        if (!sbuf) break;
+        CMBlockBufferRef bbuf = CMSampleBufferGetDataBuffer(sbuf);
+        if (bbuf) {
+            size_t totalLen = 0;
+            char *dataPtr = NULL;
+            if (CMBlockBufferGetDataPointer(bbuf, 0, NULL, &totalLen, &dataPtr) == kCMBlockBufferNoErr && dataPtr && totalLen >= 4) {
+                size_t nSamp = totalLen / sizeof(float);
+                size_t oldSz = pcm.size();
+                pcm.resize(oldSz + nSamp);
+                memcpy(pcm.data() + oldSz, dataPtr, nSamp * sizeof(float));
+            }
+        }
+        CFRelease(sbuf);
+        if (pcm.size() > (size_t)(720.0 * kSampleRate)) break;
+    }
+
+    if (pcm.size() < 2048) {
+        res.errorMessage = @"Decoded audio is empty or silent.";
+        return res;
+    }
+
+    // Build 220-bin waveform peak preview for the timeline clip
+    const int kWaveBins = 220;
+    res.waveformPeaks.assign(kWaveBins, 0.0f);
+    double totalClipSrcSamples = ((double)clipDurMs / 1000.0) * speed * kSampleRate;
+    for (int b = 0; b < kWaveBins; ++b) {
+        size_t s0 = (size_t)((double)b / kWaveBins * totalClipSrcSamples);
+        size_t s1 = (size_t)((double)(b + 1) / kWaveBins * totalClipSrcSamples);
+        if (s1 <= s0) s1 = s0 + 1;
+        float pk = 0.0f;
+        size_t step = std::max<size_t>(1, (s1 - s0) / 64);
+        for (size_t idx = s0; idx < s1; idx += step) {
+            size_t wrapped = info.loop ? (idx % pcm.size()) : idx;
+            if (wrapped < pcm.size()) {
+                float a = fabsf(pcm[wrapped]);
+                if (a > pk) pk = a;
+            }
+        }
+        res.waveformPeaks[b] = pk;
+    }
+    float maxWave = 0.001f;
+    for (float v : res.waveformPeaks) if (v > maxWave) maxWave = v;
+    for (float &v : res.waveformPeaks) v /= maxWave;
+
+    // ------------------------------------------------------------------------
+    // Stage 1: Detecting Percussive Hits (Multi-Band Log Spectral Flux via vDSP)
+    // ------------------------------------------------------------------------
+    const int kLog2N = 10;
+    const int kFFTSize = 1 << kLog2N; // 1024 (~46.4 ms)
+    const int kHalfN = kFFTSize / 2;  // 512
+    const int kHopSize = 256;         // ~11.61 ms (86.13 Hz frame rate)
+    const double hopSec = (double)kHopSize / kSampleRate;
+
+    size_t numFrames = (pcm.size() - kFFTSize) / kHopSize + 1;
+    if (numFrames < 16) {
+        res.errorMessage = @"Audio clip too short for spectral analysis.";
+        return res;
+    }
+
+    FFTSetup fftSetup = vDSP_create_fftsetup(kLog2N, kFFTRadix2);
+    if (!fftSetup) {
+        res.errorMessage = @"Failed to initialize FFT engine.";
+        return res;
+    }
+
+    std::vector<float> hann(kFFTSize);
+    vDSP_hann_window(hann.data(), kFFTSize, vDSP_HANN_NORM);
+
+    std::vector<float> windowed(kFFTSize);
+    std::vector<float> realp(kHalfN), imagp(kHalfN);
+    DSPSplitComplex splitComplex;
+    splitComplex.realp = realp.data();
+    splitComplex.imagp = imagp.data();
+
+    std::vector<float> prevLogMag(kHalfN, 0.0f);
+    std::vector<float> lowFlux(numFrames, 0.0f);
+    std::vector<float> midFlux(numFrames, 0.0f);
+    std::vector<float> highFlux(numFrames, 0.0f);
+    std::vector<float> totalFlux(numFrames, 0.0f);
+
+    // Bin boundaries @ 22050 Hz / 1024 (~21.53 Hz per bin):
+    // Low (Kick/808):  bins 1..9   (21 Hz - 194 Hz)
+    // Mid (Snare/Clap): bins 10..116 (215 Hz - 2500 Hz)
+    // High (Hi-Hat):   bins 117..464 (2520 Hz - 10000 Hz)
+    for (size_t f = 0; f < numFrames; ++f) {
+        const float *framePtr = pcm.data() + f * kHopSize;
+        vDSP_vmul(framePtr, 1, hann.data(), 1, windowed.data(), 1, kFFTSize);
+        vDSP_ctoz((const DSPComplex *)windowed.data(), 2, &splitComplex, 1, kHalfN);
+        vDSP_fft_zrip(fftSetup, &splitComplex, 1, kLog2N, FFT_FORWARD);
+
+        float lf = 0.0f, mf = 0.0f, hf = 0.0f;
+        for (int k = 1; k < 465; ++k) {
+            float re = realp[k];
+            float im = imagp[k];
+            float mag = sqrtf(re * re + im * im);
+            float logMag = log1pf(10.0f * mag);
+            float diff = logMag - prevLogMag[k];
+            prevLogMag[k] = logMag;
+            if (diff > 0.0f) {
+                if (k <= 9) lf += diff;
+                else if (k <= 116) mf += diff;
+                else hf += diff;
+            }
+        }
+        lf /= 9.0f;
+        mf /= 107.0f;
+        hf /= 348.0f;
+        lowFlux[f] = lf;
+        midFlux[f] = mf;
+        highFlux[f] = hf;
+        totalFlux[f] = 1.65f * lf + 1.0f * mf + 0.65f * hf;
+    }
+    vDSP_destroy_fftsetup(fftSetup);
+
+    // Adaptive whitening: subtract local sliding mean so quiet sections still register transients
+    const int kMeanWin = 30; // +/- 0.35s
+    std::vector<float> onset(numFrames, 0.0f);
+    std::vector<float> localMean(numFrames, 0.0f);
+    std::vector<float> localStd(numFrames, 0.0f);
+    std::vector<double> prefixSum(numFrames + 1, 0.0);
+    std::vector<double> prefixSq(numFrames + 1, 0.0);
+    for (size_t i = 0; i < numFrames; ++i) {
+        prefixSum[i + 1] = prefixSum[i] + totalFlux[i];
+        prefixSq[i + 1] = prefixSq[i] + (double)totalFlux[i] * totalFlux[i];
+    }
+    for (size_t i = 0; i < numFrames; ++i) {
+        size_t a = (i > (size_t)kMeanWin) ? (i - kMeanWin) : 0;
+        size_t b = std::min(numFrames, i + kMeanWin + 1);
+        double n = (double)(b - a);
+        double mean = (prefixSum[b] - prefixSum[a]) / n;
+        double var = std::max(0.0, (prefixSq[b] - prefixSq[a]) / n - mean * mean);
+        localMean[i] = (float)mean;
+        localStd[i] = (float)sqrt(var);
+        float w = totalFlux[i] - (float)mean;
+        onset[i] = (w > 0.0f) ? w : 0.0f;
+    }
+
+    // Normalize onset envelope using 98th percentile so outliers don't crush dynamic range
+    std::vector<float> sortedOnset = onset;
+    std::sort(sortedOnset.begin(), sortedOnset.end());
+    float p98 = sortedOnset[(size_t)(sortedOnset.size() * 0.98)];
+    float normScale = (p98 > 1e-5f) ? (1.0f / p98) : 1.0f;
+    for (float &v : onset) {
+        v = fminf(1.5f, v * normScale);
+    }
+
+    // Normalize band energies similarly for strength classification
+    auto normBand = [](std::vector<float> &band) {
+        std::vector<float> s = band;
+        std::sort(s.begin(), s.end());
+        float p = s[(size_t)(s.size() * 0.98)];
+        float inv = (p > 1e-5f) ? (1.0f / p) : 1.0f;
+        for (float &v : band) v = fminf(1.5f, v * inv);
+    };
+    normBand(lowFlux);
+    normBand(midFlux);
+    normBand(highFlux);
+
+    // Helper: map source time (relative to decodeStartSec) to timeline ms
+    double srcOffsetSec = decodeStartSec - inSec;
+    auto srcSecToTimelineMs = [&](double relSrcSec) -> int64_t {
+        double clipSrcSec = relSrcSec + srcOffsetSec;
+        return info.startTimeMs + llround((clipSrcSec * 1000.0) / speed);
+    };
+
+    // Pinpoint percussive hits via local maxima + parabolic sub-hop refinement
+    const int kMinHitGapHops = 6; // ~70 ms
+    int lastHitFrame = -kMinHitGapHops;
+    for (size_t f = 2; f + 2 < numFrames; ++f) {
+        float val = onset[f];
+        if (val < 0.10f) continue;
+        if (val < onset[f - 1] || val < onset[f + 1]) continue;
+        if (val < onset[f - 2] || val < onset[f + 2]) continue;
+        float thresh = 0.08f + 0.35f * (localStd[f] * normScale);
+        if (val < thresh) continue;
+        if ((int)f - lastHitFrame < kMinHitGapHops) {
+            if (!res.percussiveHits.empty() && val > res.percussiveHits.back().strength) {
+                res.percussiveHits.pop_back();
+            } else {
+                continue;
+            }
+        }
+        lastHitFrame = (int)f;
+
+        // Parabolic 3-point interpolation for exact sub-hop timestamp
+        float y0 = onset[f - 1], y1 = onset[f], y2 = onset[f + 1];
+        float denom = (y0 - 2.0f * y1 + y2);
+        float delta = (fabsf(denom) > 1e-6f) ? fmaxf(-0.5f, fminf(0.5f, 0.5f * (y0 - y2) / denom)) : 0.0f;
+        double relSec = ((double)f + (double)delta) * hopSec;
+        int64_t tMs = srcSecToTimelineMs(relSec);
+        if (tMs < info.startTimeMs || tMs > info.endTimeMs) continue;
+
+        float lE = lowFlux[f], mE = midFlux[f], hE = highFlux[f];
+        float strength = fminf(1.0f, 0.55f * fminf(1.0f, val) + 0.30f * fminf(1.0f, lE) + 0.15f * fminf(1.0f, mE));
+        uint8_t tier = 1;
+        if (strength >= 0.78f && lE >= 0.55f) tier = 4;
+        else if (strength >= 0.56f || lE >= 0.50f) tier = 3;
+        else if (strength >= 0.34f || mE >= 0.40f) tier = 2;
+
+        AMAutoBeatCandidate c;
+        c.timelineMs = tMs;
+        c.strength = strength;
+        c.lowEnergy = lE;
+        c.midEnergy = mE;
+        c.highEnergy = hE;
+        c.tier = tier;
+        c.isGridBeat = false;
+        c.isHalfBeat = false;
+        c.isPercussiveHit = true;
+        res.percussiveHits.push_back(c);
+    }
+
+    // ------------------------------------------------------------------------
+    // Stage 2: Building a Consistent Rhythmic Grid (Autocorrelation + DP Tracker)
+    // ------------------------------------------------------------------------
+    int lagMin = std::max(8, (int)floor(60.0 / (190.0 * hopSec)));  // 190 BPM
+    int lagMax = std::min((int)numFrames / 2, (int)ceil(60.0 / (60.0 * hopSec))); // 60 BPM
+    if (lagMax <= lagMin + 2) {
+        lagMin = 24;
+        lagMax = 86;
+    }
+
+    std::vector<double> ac(lagMax + 1, 0.0);
+    // Use up to first 90s (~7750 frames) for tempo autocorrelation to stay ultra-fast
+    size_t acFrames = std::min<size_t>(numFrames, 7750);
+    for (int lag = lagMin / 2; lag <= std::min((int)acFrames - 1, lagMax * 2); ++lag) {
+        if (lag > lagMax) break;
+        double sum = 0.0;
+        size_t cnt = acFrames - (size_t)lag;
+        for (size_t i = 0; i < cnt; ++i) {
+            sum += (double)onset[i] * (double)onset[i + (size_t)lag];
+        }
+        ac[lag] = sum / (double)std::max<size_t>(1, cnt);
+    }
+
+    // Apply perceptual tempo prior (~120 BPM) + harmonic reinforcement to avoid half/double-time errors
+    int bestLag = (lagMin + lagMax) / 2;
+    double bestScore = -1.0;
+    const double targetLag = 60.0 / (120.0 * hopSec);
+    for (int lag = lagMin; lag <= lagMax; ++lag) {
+        double logRatio = log((double)lag / targetLag);
+        double prior = exp(-0.5 * (logRatio / 0.55) * (logRatio / 0.55));
+        double harm = ac[lag];
+        if (lag * 2 <= lagMax) harm += 0.45 * ac[lag * 2];
+        if (lag / 2 >= lagMin / 2) harm += 0.25 * ac[lag / 2];
+        double score = harm * prior;
+        if (score > bestScore) {
+            bestScore = score;
+            bestLag = lag;
+        }
+    }
+
+    // Refine beat period with parabolic interpolation
+    double exactPeriod = (double)bestLag;
+    if (bestLag > lagMin && bestLag < lagMax) {
+        double y0 = ac[bestLag - 1], y1 = ac[bestLag], y2 = ac[bestLag + 1];
+        double denom = y0 - 2.0 * y1 + y2;
+        if (fabs(denom) > 1e-9) {
+            double d = fmax(-0.5, fmin(0.5, 0.5 * (y0 - y2) / denom));
+            exactPeriod += d;
+        }
+    }
+    res.estimatedBPM = (60.0 / (exactPeriod * hopSec)) * speed;
+
+    // Ellis Dynamic Programming Beat Tracking: builds a consistent grid even across quiet transitions
+    std::vector<float> dpScore(numFrames, 0.0f);
+    std::vector<int> backlink(numFrames, -1);
+    const int dMin = std::max(4, (int)round(exactPeriod * 0.5));
+    const int dMax = std::max(dMin + 1, (int)round(exactPeriod * 2.0));
+    const float kAlpha = 18.0f;
+
+    std::vector<float> penalty(dMax + 1, 0.0f);
+    for (int d = dMin; d <= dMax; ++d) {
+        float lr = logf((float)d / (float)exactPeriod);
+        penalty[d] = -kAlpha * lr * lr;
+    }
+
+    for (size_t t = 0; t < numFrames; ++t) {
+        float localObs = onset[t];
+        float bestPrev = 0.0f;
+        int bestIdx = -1;
+        if ((int)t >= dMin) {
+            int maxLook = std::min((int)t, dMax);
+            bestPrev = -1e9f;
+            for (int d = dMin; d <= maxLook; ++d) {
+                float cand = dpScore[t - (size_t)d] + penalty[d];
+                if (cand > bestPrev) {
+                    bestPrev = cand;
+                    bestIdx = (int)t - d;
+                }
+            }
+            if (bestPrev < 0.0f) {
+                bestPrev = 0.0f;
+                bestIdx = -1;
+            }
+        }
+        dpScore[t] = localObs + bestPrev;
+        backlink[t] = bestIdx;
+    }
+
+    // Backtrack from best ending beat
+    int endWindow = std::min((int)numFrames, (int)round(exactPeriod * 1.5));
+    int cur = (int)numFrames - 1;
+    float maxEnd = -1e9f;
+    for (int t = (int)numFrames - endWindow; t < (int)numFrames; ++t) {
+        if (t >= 0 && dpScore[t] > maxEnd) {
+            maxEnd = dpScore[t];
+            cur = t;
+        }
+    }
+
+    std::vector<int> beatFrames;
+    while (cur >= 0) {
+        beatFrames.push_back(cur);
+        cur = backlink[cur];
+    }
+    std::reverse(beatFrames.begin(), beatFrames.end());
+
+    // Extend grid smoothly to the very start if DP started after > 1.25 beats
+    while (!beatFrames.empty() && beatFrames.front() > (int)round(exactPeriod * 1.15)) {
+        int prevF = beatFrames.front() - (int)round(exactPeriod);
+        if (prevF < 0) break;
+        beatFrames.insert(beatFrames.begin(), prevF);
+    }
+
+    // ------------------------------------------------------------------------
+    // Stage 3: Classifying Beat Strength (Downbeat Phase + Energy Hierarchy)
+    // ------------------------------------------------------------------------
+    double phaseScore[4] = {0, 0, 0, 0};
+    for (size_t i = 0; i < beatFrames.size(); ++i) {
+        int f = beatFrames[i];
+        float lowPeak = lowFlux[f];
+        if (f > 0) lowPeak = fmaxf(lowPeak, lowFlux[f - 1]);
+        if (f + 1 < (int)numFrames) lowPeak = fmaxf(lowPeak, lowFlux[f + 1]);
+        phaseScore[i % 4] += (double)lowPeak * 1.4 + (double)onset[f];
+    }
+    int downbeatPhase = 0;
+    for (int p = 1; p < 4; ++p) {
+        if (phaseScore[p] > phaseScore[downbeatPhase]) downbeatPhase = p;
+    }
+
+    auto sampleWindowMax = [&](const std::vector<float> &v, int center, int rad) -> float {
+        float mx = 0.0f;
+        int a = std::max(0, center - rad);
+        int b = std::min((int)v.size() - 1, center + rad);
+        for (int k = a; k <= b; ++k) if (v[k] > mx) mx = v[k];
+        return mx;
+    };
+
+    // Helper to refine a grid beat frame to the sharpest nearby transient (+/- 2 hops)
+    auto refineFrame = [&](int f) -> double {
+        int bestF = f;
+        float bestV = onset[f];
+        for (int d = -2; d <= 2; ++d) {
+            int nf = f + d;
+            if (nf >= 1 && nf + 1 < (int)numFrames && onset[nf] > bestV) {
+                bestV = onset[nf];
+                bestF = nf;
+            }
+        }
+        if (bestV > 0.12f && bestF >= 1 && bestF + 1 < (int)numFrames) {
+            float y0 = onset[bestF - 1], y1 = onset[bestF], y2 = onset[bestF + 1];
+            float denom = y0 - 2.0f * y1 + y2;
+            float delta = (fabsf(denom) > 1e-6f) ? fmaxf(-0.5f, fminf(0.5f, 0.5f * (y0 - y2) / denom)) : 0.0f;
+            return (double)bestF + (double)delta;
+        }
+        return (double)f;
+    };
+
+    for (size_t i = 0; i < beatFrames.size(); ++i) {
+        int f = beatFrames[i];
+        double rf = refineFrame(f);
+        int64_t tMs = srcSecToTimelineMs(rf * hopSec);
+        bool isDownbeat = ((int)(i % 4) == downbeatPhase);
+
+        float lE = sampleWindowMax(lowFlux, f, 2);
+        float mE = sampleWindowMax(midFlux, f, 2);
+        float hE = sampleWindowMax(highFlux, f, 2);
+        float oE = sampleWindowMax(onset, f, 2);
+
+        float rawStr = 0.45f * fminf(1.0f, oE) + 0.35f * fminf(1.0f, lE) + 0.12f * fminf(1.0f, mE) + (isDownbeat ? 0.22f : 0.0f);
+        float strength = fminf(1.0f, fmaxf(0.18f, rawStr));
+        uint8_t tier = 2;
+        if (isDownbeat && (lE >= 0.32f || oE >= 0.38f)) tier = 4;
+        else if (isDownbeat || strength >= 0.60f || lE >= 0.48f) tier = 3;
+        else if (strength >= 0.34f || mE >= 0.32f) tier = 2;
+        else tier = 1;
+
+        if (tMs >= info.startTimeMs && tMs <= info.endTimeMs) {
+            AMAutoBeatCandidate c;
+            c.timelineMs = tMs;
+            c.strength = strength;
+            c.lowEnergy = lE;
+            c.midEnergy = mE;
+            c.highEnergy = hE;
+            c.tier = tier;
+            c.isGridBeat = true;
+            c.isHalfBeat = false;
+            c.isPercussiveHit = (oE >= 0.25f);
+            res.gridBeats.push_back(c);
+        }
+
+        // Consistent in-between 8th-note beat evenly placed across the bar
+        if (i + 1 < beatFrames.size()) {
+            int fNext = beatFrames[i + 1];
+            int fMid = (f + fNext) / 2;
+            if (fMid > f + 3 && fMid < fNext - 3 && fMid < (int)numFrames) {
+                double rfMid = refineFrame(fMid);
+                int64_t tMidMs = srcSecToTimelineMs(rfMid * hopSec);
+                if (tMidMs >= info.startTimeMs && tMidMs <= info.endTimeMs) {
+                    float mlE = sampleWindowMax(lowFlux, fMid, 2);
+                    float mmE = sampleWindowMax(midFlux, fMid, 2);
+                    float mhE = sampleWindowMax(highFlux, fMid, 2);
+                    float moE = sampleWindowMax(onset, fMid, 2);
+                    float mStr = fminf(0.88f, 0.40f * fminf(1.0f, moE) + 0.25f * fminf(1.0f, mmE) + 0.20f * fminf(1.0f, mhE) + 0.15f * fminf(1.0f, mlE));
+                    uint8_t mTier = (mStr >= 0.48f || mmE >= 0.45f) ? 2 : 1;
+
+                    AMAutoBeatCandidate hc;
+                    hc.timelineMs = tMidMs;
+                    hc.strength = mStr;
+                    hc.lowEnergy = mlE;
+                    hc.midEnergy = mmE;
+                    hc.highEnergy = mhE;
+                    hc.tier = mTier;
+                    hc.isGridBeat = true;
+                    hc.isHalfBeat = true;
+                    hc.isPercussiveHit = (moE >= 0.22f);
+                    res.gridBeats.push_back(hc);
+                }
+            }
+        }
+    }
+
+    // If the audio layer loops beyond the decoded source length, tile beats seamlessly across the loop!
+    double decodedClipDurMs = ((double)pcm.size() / kSampleRate) * 1000.0 / speed;
+    if (info.loop && decodedClipDurMs > 300.0 && (double)clipDurMs > decodedClipDurMs + 50.0) {
+        int64_t loopSpanMs = llround(decodedClipDurMs);
+        size_t origGrid = res.gridBeats.size();
+        size_t origHits = res.percussiveHits.size();
+        for (int64_t shift = loopSpanMs; info.startTimeMs + shift < info.endTimeMs; shift += loopSpanMs) {
+            for (size_t i = 0; i < origGrid; ++i) {
+                AMAutoBeatCandidate c = res.gridBeats[i];
+                c.timelineMs += shift;
+                if (c.timelineMs <= info.endTimeMs) res.gridBeats.push_back(c);
+            }
+            for (size_t i = 0; i < origHits; ++i) {
+                AMAutoBeatCandidate c = res.percussiveHits[i];
+                c.timelineMs += shift;
+                if (c.timelineMs <= info.endTimeMs) res.percussiveHits.push_back(c);
+            }
+        }
+    }
+
+    res.ok = YES;
+    return res;
+}
+
+// Mode: 0 = Beats I (Main Rhythms), 1 = Beats II (Full Grid + In-Between), 2 = Hits Only (Percussive)
+static std::vector<AMAutoBeatCandidate> AMAutoBeatsFilterCandidates(const AMAutoBeatsAnalysisResult &res,
+                                                                    NSInteger mode,
+                                                                    float density,
+                                                                    int64_t offsetMs) {
+    std::vector<AMAutoBeatCandidate> out;
+    if (!res.ok) return out;
+    density = fmaxf(0.0f, fminf(1.0f, density));
+
+    const std::vector<AMAutoBeatCandidate> &src = (mode == 2) ? res.percussiveHits : res.gridBeats;
+    for (const auto &c : src) {
+        bool keep = false;
+        if (mode == 0) {
+            // Beats I: quarter-note rhythmic grid weighted by energy
+            if (!c.isHalfBeat) {
+                float minStrength = 0.80f - density * 0.72f; // 0% -> 0.80 (drops only), 55% -> 0.40, 100% -> 0.08 (all)
+                if (c.tier == 4 && density >= 0.05f) keep = true;
+                else if (c.strength >= minStrength) keep = true;
+            } else if (density > 0.82f && c.tier >= 2 && c.strength >= (1.0f - density) * 2.5f) {
+                keep = true;
+            }
+        } else if (mode == 1) {
+            // Beats II: full rhythmic grid including snares/claps/in-between beats
+            if (!c.isHalfBeat) {
+                float minStrength = 0.65f - density * 0.65f;
+                keep = (c.tier >= 3 || c.strength >= minStrength);
+            } else {
+                float minHalf = 0.78f - density * 0.72f;
+                keep = (c.strength >= minHalf);
+            }
+        } else {
+            // Hits Only: pure spectral-flux percussive hits ranked by classified energy
+            float minStrength = 0.86f - density * 0.78f;
+            keep = (c.strength >= minStrength);
+        }
+
+        if (!keep) continue;
+        AMAutoBeatCandidate adj = c;
+        adj.timelineMs += offsetMs;
+        if (adj.timelineMs < res.clipStartMs || adj.timelineMs > res.clipEndMs) continue;
+        out.push_back(adj);
+    }
+
+    std::sort(out.begin(), out.end(), [](const AMAutoBeatCandidate &a, const AMAutoBeatCandidate &b) {
+        return a.timelineMs < b.timelineMs;
+    });
+
+    // Enforce minimum spacing (keep stronger beat if two land within 85ms)
+    std::vector<AMAutoBeatCandidate> dedup;
+    dedup.reserve(out.size());
+    for (const auto &c : out) {
+        if (!dedup.empty() && (c.timelineMs - dedup.back().timelineMs) < 85) {
+            if (c.strength > dedup.back().strength) {
+                dedup.back() = c;
+            }
+        } else {
+            dedup.push_back(c);
+        }
+    }
+    return dedup;
+}
+
+// --- Custom Crisp Vector Icon for Auto Beats Card in EditingPanelVC ---
+
+static UIImage *AMAutoBeatsTabIcon(void) {
+    CGSize sz = CGSizeMake(28.0, 28.0);
+    UIGraphicsBeginImageContextWithOptions(sz, NO, 0.0);
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (ctx) {
+        [[UIColor whiteColor] setStroke];
+        [[UIColor whiteColor] setFill];
+
+        // 5-bar waveform
+        CGFloat heights[5] = {7.0, 15.0, 11.0, 17.0, 8.0};
+        CGFloat xs[5] = {5.0, 9.5, 14.0, 18.5, 23.0};
+        CGContextSetLineCap(ctx, kCGLineCapRound);
+        CGContextSetLineWidth(ctx, 2.2);
+        for (int i = 0; i < 5; ++i) {
+            CGFloat cy = 15.5;
+            CGContextMoveToPoint(ctx, xs[i], cy - heights[i] * 0.5);
+            CGContextAddLineToPoint(ctx, xs[i], cy + heights[i] * 0.5);
+        }
+        CGContextStrokePath(ctx);
+
+        // Top beat diamonds (CapCut-style beat markers above the waveform)
+        CGFloat dxs[2] = {9.5, 18.5};
+        for (int i = 0; i < 2; ++i) {
+            CGFloat dx = dxs[i], dy = 4.2, r = 2.6;
+            UIBezierPath *d = [UIBezierPath bezierPath];
+            [d moveToPoint:CGPointMake(dx, dy - r)];
+            [d addLineToPoint:CGPointMake(dx + r, dy)];
+            [d addLineToPoint:CGPointMake(dx, dy + r)];
+            [d addLineToPoint:CGPointMake(dx - r, dy)];
+            [d closePath];
+            [d fill];
+        }
+    }
+    UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+}
+
+// --- Interactive Waveform + Color-Coded Beat Preview View ---
+
+@interface AMAutoBeatsWaveformView : UIView
+@property (nonatomic, copy) void (^onSeekTimeMs)(int64_t timeMs);
+- (void)updateWaveform:(const std::vector<float> &)peaks
+                 beats:(const std::vector<AMAutoBeatCandidate> &)beats
+           clipStartMs:(int64_t)startMs
+             clipEndMs:(int64_t)endMs;
+@end
+
+@implementation AMAutoBeatsWaveformView {
+    std::vector<float> _peaks;
+    std::vector<AMAutoBeatCandidate> _beats;
+    int64_t _startMs;
+    int64_t _endMs;
+    CGFloat _scrubNorm;
+    BOOL _scrubbing;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = AMInputSurfaceColor();
+        self.layer.cornerRadius = 8.0;
+        self.layer.borderWidth = 1.0;
+        self.layer.borderColor = AMBorderColor().CGColor;
+        self.clipsToBounds = YES;
+        _scrubNorm = -1.0;
+    }
+    return self;
+}
+
+- (void)updateWaveform:(const std::vector<float> &)peaks
+                 beats:(const std::vector<AMAutoBeatCandidate> &)beats
+           clipStartMs:(int64_t)startMs
+             clipEndMs:(int64_t)endMs {
+    _peaks = peaks;
+    _beats = beats;
+    _startMs = startMs;
+    _endMs = endMs;
+    [self setNeedsDisplay];
+}
+
+- (void)handleTouchPoint:(CGPoint)pt {
+    if (_endMs <= _startMs || self.bounds.size.width <= 1.0) return;
+    CGFloat pad = 8.0;
+    CGFloat w = self.bounds.size.width - pad * 2.0;
+    if (w <= 1.0) return;
+    CGFloat norm = fmax(0.0, fmin(1.0, (pt.x - pad) / w));
+    _scrubNorm = norm;
+    [self setNeedsDisplay];
+    int64_t targetMs = _startMs + llround((double)norm * (double)(_endMs - _startMs));
+    if (self.onSeekTimeMs) self.onSeekTimeMs(targetMs);
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)event;
+    _scrubbing = YES;
+    [self handleTouchPoint:[[touches anyObject] locationInView:self]];
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)event;
+    [self handleTouchPoint:[[touches anyObject] locationInView:self]];
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)touches; (void)event;
+    _scrubbing = NO;
+}
+
+- (void)drawRect:(CGRect)rect {
+    (void)rect;
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) return;
+
+    CGFloat pad = 8.0;
+    CGFloat w = self.bounds.size.width - pad * 2.0;
+    CGFloat h = self.bounds.size.height;
+    CGFloat midY = h * 0.56;
+    if (w <= 1.0 || h <= 1.0) return;
+
+    // Center baseline
+    CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithWhite:1.0 alpha:0.08].CGColor);
+    CGContextSetLineWidth(ctx, 1.0);
+    CGContextMoveToPoint(ctx, pad, midY);
+    CGContextAddLineToPoint(ctx, pad + w, midY);
+    CGContextStrokePath(ctx);
+
+    // Draw waveform bars
+    if (!_peaks.empty()) {
+        size_t n = _peaks.size();
+        CGFloat step = w / (CGFloat)n;
+        CGFloat maxHalfH = h * 0.34;
+        CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithRed:0.42 green:0.48 blue:0.68 alpha:0.55].CGColor);
+        CGContextSetLineWidth(ctx, fmax(1.0, step * 0.65));
+        CGContextSetLineCap(ctx, kCGLineCapRound);
+        for (size_t i = 0; i < n; ++i) {
+            CGFloat x = pad + ((CGFloat)i + 0.5) * step;
+            CGFloat bh = fmax(1.5, _peaks[i] * maxHalfH);
+            CGContextMoveToPoint(ctx, x, midY - bh);
+            CGContextAddLineToPoint(ctx, x, midY + bh);
+        }
+        CGContextStrokePath(ctx);
+    }
+
+    // Draw classified beat markers (Tier 4 = Mint Green, Tier 3 = Amber, Tier 1-2 = Soft Slate)
+    if (_endMs > _startMs && !_beats.empty()) {
+        double dur = (double)(_endMs - _startMs);
+        for (const auto &b : _beats) {
+            double norm = (double)(b.timelineMs - _startMs) / dur;
+            if (norm < 0.0 || norm > 1.0) continue;
+            CGFloat x = pad + (CGFloat)norm * w;
+
+            UIColor *col = nil;
+            CGFloat lineTop = 14.0;
+            CGFloat lw = 1.1;
+            CGFloat diamondR = 0.0;
+            if (b.tier >= 4) {
+                col = AMAccentGreenColor();
+                lineTop = 10.0;
+                lw = 1.8;
+                diamondR = 3.6;
+            } else if (b.tier == 3) {
+                col = [UIColor colorWithRed:0.98 green:0.75 blue:0.14 alpha:0.95];
+                lineTop = 14.0;
+                lw = 1.4;
+                diamondR = 2.6;
+            } else {
+                col = [UIColor colorWithRed:0.64 green:0.74 blue:0.92 alpha:0.72];
+                lineTop = 20.0;
+                lw = 1.0;
+                diamondR = 0.0;
+            }
+
+            CGContextSetStrokeColorWithColor(ctx, [col colorWithAlphaComponent:0.75].CGColor);
+            CGContextSetLineWidth(ctx, lw);
+            CGContextMoveToPoint(ctx, x, lineTop);
+            CGContextAddLineToPoint(ctx, x, h - 5.0);
+            CGContextStrokePath(ctx);
+
+            if (diamondR > 0.0) {
+                UIBezierPath *d = [UIBezierPath bezierPath];
+                CGFloat dy = lineTop - 1.5;
+                [d moveToPoint:CGPointMake(x, dy - diamondR)];
+                [d addLineToPoint:CGPointMake(x + diamondR, dy)];
+                [d addLineToPoint:CGPointMake(x, dy + diamondR)];
+                [d addLineToPoint:CGPointMake(x - diamondR, dy)];
+                [d closePath];
+                [col setFill];
+                [d fill];
+            }
+        }
+    }
+
+    // Playhead scrub indicator
+    if (_scrubNorm >= 0.0 && _scrubNorm <= 1.0) {
+        CGFloat x = pad + _scrubNorm * w;
+        CGContextSetStrokeColorWithColor(ctx, [UIColor whiteColor].CGColor);
+        CGContextSetLineWidth(ctx, 1.5);
+        CGContextMoveToPoint(ctx, x, 2.0);
+        CGContextAddLineToPoint(ctx, x, h - 2.0);
+        CGContextStrokePath(ctx);
+    }
+}
+
+@end
+
+// --- Native Bottom Panel ViewController (Pushed onto EditingPanelNC) ---
+
+@interface AMAutoBeatsPanelVC : UIViewController
+@property (nonatomic, assign) void *holder;
+@property (nonatomic, assign) uint64_t elementId;
+@end
+
+@implementation AMAutoBeatsPanelVC {
+    AMAutoBeatsAudioInfo _audioInfo;
+    AMAutoBeatsAnalysisResult _analysis;
+    std::vector<AMAutoBeatCandidate> _filteredBeats;
+
+    NSInteger _mode;      // 0 = Beats I, 1 = Beats II, 2 = Hits Only
+    float _density;       // 0.0 .. 1.0
+    int64_t _offsetMs;    // -100 .. +100
+    NSUInteger _analysisGen;
+
+    UILabel *_bpmBadge;
+    UILabel *_countBadge;
+    UILabel *_statusLabel;
+    UIActivityIndicatorView *_spinner;
+    AMAutoBeatsWaveformView *_waveformView;
+    UISegmentedControl *_modeControl;
+    UISlider *_densitySlider;
+    UILabel *_densityValueLabel;
+    UILabel *_offsetValueLabel;
+    UIButton *_applyButton;
+    UIButton *_clearButton;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _mode = 0;
+        _density = 0.55f;
+        _offsetMs = 0;
+    }
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = AMBgColor();
+
+    // Header Row: Back | AUTO BEATS | BPM Badge | Count Badge | Clear | Apply
+    UIView *header = [[UIView alloc] init];
+    header.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:header];
+
+    UIButton *backBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    backBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.0 weight:UIImageSymbolWeightBold];
+    [backBtn setImage:[UIImage systemImageNamed:@"chevron.left" withConfiguration:cfg] forState:UIControlStateNormal];
+    backBtn.tintColor = [UIColor whiteColor];
+    backBtn.backgroundColor = AMCircleBtnColor();
+    backBtn.layer.cornerRadius = 14.0;
+    [backBtn addTarget:self action:@selector(onTapBack) forControlEvents:UIControlEventTouchUpInside];
+    [header addSubview:backBtn];
+
+    UILabel *titleLbl = [[UILabel alloc] init];
+    titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    titleLbl.text = @"AUTO BEATS";
+    titleLbl.textColor = [UIColor whiteColor];
+    titleLbl.font = AMThemeFont(12.5, UIFontWeightBold);
+    [header addSubview:titleLbl];
+
+    _bpmBadge = [[UILabel alloc] init];
+    _bpmBadge.translatesAutoresizingMaskIntoConstraints = NO;
+    _bpmBadge.text = @"-- BPM";
+    _bpmBadge.textColor = AMAccentGreenColor();
+    _bpmBadge.font = AMThemeFont(10.5, UIFontWeightSemibold);
+    _bpmBadge.backgroundColor = [AMAccentGreenColor() colorWithAlphaComponent:0.15];
+    _bpmBadge.layer.cornerRadius = 6.0;
+    _bpmBadge.clipsToBounds = YES;
+    _bpmBadge.textAlignment = NSTextAlignmentCenter;
+    [header addSubview:_bpmBadge];
+
+    _countBadge = [[UILabel alloc] init];
+    _countBadge.translatesAutoresizingMaskIntoConstraints = NO;
+    _countBadge.text = @"0 beats";
+    _countBadge.textColor = [UIColor colorWithWhite:0.86 alpha:1.0];
+    _countBadge.font = AMThemeFont(10.5, UIFontWeightMedium);
+    [header addSubview:_countBadge];
+
+    _clearButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    _clearButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [_clearButton setTitle:@"Clear" forState:UIControlStateNormal];
+    [_clearButton setTitleColor:[UIColor colorWithRed:0.97 green:0.45 blue:0.45 alpha:1.0] forState:UIControlStateNormal];
+    _clearButton.titleLabel.font = AMThemeFont(11.5, UIFontWeightSemibold);
+    _clearButton.backgroundColor = [UIColor colorWithRed:0.97 green:0.45 blue:0.45 alpha:0.14];
+    _clearButton.layer.cornerRadius = 7.0;
+    _clearButton.contentEdgeInsets = UIEdgeInsetsMake(4.0, 9.0, 4.0, 9.0);
+    [_clearButton addTarget:self action:@selector(onTapClear) forControlEvents:UIControlEventTouchUpInside];
+    [header addSubview:_clearButton];
+
+    _applyButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    _applyButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [_applyButton setTitle:@"Apply" forState:UIControlStateNormal];
+    [_applyButton setTitleColor:[UIColor colorWithRed:0.06 green:0.10 blue:0.12 alpha:1.0] forState:UIControlStateNormal];
+    _applyButton.titleLabel.font = AMThemeFont(11.5, UIFontWeightBold);
+    _applyButton.backgroundColor = AMAccentGreenColor();
+    _applyButton.layer.cornerRadius = 7.0;
+    _applyButton.contentEdgeInsets = UIEdgeInsetsMake(4.0, 12.0, 4.0, 12.0);
+    _applyButton.enabled = NO;
+    _applyButton.alpha = 0.5;
+    [_applyButton addTarget:self action:@selector(onTapApply) forControlEvents:UIControlEventTouchUpInside];
+    [header addSubview:_applyButton];
+
+    // Waveform + Beat Preview Strip
+    _waveformView = [[AMAutoBeatsWaveformView alloc] init];
+    _waveformView.translatesAutoresizingMaskIntoConstraints = NO;
+    __weak typeof(self) weakSelf = self;
+    _waveformView.onSeekTimeMs = ^(int64_t timeMs) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf && strongSelf.holder) {
+            AMPuppetSeekHolderToTimeMs(strongSelf.holder, timeMs);
+        }
+    };
+    [self.view addSubview:_waveformView];
+
+    _spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    _spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    _spinner.color = AMAccentGreenColor();
+    _spinner.hidesWhenStopped = YES;
+    [_waveformView addSubview:_spinner];
+
+    _statusLabel = [[UILabel alloc] init];
+    _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _statusLabel.text = @"Analyzing spectral flux & rhythm...";
+    _statusLabel.textColor = [UIColor colorWithWhite:0.78 alpha:1.0];
+    _statusLabel.font = AMThemeFont(11.0, UIFontWeightMedium);
+    _statusLabel.textAlignment = NSTextAlignmentCenter;
+    [_waveformView addSubview:_statusLabel];
+
+    // Mode Segmented Control (Beats I | Beats II | Hits Only)
+    _modeControl = [[UISegmentedControl alloc] initWithItems:@[@"Beats I", @"Beats II", @"Hits Only"]];
+    _modeControl.translatesAutoresizingMaskIntoConstraints = NO;
+    _modeControl.selectedSegmentIndex = _mode;
+    _modeControl.backgroundColor = AMInputSurfaceColor();
+    _modeControl.selectedSegmentTintColor = AMSurfaceColor();
+    [_modeControl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.70 alpha:1.0],
+                                           NSFontAttributeName: AMThemeFont(11.5, UIFontWeightMedium)}
+                                forState:UIControlStateNormal];
+    [_modeControl setTitleTextAttributes:@{NSForegroundColorAttributeName: AMAccentGreenColor(),
+                                           NSFontAttributeName: AMThemeFont(11.5, UIFontWeightBold)}
+                                forState:UIControlStateSelected];
+    [_modeControl addTarget:self action:@selector(onModeChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.view addSubview:_modeControl];
+
+    // Density + Offset Row
+    UIView *controlsRow = [[UIView alloc] init];
+    controlsRow.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:controlsRow];
+
+    UILabel *densLbl = [[UILabel alloc] init];
+    densLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    densLbl.text = @"Density";
+    densLbl.textColor = [UIColor colorWithWhite:0.80 alpha:1.0];
+    densLbl.font = AMThemeFont(11.0, UIFontWeightMedium);
+    [controlsRow addSubview:densLbl];
+
+    _densitySlider = [[UISlider alloc] init];
+    _densitySlider.translatesAutoresizingMaskIntoConstraints = NO;
+    _densitySlider.minimumValue = 0.0f;
+    _densitySlider.maximumValue = 1.0f;
+    _densitySlider.value = _density;
+    _densitySlider.minimumTrackTintColor = AMAccentGreenColor();
+    _densitySlider.maximumTrackTintColor = [UIColor colorWithWhite:1.0 alpha:0.18];
+    [_densitySlider addTarget:self action:@selector(onDensityChanged:) forControlEvents:UIControlEventValueChanged];
+    [controlsRow addSubview:_densitySlider];
+
+    _densityValueLabel = [[UILabel alloc] init];
+    _densityValueLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _densityValueLabel.text = @"55%";
+    _densityValueLabel.textColor = [UIColor whiteColor];
+    _densityValueLabel.font = AMThemeFont(11.0, UIFontWeightSemibold);
+    _densityValueLabel.textAlignment = NSTextAlignmentRight;
+    [controlsRow addSubview:_densityValueLabel];
+
+    UIButton *offMinus = [UIButton buttonWithType:UIButtonTypeSystem];
+    offMinus.translatesAutoresizingMaskIntoConstraints = NO;
+    [offMinus setTitle:@"-10ms" forState:UIControlStateNormal];
+    [offMinus setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    offMinus.titleLabel.font = AMThemeFont(10.0, UIFontWeightSemibold);
+    offMinus.backgroundColor = AMSurfaceColor();
+    offMinus.layer.cornerRadius = 5.0;
+    [offMinus addTarget:self action:@selector(onOffsetMinus) forControlEvents:UIControlEventTouchUpInside];
+    [controlsRow addSubview:offMinus];
+
+    _offsetValueLabel = [[UILabel alloc] init];
+    _offsetValueLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _offsetValueLabel.text = @"0ms";
+    _offsetValueLabel.textColor = [UIColor colorWithWhite:0.82 alpha:1.0];
+    _offsetValueLabel.font = AMThemeFont(10.5, UIFontWeightMedium);
+    _offsetValueLabel.textAlignment = NSTextAlignmentCenter;
+    [controlsRow addSubview:_offsetValueLabel];
+
+    UIButton *offPlus = [UIButton buttonWithType:UIButtonTypeSystem];
+    offPlus.translatesAutoresizingMaskIntoConstraints = NO;
+    [offPlus setTitle:@"+10ms" forState:UIControlStateNormal];
+    [offPlus setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    offPlus.titleLabel.font = AMThemeFont(10.0, UIFontWeightSemibold);
+    offPlus.backgroundColor = AMSurfaceColor();
+    offPlus.layer.cornerRadius = 5.0;
+    [offPlus addTarget:self action:@selector(onOffsetPlus) forControlEvents:UIControlEventTouchUpInside];
+    [controlsRow addSubview:offPlus];
+
+    // Legend Row (Green = Heavy Drop, Amber = Strong, Slate = Light)
+    UILabel *legendLbl = [[UILabel alloc] init];
+    legendLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    legendLbl.text = @"● Downbeat/Kick   ● Strong/Snare   ● Light/Grid   • Scrub waveform to preview";
+    legendLbl.textColor = [UIColor colorWithWhite:0.58 alpha:1.0];
+    legendLbl.font = AMThemeFont(9.5, UIFontWeightRegular);
+    legendLbl.textAlignment = NSTextAlignmentCenter;
+    [self.view addSubview:legendLbl];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [header.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:8.0],
+        [header.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12.0],
+        [header.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12.0],
+        [header.heightAnchor constraintEqualToConstant:30.0],
+
+        [backBtn.leadingAnchor constraintEqualToAnchor:header.leadingAnchor],
+        [backBtn.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [backBtn.widthAnchor constraintEqualToConstant:28.0],
+        [backBtn.heightAnchor constraintEqualToConstant:28.0],
+
+        [titleLbl.leadingAnchor constraintEqualToAnchor:backBtn.trailingAnchor constant:8.0],
+        [titleLbl.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+
+        [_bpmBadge.leadingAnchor constraintEqualToAnchor:titleLbl.trailingAnchor constant:7.0],
+        [_bpmBadge.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [_bpmBadge.widthAnchor constraintGreaterThanOrEqualToConstant:58.0],
+        [_bpmBadge.heightAnchor constraintEqualToConstant:20.0],
+
+        [_countBadge.leadingAnchor constraintEqualToAnchor:_bpmBadge.trailingAnchor constant:7.0],
+        [_countBadge.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+
+        [_applyButton.trailingAnchor constraintEqualToAnchor:header.trailingAnchor],
+        [_applyButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [_applyButton.heightAnchor constraintEqualToConstant:26.0],
+
+        [_clearButton.trailingAnchor constraintEqualToAnchor:_applyButton.leadingAnchor constant:-6.0],
+        [_clearButton.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [_clearButton.heightAnchor constraintEqualToConstant:26.0],
+
+        [_waveformView.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:8.0],
+        [_waveformView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12.0],
+        [_waveformView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12.0],
+        [_waveformView.heightAnchor constraintEqualToConstant:62.0],
+
+        [_spinner.centerXAnchor constraintEqualToAnchor:_waveformView.centerXAnchor],
+        [_spinner.centerYAnchor constraintEqualToAnchor:_waveformView.centerYAnchor constant:-8.0],
+        [_statusLabel.centerXAnchor constraintEqualToAnchor:_waveformView.centerXAnchor],
+        [_statusLabel.topAnchor constraintEqualToAnchor:_spinner.bottomAnchor constant:3.0],
+        [_statusLabel.leadingAnchor constraintEqualToAnchor:_waveformView.leadingAnchor constant:8.0],
+        [_statusLabel.trailingAnchor constraintEqualToAnchor:_waveformView.trailingAnchor constant:-8.0],
+
+        [_modeControl.topAnchor constraintEqualToAnchor:_waveformView.bottomAnchor constant:8.0],
+        [_modeControl.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12.0],
+        [_modeControl.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12.0],
+        [_modeControl.heightAnchor constraintEqualToConstant:28.0],
+
+        [controlsRow.topAnchor constraintEqualToAnchor:_modeControl.bottomAnchor constant:8.0],
+        [controlsRow.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12.0],
+        [controlsRow.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12.0],
+        [controlsRow.heightAnchor constraintEqualToConstant:28.0],
+
+        [densLbl.leadingAnchor constraintEqualToAnchor:controlsRow.leadingAnchor],
+        [densLbl.centerYAnchor constraintEqualToAnchor:controlsRow.centerYAnchor],
+
+        [_densitySlider.leadingAnchor constraintEqualToAnchor:densLbl.trailingAnchor constant:8.0],
+        [_densitySlider.centerYAnchor constraintEqualToAnchor:controlsRow.centerYAnchor],
+
+        [_densityValueLabel.leadingAnchor constraintEqualToAnchor:_densitySlider.trailingAnchor constant:6.0],
+        [_densityValueLabel.centerYAnchor constraintEqualToAnchor:controlsRow.centerYAnchor],
+        [_densityValueLabel.widthAnchor constraintEqualToConstant:34.0],
+
+        [offMinus.leadingAnchor constraintEqualToAnchor:_densityValueLabel.trailingAnchor constant:10.0],
+        [offMinus.centerYAnchor constraintEqualToAnchor:controlsRow.centerYAnchor],
+        [offMinus.widthAnchor constraintEqualToConstant:40.0],
+        [offMinus.heightAnchor constraintEqualToConstant:22.0],
+
+        [_offsetValueLabel.leadingAnchor constraintEqualToAnchor:offMinus.trailingAnchor constant:3.0],
+        [_offsetValueLabel.centerYAnchor constraintEqualToAnchor:controlsRow.centerYAnchor],
+        [_offsetValueLabel.widthAnchor constraintEqualToConstant:36.0],
+
+        [offPlus.leadingAnchor constraintEqualToAnchor:_offsetValueLabel.trailingAnchor constant:3.0],
+        [offPlus.trailingAnchor constraintEqualToAnchor:controlsRow.trailingAnchor],
+        [offPlus.centerYAnchor constraintEqualToAnchor:controlsRow.centerYAnchor],
+        [offPlus.widthAnchor constraintEqualToConstant:40.0],
+        [offPlus.heightAnchor constraintEqualToConstant:22.0],
+
+        [legendLbl.topAnchor constraintEqualToAnchor:controlsRow.bottomAnchor constant:5.0],
+        [legendLbl.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:12.0],
+        [legendLbl.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12.0],
+    ]];
+
+    [self startAudioAnalysis];
+}
+
+- (void)startAudioAnalysis {
+    _analysisGen++;
+    NSUInteger gen = _analysisGen;
+    _audioInfo = AMReadAudioLayerInfo(self.holder, self.elementId);
+
+    if (!_audioInfo.valid || !_audioInfo.isAudio) {
+        _statusLabel.text = @"Select an audio layer to detect beats.";
+        return;
+    }
+
+    [_spinner startAnimating];
+    _statusLabel.hidden = NO;
+    _statusLabel.text = @"Analyzing spectral flux & tempo...";
+    _applyButton.enabled = NO;
+    _applyButton.alpha = 0.5;
+
+    AMAutoBeatsAudioInfo infoCopy = _audioInfo;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_USER_INITIATED, 0), ^{
+        AMAutoBeatsAnalysisResult result = AMAutoBeatsAnalyzeAudio(infoCopy);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf || strongSelf->_analysisGen != gen) return;
+            [strongSelf->_spinner stopAnimating];
+            strongSelf->_analysis = result;
+            if (!result.ok) {
+                strongSelf->_statusLabel.hidden = NO;
+                strongSelf->_statusLabel.text = result.errorMessage ?: @"Beat analysis failed.";
+                return;
+            }
+            strongSelf->_statusLabel.hidden = YES;
+            strongSelf->_bpmBadge.text = [NSString stringWithFormat:@"%.1f BPM", result.estimatedBPM];
+            strongSelf->_applyButton.enabled = YES;
+            strongSelf->_applyButton.alpha = 1.0;
+            [strongSelf refreshFilteredPreview];
+        });
+    });
+}
+
+- (void)refreshFilteredPreview {
+    if (!_analysis.ok) return;
+    _filteredBeats = AMAutoBeatsFilterCandidates(_analysis, _mode, _density, _offsetMs);
+    _countBadge.text = [NSString stringWithFormat:@"%lu beats", (unsigned long)_filteredBeats.size()];
+    _densityValueLabel.text = [NSString stringWithFormat:@"%d%%", (int)lroundf(_density * 100.0f)];
+    _offsetValueLabel.text = [NSString stringWithFormat:@"%@%lldms", (_offsetMs > 0 ? @"+" : @""), _offsetMs];
+    [_waveformView updateWaveform:_analysis.waveformPeaks
+                            beats:_filteredBeats
+                      clipStartMs:_analysis.clipStartMs
+                        clipEndMs:_analysis.clipEndMs];
+}
+
+- (void)onModeChanged:(UISegmentedControl *)seg {
+    _mode = seg.selectedSegmentIndex;
+    [self refreshFilteredPreview];
+}
+
+- (void)onDensityChanged:(UISlider *)slider {
+    _density = slider.value;
+    [self refreshFilteredPreview];
+}
+
+- (void)onOffsetMinus {
+    _offsetMs = std::max<int64_t>(-100, _offsetMs - 10);
+    [self refreshFilteredPreview];
+}
+
+- (void)onOffsetPlus {
+    _offsetMs = std::min<int64_t>(100, _offsetMs + 10);
+    [self refreshFilteredPreview];
+}
+
+- (void)onTapClear {
+    if (!self.holder || !_audioInfo.valid) return;
+    std::vector<int64_t> empty;
+    NSInteger removed = 0, added = 0;
+    AMAutoBeatsApplyBookmarks(self.holder, _audioInfo.startTimeMs, _audioInfo.endTimeMs, YES, empty, &removed, &added);
+    _countBadge.text = [NSString stringWithFormat:@"Cleared %ld", (long)removed];
+}
+
+- (void)onTapApply {
+    if (!self.holder || !_analysis.ok) return;
+    std::vector<int64_t> times;
+    times.reserve(_filteredBeats.size());
+    for (const auto &b : _filteredBeats) {
+        times.push_back(b.timelineMs);
+    }
+    NSInteger removed = 0, added = 0;
+    AMAutoBeatsApplyBookmarks(self.holder, _analysis.clipStartMs, _analysis.clipEndMs, YES, times, &removed, &added);
+    [_applyButton setTitle:@"Applied ✓" forState:UIControlStateNormal];
+    _countBadge.text = [NSString stringWithFormat:@"%ld markers set", (long)added];
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) {
+            [strongSelf->_applyButton setTitle:@"Apply" forState:UIControlStateNormal];
+        }
+    });
+}
+
+- (void)onTapBack {
+    [self.navigationController popViewControllerAnimated:YES];
+}
+
+@end
+
+// --- Native EditingPanelVC Hooks (Adds exact Alight Motion 'Puppet' & 'Auto Beats' Cards!) ---
 
 static IMP gOrigEditingPanelNumItems = NULL;
 static IMP gOrigEditingPanelCellForItem = NULL;
@@ -12641,12 +14193,14 @@ static NSInteger AMHook_editingPanelNumItems(id self, SEL _cmd, UICollectionView
         ? ((NSInteger (*)(id, SEL, UICollectionView *, NSInteger))gOrigEditingPanelNumItems)(self, _cmd, cv, section)
         : 0;
     if (orig >= 4) return orig + 1;
+    if (AMIsEditingPanelShowingAudioLayer(self, orig)) return orig + 1;
     return orig;
 }
 
 static CGSize AMHook_editingPanelSizeForItem(id self, SEL _cmd, UICollectionView *cv, UICollectionViewLayout *layout, NSIndexPath *indexPath) {
     NSInteger orig = AMEditingPanelOrigCount(self, cv, indexPath.section);
-    if (orig < 4) {
+    BOOL isAudio = (orig < 4) && AMIsEditingPanelShowingAudioLayer(self, orig);
+    if (orig < 4 && !isAudio) {
         if (gOrigEditingPanelSizeForItem) {
             return ((CGSize (*)(id, SEL, UICollectionView *, UICollectionViewLayout *, NSIndexPath *))gOrigEditingPanelSizeForItem)(
                 self, _cmd, cv, layout, indexPath);
@@ -12654,10 +14208,13 @@ static CGSize AMHook_editingPanelSizeForItem(id self, SEL _cmd, UICollectionView
         return CGSizeMake(80.0, 64.0);
     }
     NSInteger total = orig + 1;
-    NSInteger topCols = total / 2;
-    NSInteger botCols = total - topCols;
-    NSInteger cols = (indexPath.row < topCols) ? topCols : botCols;
-    NSInteger rows = 2;
+    NSInteger rows = (total >= 4) ? 2 : 1;
+    NSInteger cols = total;
+    if (rows == 2) {
+        NSInteger topCols = total / 2;
+        NSInteger botCols = total - topCols;
+        cols = (indexPath.row < topCols) ? topCols : botCols;
+    }
 
     CGFloat interSpacing = 8.0;
     CGFloat lineSpacing = 8.0;
@@ -12677,7 +14234,9 @@ static CGSize AMHook_editingPanelSizeForItem(id self, SEL _cmd, UICollectionView
 
 static UICollectionViewCell *AMHook_editingPanelCellForItem(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
     NSInteger orig = AMEditingPanelOrigCount(self, cv, indexPath.section);
-    if (orig >= 4 && indexPath.row == orig) {
+    BOOL isPuppet = (orig >= 4 && indexPath.row == orig);
+    BOOL isAutoBeats = (!isPuppet && orig < 4 && indexPath.row == orig && AMIsEditingPanelShowingAudioLayer(self, orig));
+    if (isPuppet || isAutoBeats) {
         UICollectionViewCell *cell = [cv dequeueReusableCellWithReuseIdentifier:@"EditingPanelCell" forIndexPath:indexPath];
         cell.layer.cornerRadius = 5.3;
         cell.layer.masksToBounds = YES;
@@ -12685,14 +14244,14 @@ static UICollectionViewCell *AMHook_editingPanelCellForItem(id self, SEL _cmd, U
         if ([cell respondsToSelector:labelSel]) {
             UILabel *lbl = ((UILabel *(*)(id, SEL))objc_msgSend)(cell, labelSel);
             if ([lbl isKindOfClass:[UILabel class]]) {
-                lbl.text = @"Puppet";
+                lbl.text = isAutoBeats ? @"Auto Beats" : @"Puppet";
             }
         }
         SEL imgSel = NSSelectorFromString(@"imageView");
         if ([cell respondsToSelector:imgSel]) {
             UIImageView *iv = ((UIImageView *(*)(id, SEL))objc_msgSend)(cell, imgSel);
             if ([iv isKindOfClass:[UIImageView class]]) {
-                iv.image = AMPuppetTabIcon();
+                iv.image = isAutoBeats ? AMAutoBeatsTabIcon() : AMPuppetTabIcon();
                 iv.tintColor = [UIColor whiteColor];
                 iv.contentMode = UIViewContentModeScaleAspectFit;
             }
@@ -12714,7 +14273,9 @@ static UICollectionViewCell *AMHook_editingPanelCellForItem(id self, SEL _cmd, U
 
 static void AMHook_editingPanelDidSelectItem(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
     NSInteger orig = AMEditingPanelOrigCount(self, cv, indexPath.section);
-    if (orig >= 4 && indexPath.row == orig) {
+    BOOL isPuppet = (orig >= 4 && indexPath.row == orig);
+    BOOL isAutoBeats = (!isPuppet && orig < 4 && indexPath.row == orig && AMIsEditingPanelShowingAudioLayer(self, orig));
+    if (isPuppet || isAutoBeats) {
         [cv deselectItemAtIndexPath:indexPath animated:YES];
         intptr_t slide = AMMainBinarySlide();
         Ivar holderIvar = class_getInstanceVariable([self class], "holder");
@@ -12730,12 +14291,19 @@ static void AMHook_editingPanelDidSelectItem(id self, SEL _cmd, UICollectionView
         if (selIds) free(selIds);
         if (targetId == 0) return;
 
-        AMPuppetPanelVC *pvc = [[AMPuppetPanelVC alloc] init];
-        pvc.holder = holder;
-        pvc.elementId = targetId;
         UIViewController *vc = (UIViewController *)self;
         if (vc.navigationController) {
-            [vc.navigationController pushViewController:pvc animated:YES];
+            if (isAutoBeats) {
+                AMAutoBeatsPanelVC *abvc = [[AMAutoBeatsPanelVC alloc] init];
+                abvc.holder = holder;
+                abvc.elementId = targetId;
+                [vc.navigationController pushViewController:abvc animated:YES];
+            } else {
+                AMPuppetPanelVC *pvc = [[AMPuppetPanelVC alloc] init];
+                pvc.holder = holder;
+                pvc.elementId = targetId;
+                [vc.navigationController pushViewController:pvc animated:YES];
+            }
         }
         return;
     }
