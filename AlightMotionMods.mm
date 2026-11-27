@@ -18499,8 +18499,9 @@ static void AMHook_keyframeViewDrawRect(id self, SEL _cmd, CGRect rect) {
         BOOL atPlayhead = (llabs(kfTimes[i] - gAMPuppetEditorCurrentTimeMs) <= 20);
 
         if (st > 0) {
-            // Selected property (Puppet Pin or 3D Rotate panel active): solid white diamond, Bl1/Y1 stroke
-            CGFloat diamondH = MAX(10.0, v.bounds.size.height * 0.40 * (atPlayhead ? 0.75 : 0.65));
+            // Selected property (Puppet Pin or 3D Rotate panel active): match native KeyframeView.drawHelper
+            // (0x1008b7530..0x1008b7598: bounds.height * 0.65 off-playhead, 0.75 at playhead — no 0.40 factor)
+            CGFloat diamondH = MAX(12.0, v.bounds.size.height * (atPlayhead ? 0.75 : 0.65));
             UIBezierPath *d = AMNativeKeyframeDiamondPathCentered(diamondH, CGPointMake(x, cy));
             [colW1 setFill];
             [d fill];
@@ -18624,6 +18625,1111 @@ static void AMHook_previewControlBarMovePrev(id self, SEL _cmd, id sender) {
 
 static void AMHook_previewControlBarMoveNext(id self, SEL _cmd, id sender) {
     AMPreviewControlBarStepToKeyframe(self, _cmd, sender, gOrigPreviewControlBarMoveNext, YES);
+}
+
+// ============================================================================
+// Module 12: Import Video/Audio via Link (YouTube & TikTok) in Project + Menu
+// ============================================================================
+
+struct AMSwiftStringPair {
+    uint64_t a;
+    uint64_t b;
+};
+
+static AMSwiftStringPair AMBridgeNSStringToSwift(NSString *str, intptr_t slide) {
+    NSString *s = str ?: @"";
+    typedef AMSwiftStringPair (*BridgeStrFn)(void *);
+    BridgeStrFn fn = (BridgeStrFn)(0x1025b55ccULL + (uintptr_t)slide);
+    return fn((__bridge void *)s);
+}
+
+static void AMSetSceneElementLabel(uint8_t *elBuf, NSString *title, intptr_t slide) {
+    if (!elBuf) return;
+    AMSwiftStringPair sp = AMBridgeNSStringToSwift(title, slide);
+    void *oldObj = *(void **)(elBuf + 0x28);
+    if (oldObj) {
+        typedef void (*RelFn)(void *);
+        ((RelFn)(0x1025bb404ULL + (uintptr_t)slide))(oldObj);
+    }
+    *(uint64_t *)(elBuf + 0x20) = sp.a;
+    *(uint64_t *)(elBuf + 0x28) = sp.b;
+}
+
+static void AMSetOptionalFoundationURL(void *dstOptPtr, NSURL *fileURL, intptr_t slide) {
+    if (!dstOptPtr || !fileURL) return;
+    // Destroy previous Optional<Foundation.URL> value at dstOptPtr (0x1007240b4 / 0x1007888dc)
+    typedef void (*DestroyOptFn)(void *, void *, void *);
+    ((DestroyOptFn)(0x100019f70ULL + (uintptr_t)slide))(
+        dstOptPtr,
+        (void *)(0x1033229b0ULL + (uintptr_t)slide),
+        (void *)(0x1026be5a0ULL + (uintptr_t)slide));
+
+    typedef void *(*MetaFn)(uint64_t);
+    void *urlMeta = ((MetaFn)(0x1025b2098ULL + (uintptr_t)slide))(0);
+    void **urlVWT = *(void ***)((uint8_t *)urlMeta - 8);
+
+    uint8_t urlBuf[128];
+    memset(urlBuf, 0, sizeof(urlBuf));
+    uintptr_t bridgeUrlAddr = (uintptr_t)(0x1025b2020ULL + (uintptr_t)slide);
+    void *nsUrlPtr = (__bridge void *)fileURL;
+    __asm__ volatile(
+        "mov x0, %[u]\n"
+        "mov x8, %[buf]\n"
+        "blr %[fn]\n"
+        :
+        : [u] "r"(nsUrlPtr), [buf] "r"(urlBuf), [fn] "r"(bridgeUrlAddr)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+          "x12", "x13", "x14", "x15", "x16", "x17", "x30", "memory");
+
+    // VWT +0x20 (index 4): initializeWithTake(dst, src, metadata)
+    typedef void *(*InitWithTakeFn)(void *, void *, void *);
+    ((InitWithTakeFn)urlVWT[4])(dstOptPtr, urlBuf, urlMeta);
+    // VWT +0x38 (index 7): storeEnumTagSinglePayload(dst, whichCase=0 (.some), emptyCases=1, metadata)
+    typedef void (*StoreTagFn)(void *, uint32_t, uint32_t, void *);
+    ((StoreTagFn)urlVWT[7])(dstOptPtr, 0, 1, urlMeta);
+}
+
+static void AMCallSceneHolderAddElement(void *holder, void *elBuf, intptr_t slide) {
+    if (!holder || !elBuf) return;
+    uintptr_t addFn = (uintptr_t)(0x10039b974ULL + (uintptr_t)slide);
+    typedef void (*RetainFn)(void *);
+    typedef void (*ReleaseFn)(void *);
+    ((RetainFn)(0x1025bb824ULL + (uintptr_t)slide))(holder);
+    __asm__ volatile(
+        "mov x20, %[h]\n"
+        "mov x0, %[el]\n"
+        "mov w1, #1\n"
+        "mov x2, #0\n"
+        "mov w3, #1\n"
+        "mov w4, #1\n"
+        "blr %[fn]\n"
+        :
+        : [h] "r"(holder), [el] "r"(elBuf), [fn] "r"(addFn)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+          "x12", "x13", "x14", "x15", "x16", "x17", "x20", "x30", "memory");
+    ((ReleaseFn)(0x1025bb80cULL + (uintptr_t)slide))(holder);
+}
+
+static BOOL AMInsertLocalAudioLayer(void *holder, NSURL *fileURL, NSString *title) {
+    if (!holder || !fileURL) return NO;
+    intptr_t slide = AMMainBinarySlide();
+
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:fileURL options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
+    double durSec = CMTimeGetSeconds(asset.duration);
+    if (!isfinite(durSec) || durSec <= 0.05) durSec = 5.0;
+    int64_t durMs = MAX((int64_t)500, (int64_t)llround(durSec * 1000.0));
+    int64_t startMs = AMReadHolderCurrentTime(holder, slide);
+    if (startMs < 0) startMs = 0;
+
+    typedef void *(*MetaFn)(uint64_t);
+    void *elMeta = ((MetaFn)(0x1003e0404ULL + (uintptr_t)slide))(0);
+    if (!elMeta) return NO;
+    void **elVWT = *(void ***)((uint8_t *)elMeta - 8);
+    size_t elSize = (size_t)elVWT[8]; // VWT +0x40 = size
+    if (elSize < 0x100 || elSize > 0x4000) return NO;
+
+    uint8_t *elBuf = (uint8_t *)calloc(1, elSize + 64);
+    if (!elBuf) return NO;
+
+    // Default-init SceneElement (0x1003e19c8)
+    uintptr_t initElAddr = (uintptr_t)(0x1003e19c8ULL + (uintptr_t)slide);
+    __asm__ volatile(
+        "mov x8, %[buf]\n"
+        "blr %[fn]\n"
+        :
+        : [buf] "r"(elBuf), [fn] "r"(initElAddr)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+          "x12", "x13", "x14", "x15", "x16", "x17", "x30", "memory");
+
+    // Exact AudioFolderVC setup (0x100724050..0x10072413c)
+    elBuf[0] = 4; // type = Audio
+    AMSetSceneElementLabel(elBuf, title.length ? title : fileURL.lastPathComponent, slide);
+    *(int64_t *)(elBuf + 8) = startMs;
+    *(int64_t *)(elBuf + 0x10) = startMs + durMs;
+
+    int32_t inOff = *(int32_t *)((uint8_t *)elMeta + 0x50);
+    int32_t outOff = *(int32_t *)((uint8_t *)elMeta + 0x54);
+    int32_t loopOff = *(int32_t *)((uint8_t *)elMeta + 0x58);
+    int32_t srcOff = *(int32_t *)((uint8_t *)elMeta + 0x44);
+    *(int64_t *)(elBuf + inOff) = 0;
+    *(int64_t *)(elBuf + outOff) = durMs;
+    *(uint8_t *)(elBuf + loopOff) = 0;
+    AMSetOptionalFoundationURL(elBuf + srcOff, fileURL, slide);
+
+    AMCallSceneHolderAddElement(holder, elBuf, slide);
+
+    typedef void (*DestroyFn)(void *, void *);
+    ((DestroyFn)(0x1000199c0ULL + (uintptr_t)slide))(elBuf, (void *)(0x1003e0404ULL + (uintptr_t)slide));
+    free(elBuf);
+    return YES;
+}
+
+static BOOL AMInsertLocalVideoLayer(void *holder, NSURL *fileURL, NSString *title) {
+    if (!holder || !fileURL) return NO;
+    intptr_t slide = AMMainBinarySlide();
+
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:fileURL options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
+    double durSec = CMTimeGetSeconds(asset.duration);
+    if (!isfinite(durSec) || durSec <= 0.05) durSec = 5.0;
+    int64_t durMs = MAX((int64_t)500, (int64_t)llround(durSec * 1000.0));
+    int64_t startMs = AMReadHolderCurrentTime(holder, slide);
+    if (startMs < 0) startMs = 0;
+
+    float vidW = 1080.0f, vidH = 1920.0f;
+    NSArray<AVAssetTrack *> *vTracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+    if (vTracks.count > 0) {
+        AVAssetTrack *vt = vTracks.firstObject;
+        CGSize sz = CGSizeApplyAffineTransform(vt.naturalSize, vt.preferredTransform);
+        float w = (float)fabs(sz.width);
+        float h = (float)fabs(sz.height);
+        if (w > 16.0f && h > 16.0f) {
+            vidW = w;
+            vidH = h;
+        }
+    }
+    // Scale cleanly to fit standard 1080 canvas dimension preserving aspect ratio
+    float maxSide = MAX(vidW, vidH);
+    if (maxSide > 1080.0f) {
+        float sc = 1080.0f / maxSide;
+        vidW *= sc;
+        vidH *= sc;
+    }
+    float halfW = vidW * 0.5f;
+    float halfH = vidH * 0.5f;
+
+    typedef void *(*MetaFn)(uint64_t);
+    typedef void *(*GenericMetaFn)(void *, void *);
+    typedef void *(*AllocObjFn)(void *, size_t, size_t);
+    typedef void (*DestroyFn)(void *, void *);
+    typedef void (*DestroyOptFn)(void *, void *, void *);
+    typedef void (*ReleaseFn)(void *);
+
+    void *elMeta = ((MetaFn)(0x1003e0404ULL + (uintptr_t)slide))(0);
+    if (!elMeta) return NO;
+    void **elVWT = *(void ***)((uint8_t *)elMeta - 8);
+    size_t elSize = (size_t)elVWT[8];
+    if (elSize < 0x100 || elSize > 0x4000) return NO;
+
+    uint8_t *elBuf = (uint8_t *)calloc(1, elSize + 64);
+    if (!elBuf) return NO;
+
+    // 1. Default-init SceneElement (0x1003e19c8)
+    uintptr_t initElAddr = (uintptr_t)(0x1003e19c8ULL + (uintptr_t)slide);
+    __asm__ volatile(
+        "mov x8, %[buf]\n"
+        "blr %[fn]\n"
+        :
+        : [buf] "r"(elBuf), [fn] "r"(initElAddr)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+          "x12", "x13", "x14", "x15", "x16", "x17", "x30", "memory");
+
+    // 2. Basic metadata & timing
+    elBuf[0] = 0; // type = Shape / Media
+    AMSetSceneElementLabel(elBuf, title.length ? title : fileURL.lastPathComponent, slide);
+    *(int64_t *)(elBuf + 8) = startMs;
+    *(int64_t *)(elBuf + 0x10) = startMs + durMs;
+    *(int64_t *)(elBuf + *(int32_t *)((uint8_t *)elMeta + 0x50)) = 0;     // inTime
+    *(int64_t *)(elBuf + *(int32_t *)((uint8_t *)elMeta + 0x54)) = durMs; // outTime
+
+    // 3. Build rectangle LiveShape ("com.alightcreative.shapes.rect", size = (halfW, halfH))
+    //    Exact instruction-for-instruction match of Visual add (0x100788648..0x1007888c4)
+    GenericMetaFn getGenMeta = (GenericMetaFn)(0x100009ee4ULL + (uintptr_t)slide);
+    AllocObjFn swiftAlloc = (AllocObjFn)(0x1025bb380ULL + (uintptr_t)slide);
+
+    void *arrMeta = getGenMeta((void *)(0x103330df0ULL + (uintptr_t)slide),
+                               (void *)(0x1026d6ee0ULL + (uintptr_t)slide));
+    void *tupMeta = getGenMeta((void *)(0x1033232d8ULL + (uintptr_t)slide),
+                               (void *)(0x1026bf2c0ULL + (uintptr_t)slide));
+    void **tupVWT = *(void ***)((uint8_t *)tupMeta - 8);
+    size_t tupStride = (size_t)tupVWT[9]; // +0x48
+    size_t tupAlignMask = (size_t)(*(uint8_t *)((uint8_t *)tupVWT + 0x50));
+    size_t elemStart = (tupAlignMask + 0x20) & ~tupAlignMask;
+    uint8_t *arrObj = (uint8_t *)swiftAlloc(arrMeta, elemStart + tupStride, tupAlignMask | 7);
+    if (arrObj) {
+        // Copy 16-byte array header (count=1, cap=2) from 0x1026be0c0
+        memcpy(arrObj + 0x10, (const void *)(0x1026be0c0ULL + (uintptr_t)slide), 16);
+        uint8_t *tupPtr = arrObj + elemStart;
+        int32_t valOff = *(int32_t *)((uint8_t *)tupMeta + 0x30);
+        uint8_t *valPtr = tupPtr + valOff;
+
+        // Key = "size" (small Swift String)
+        *(uint64_t *)(tupPtr + 0) = 0x00000000657a6973ULL;
+        *(uint64_t *)(tupPtr + 8) = 0xe400000000000000ULL;
+
+        // Value = KeyableProperty<Vec2>(halfW, halfH) wrapped in Property enum tag 3
+        void *propBoxMeta = getGenMeta((void *)(0x10332d0e0ULL + (uintptr_t)slide),
+                                       (void *)(0x1026d32d0ULL + (uintptr_t)slide));
+        uint8_t *propObj = (uint8_t *)swiftAlloc(propBoxMeta, 0x58, 7);
+        memcpy(propObj + 0x10, (const void *)(0x1026be0c0ULL + (uintptr_t)slide), 16);
+        *(uint64_t *)(propObj + 0x48) = (uint64_t)(0x102f49558ULL + (uintptr_t)slide);
+        *(uint64_t *)(propObj + 0x50) = (uint64_t)(0x102f49838ULL + (uintptr_t)slide);
+        *(float *)(propObj + 0x20) = halfW;
+        *(float *)(propObj + 0x24) = halfH;
+        *(uint32_t *)(propObj + 0x28) = 0;
+
+        valPtr[0] = 0;
+        *(void **)(valPtr + 8) = propObj;
+        void *propEnumMeta = ((MetaFn)(0x100449304ULL + (uintptr_t)slide))(0);
+        typedef void (*StoreMultiTagFn)(void *, void *, uint32_t);
+        ((StoreMultiTagFn)(0x1025bb884ULL + (uintptr_t)slide))(valPtr, propEnumMeta, 3);
+
+        // Convert 1-element array to Swift Dictionary (0x100028834)
+        typedef void *(*DictInitFn)(void *);
+        void *dictObj = ((DictInitFn)(0x100028834ULL + (uintptr_t)slide))(arrObj);
+
+        // Clean up temporary array buffer (0x1025bb848 + 0x100019f70 + 0x1025bb4a0)
+        typedef void (*DeinitBufFn)(void *);
+        ((DeinitBufFn)(0x1025bb848ULL + (uintptr_t)slide))(arrObj);
+        ((DestroyOptFn)(0x100019f70ULL + (uintptr_t)slide))(
+            tupPtr,
+            (void *)(0x1033232d8ULL + (uintptr_t)slide),
+            (void *)(0x1026bf2c0ULL + (uintptr_t)slide));
+        typedef void (*DeallocObjFn)(void *, size_t, size_t);
+        ((DeallocObjFn)(0x1025bb4a0ULL + (uintptr_t)slide))(arrObj, elemStart + tupStride, tupAlignMask | 7);
+
+        // Build LiveShape value (0x100318df4)
+        void *lsMeta = ((MetaFn)(0x100318df4ULL + (uintptr_t)slide))(0);
+        void **lsVWT = *(void ***)((uint8_t *)lsMeta - 8);
+        size_t lsSize = (size_t)lsVWT[8];
+        uint8_t *lsBuf = (uint8_t *)calloc(1, lsSize + 64);
+        if (lsBuf) {
+            // UUID() at +0 (0x1025b23c8)
+            uintptr_t uuidFn = (uintptr_t)(0x1025b23c8ULL + (uintptr_t)slide);
+            __asm__ volatile(
+                "mov x8, %[buf]\n"
+                "blr %[fn]\n"
+                :
+                : [buf] "r"(lsBuf), [fn] "r"(uuidFn)
+                : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+                  "x12", "x13", "x14", "x15", "x16", "x17", "x30", "memory");
+
+            int32_t lsTypeOff = *(int32_t *)((uint8_t *)lsMeta + 0x14);
+            int32_t lsPropsOff = *(int32_t *)((uint8_t *)lsMeta + 0x18);
+            uint64_t rectStrPtr = ((uint64_t)(0x1029f9700ULL + (uintptr_t)slide) - 0x20ULL) | 0x8000000000000000ULL;
+            *(uint64_t *)(lsBuf + lsTypeOff) = 0xd00000000000001eULL;
+            *(uint64_t *)(lsBuf + lsTypeOff + 8) = rectStrPtr;
+            *(void **)(lsBuf + lsPropsOff) = dictObj;
+
+            // Build outline path from LiveShape (0x100319d58 + 0x100300154)
+            void *pathObj = NULL;
+            uintptr_t buildPathFn = (uintptr_t)(0x100319d58ULL + (uintptr_t)slide);
+            __asm__ volatile(
+                "fmov s0, wzr\n"
+                "mov x20, %[ls]\n"
+                "blr %[fn]\n"
+                "mov %[out], x0\n"
+                : [out] "=r"(pathObj)
+                : [ls] "r"(lsBuf), [fn] "r"(buildPathFn)
+                : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
+                  "x12", "x13", "x14", "x15", "x16", "x17", "x20", "x30", "v0", "memory");
+            if (pathObj) {
+                typedef void *(*MakeOutlineFn)(void *);
+                void *outlineObj = ((MakeOutlineFn)(0x100300154ULL + (uintptr_t)slide))(pathObj);
+                ((ReleaseFn)(0x1025bb404ULL + (uintptr_t)slide))(pathObj);
+                int32_t outlineOff = *(int32_t *)((uint8_t *)elMeta + 0x40);
+                void *oldOutline = *(void **)(elBuf + outlineOff);
+                if (oldOutline) ((ReleaseFn)(0x1025bb404ULL + (uintptr_t)slide))(oldOutline);
+                *(void **)(elBuf + outlineOff) = outlineObj;
+            }
+
+            // Store Optional<LiveShape>.some into elBuf + [elMeta + 0x4c]
+            int32_t liveShapeOff = *(int32_t *)((uint8_t *)elMeta + 0x4c);
+            void *dstLS = elBuf + liveShapeOff;
+            ((DestroyOptFn)(0x100019f70ULL + (uintptr_t)slide))(
+                dstLS,
+                (void *)(0x103324d08ULL + (uintptr_t)slide),
+                (void *)(0x1026c2fd0ULL + (uintptr_t)slide));
+            typedef void *(*InitWithTakeFn)(void *, void *, void *);
+            ((InitWithTakeFn)lsVWT[4])(dstLS, lsBuf, lsMeta);
+            typedef void (*StoreTagFn)(void *, uint32_t, uint32_t, void *);
+            ((StoreTagFn)lsVWT[7])(dstLS, 0, 1, lsMeta);
+            free(lsBuf);
+        }
+    }
+
+    // 4. Attach fillVideo (elMeta + 0x30) and set fillType = 3 (Media, elMeta + 0x38)
+    int32_t fillVideoOff = *(int32_t *)((uint8_t *)elMeta + 0x30);
+    int32_t fillTypeOff = *(int32_t *)((uint8_t *)elMeta + 0x38);
+    AMSetOptionalFoundationURL(elBuf + fillVideoOff, fileURL, slide);
+    *(uint8_t *)(elBuf + fillTypeOff) = 3;
+
+    // 5. Add to SceneHolder (0x10039b974)
+    AMCallSceneHolderAddElement(holder, elBuf, slide);
+
+    ((DestroyFn)(0x1000199c0ULL + (uintptr_t)slide))(elBuf, (void *)(0x1003e0404ULL + (uintptr_t)slide));
+    free(elBuf);
+    return YES;
+}
+
+// --- Media Link Resolver (YouTube Innertube + TikTok TikWM) & HD Muxer ---
+
+static NSURL *AMRockMotionMediaDirectoryURL(void) {
+    NSArray<NSURL *> *docs = [[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask];
+    NSURL *dir = [docs.firstObject URLByAppendingPathComponent:@"RockMotionMedia" isDirectory:YES];
+    if (dir) {
+        [[NSFileManager defaultManager] createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    return dir;
+}
+
+static NSString *AMSanitizeMediaFilenameTitle(NSString *raw, NSString *fallback) {
+    if (!raw.length) return fallback;
+    NSString *s = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (s.length > 48) s = [s substringToIndex:48];
+    return s.length ? s : fallback;
+}
+
+static NSString *AMExtractYouTubeVideoID(NSString *urlString) {
+    if (!urlString.length) return nil;
+    NSRegularExpression *rx = [NSRegularExpression regularExpressionWithPattern:
+        @"(?:youtube\\.com/(?:watch\\?(?:.*&)?v=|shorts/|embed/|live/)|youtu\\.be/)([A-Za-z0-9_-]{11})"
+        options:NSRegularExpressionCaseInsensitive error:nil];
+    NSTextCheckingResult *m = [rx firstMatchInString:urlString options:0 range:NSMakeRange(0, urlString.length)];
+    if (m && m.numberOfRanges >= 2) {
+        return [urlString substringWithRange:[m rangeAtIndex:1]];
+    }
+    return nil;
+}
+
+static BOOL AMIsTikTokURLString(NSString *urlString) {
+    if (!urlString.length) return NO;
+    NSString *low = urlString.lowercaseString;
+    return [low containsString:@"tiktok.com/"] || [low containsString:@"vm.tiktok.com"] || [low containsString:@"vt.tiktok.com"];
+}
+
+static void AMDownloadURLToLocalFile(NSURL *remoteURL,
+                                     NSString *userAgent,
+                                     NSURL *destURL,
+                                     void (^progressBlock)(float p),
+                                     void (^completion)(NSURL * _Nullable localURL, NSError * _Nullable err)) {
+    if (!remoteURL || !destURL) {
+        completion(nil, [NSError errorWithDomain:@"AMLinkMedia" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Invalid download URL."}]);
+        return;
+    }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:remoteURL
+                                                       cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                   timeoutInterval:90.0];
+    if (userAgent.length) {
+        [req setValue:userAgent forHTTPHeaderField:@"User-Agent"];
+    }
+    NSURLSessionDownloadTask *task = [[NSURLSession sharedSession] downloadTaskWithRequest:req
+        completionHandler:^(NSURL * _Nullable location, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+            NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+            if (error || !location || (http && (http.statusCode < 200 || http.statusCode >= 300))) {
+                NSError *e = error ?: [NSError errorWithDomain:@"AMLinkMedia"
+                                                          code:(http ? http.statusCode : 2)
+                                                      userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Download failed (HTTP %ld).", (long)(http ? http.statusCode : 0)]}];
+                completion(nil, e);
+                return;
+            }
+            NSFileManager *fm = [NSFileManager defaultManager];
+            [fm removeItemAtURL:destURL error:nil];
+            NSError *mvErr = nil;
+            if (![fm moveItemAtURL:location toURL:destURL error:&mvErr]) {
+                completion(nil, mvErr ?: [NSError errorWithDomain:@"AMLinkMedia" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Could not save downloaded media."}]);
+                return;
+            }
+            if (progressBlock) progressBlock(1.0f);
+            completion(destURL, nil);
+        }];
+    [task resume];
+}
+
+static void AMMuxVideoAndAudioFiles(NSURL *videoURL,
+                                    NSURL *audioURL,
+                                    NSURL *outputURL,
+                                    void (^completion)(NSURL * _Nullable muxedURL, NSError * _Nullable err)) {
+    AVURLAsset *vAsset = [AVURLAsset URLAssetWithURL:videoURL options:nil];
+    AVURLAsset *aAsset = [AVURLAsset URLAssetWithURL:audioURL options:nil];
+    AVAssetTrack *vTrack = [vAsset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+    AVAssetTrack *aTrack = [aAsset tracksWithMediaType:AVMediaTypeAudio].firstObject;
+    if (!vTrack || !aTrack) {
+        completion(nil, [NSError errorWithDomain:@"AMLinkMedia" code:10 userInfo:@{NSLocalizedDescriptionKey: @"Missing video or audio track for muxing."}]);
+        return;
+    }
+
+    AVMutableComposition *comp = [AVMutableComposition composition];
+    CMTimeRange vRange = CMTimeRangeMake(kCMTimeZero, vAsset.duration);
+    CMTimeRange aRange = CMTimeRangeMake(kCMTimeZero, CMTimeMinimum(vAsset.duration, aAsset.duration));
+
+    AVMutableCompositionTrack *compV = [comp addMutableTrackWithMediaType:AVMediaTypeVideo preferredTrackID:kCMPersistentTrackID_Invalid];
+    AVMutableCompositionTrack *compA = [comp addMutableTrackWithMediaType:AVMediaTypeAudio preferredTrackID:kCMPersistentTrackID_Invalid];
+    NSError *insErr = nil;
+    [compV insertTimeRange:vRange ofTrack:vTrack atTime:kCMTimeZero error:&insErr];
+    compV.preferredTransform = vTrack.preferredTransform;
+    if (!insErr) {
+        [compA insertTimeRange:aRange ofTrack:aTrack atTime:kCMTimeZero error:&insErr];
+    }
+    if (insErr) {
+        completion(nil, insErr);
+        return;
+    }
+
+    [[NSFileManager defaultManager] removeItemAtURL:outputURL error:nil];
+    AVAssetExportSession *exporter = [[AVAssetExportSession alloc] initWithAsset:comp presetName:AVAssetExportPresetPassthrough];
+    exporter.outputURL = outputURL;
+    exporter.outputFileType = AVFileTypeMPEG4;
+    exporter.shouldOptimizeForNetworkUse = YES;
+    [exporter exportAsynchronouslyWithCompletionHandler:^{
+        if (exporter.status == AVAssetExportSessionStatusCompleted) {
+            completion(outputURL, nil);
+        } else {
+            completion(nil, exporter.error ?: [NSError errorWithDomain:@"AMLinkMedia" code:11 userInfo:@{NSLocalizedDescriptionKey: @"Failed to mux HD video and audio."}]);
+        }
+    }];
+}
+
+static void AMFetchYouTubePlayerJSON(NSString *videoID,
+                                     BOOL useIOSFallback,
+                                     void (^completion)(NSDictionary * _Nullable json, NSString *ua, NSError * _Nullable err)) {
+    NSURL *apiURL = [NSURL URLWithString:@"https://www.youtube.com/youtubei/v1/player?prettyPrint=false"];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:apiURL
+                                                       cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                   timeoutInterval:20.0];
+    req.HTTPMethod = @"POST";
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    NSString *ua = useIOSFallback
+        ? @"com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)"
+        : @"com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+    [req setValue:ua forHTTPHeaderField:@"User-Agent"];
+
+    NSDictionary *clientDict = useIOSFallback
+        ? @{@"clientName": @"IOS",
+            @"clientVersion": @"20.10.4",
+            @"deviceMake": @"Apple",
+            @"deviceModel": @"iPhone16,2",
+            @"osName": @"iPhone",
+            @"osVersion": @"18.3.2.22D82",
+            @"hl": @"en",
+            @"gl": @"US"}
+        : @{@"clientName": @"ANDROID_VR",
+            @"clientVersion": @"1.60.19",
+            @"deviceMake": @"Oculus",
+            @"deviceModel": @"Quest 3",
+            @"osName": @"Android",
+            @"osVersion": @"12L",
+            @"androidSdkVersion": @32,
+            @"hl": @"en",
+            @"gl": @"US"};
+
+    NSDictionary *payload = @{@"context": @{@"client": clientDict}, @"videoId": videoID};
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        (void)resp;
+        if (err || !data) {
+            completion(nil, ua, err ?: [NSError errorWithDomain:@"AMLinkMedia" code:20 userInfo:@{NSLocalizedDescriptionKey: @"Network error contacting YouTube."}]);
+            return;
+        }
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![obj isKindOfClass:[NSDictionary class]]) {
+            completion(nil, ua, [NSError errorWithDomain:@"AMLinkMedia" code:21 userInfo:@{NSLocalizedDescriptionKey: @"Invalid response from YouTube."}]);
+            return;
+        }
+        completion((NSDictionary *)obj, ua, nil);
+    }] resume];
+}
+
+static void AMResolveAndDownloadYouTube(NSString *videoID,
+                                        BOOL audioOnly,
+                                        BOOL isFallback,
+                                        void (^statusBlock)(NSString *status, float progress),
+                                        void (^completion)(NSURL * _Nullable localURL, NSString * _Nullable title, NSError * _Nullable err)) {
+    if (statusBlock) statusBlock(isFallback ? @"Retrying YouTube (iOS client)..." : @"Resolving YouTube link...", 0.15f);
+    AMFetchYouTubePlayerJSON(videoID, isFallback, ^(NSDictionary * _Nullable json, NSString *ua, NSError * _Nullable err) {
+        if (err || !json) {
+            if (!isFallback) {
+                AMResolveAndDownloadYouTube(videoID, audioOnly, YES, statusBlock, completion);
+            } else {
+                completion(nil, nil, err);
+            }
+            return;
+        }
+        NSDictionary *playStatus = [json[@"playabilityStatus"] isKindOfClass:[NSDictionary class]] ? json[@"playabilityStatus"] : nil;
+        NSDictionary *streamData = [json[@"streamingData"] isKindOfClass:[NSDictionary class]] ? json[@"streamingData"] : nil;
+        NSDictionary *vidDetails = [json[@"videoDetails"] isKindOfClass:[NSDictionary class]] ? json[@"videoDetails"] : nil;
+        NSString *title = AMSanitizeMediaFilenameTitle([vidDetails[@"title"] isKindOfClass:[NSString class]] ? vidDetails[@"title"] : nil,
+                                                       [NSString stringWithFormat:@"YouTube_%@", videoID]);
+
+        NSArray *formats = [streamData[@"formats"] isKindOfClass:[NSArray class]] ? streamData[@"formats"] : @[];
+        NSArray *adaptive = [streamData[@"adaptiveFormats"] isKindOfClass:[NSArray class]] ? streamData[@"adaptiveFormats"] : @[];
+
+        NSString *bestAudioURL = nil;
+        NSInteger bestAudioBitrate = -1;
+        for (id item in adaptive) {
+            if (![item isKindOfClass:[NSDictionary class]]) continue;
+            NSString *u = [item[@"url"] isKindOfClass:[NSString class]] ? item[@"url"] : nil;
+            NSString *mime = [item[@"mimeType"] isKindOfClass:[NSString class]] ? item[@"mimeType"] : @"";
+            if (!u.length || ![mime containsString:@"audio/mp4"]) continue;
+            NSInteger br = [item[@"bitrate"] respondsToSelector:@selector(integerValue)] ? [item[@"bitrate"] integerValue] : 0;
+            if (br > bestAudioBitrate) {
+                bestAudioBitrate = br;
+                bestAudioURL = u;
+            }
+        }
+
+        NSString *bestAdaptiveVideoURL = nil;
+        NSInteger bestAdaptiveHeight = -1;
+        for (id item in adaptive) {
+            if (![item isKindOfClass:[NSDictionary class]]) continue;
+            NSString *u = [item[@"url"] isKindOfClass:[NSString class]] ? item[@"url"] : nil;
+            NSString *mime = [item[@"mimeType"] isKindOfClass:[NSString class]] ? item[@"mimeType"] : @"";
+            if (!u.length || ![mime containsString:@"video/mp4"] || ![mime containsString:@"avc1"]) continue;
+            NSInteger h = [item[@"height"] respondsToSelector:@selector(integerValue)] ? [item[@"height"] integerValue] : 0;
+            if (h > 1080) continue;
+            if (h > bestAdaptiveHeight) {
+                bestAdaptiveHeight = h;
+                bestAdaptiveVideoURL = u;
+            }
+        }
+
+        NSString *bestProgURL = nil;
+        NSInteger bestProgHeight = -1;
+        for (id item in formats) {
+            if (![item isKindOfClass:[NSDictionary class]]) continue;
+            NSString *u = [item[@"url"] isKindOfClass:[NSString class]] ? item[@"url"] : nil;
+            NSString *mime = [item[@"mimeType"] isKindOfClass:[NSString class]] ? item[@"mimeType"] : @"";
+            if (!u.length || ![mime containsString:@"video/mp4"]) continue;
+            NSInteger h = [item[@"height"] respondsToSelector:@selector(integerValue)] ? [item[@"height"] integerValue] : 0;
+            if (h > bestProgHeight) {
+                bestProgHeight = h;
+                bestProgURL = u;
+            }
+        }
+
+        NSURL *mediaDir = AMRockMotionMediaDirectoryURL();
+        NSString *uid = [NSUUID UUID].UUIDString;
+
+        if (audioOnly) {
+            NSString *dl = bestAudioURL ?: bestProgURL;
+            if (!dl.length) {
+                if (!isFallback) {
+                    AMResolveAndDownloadYouTube(videoID, audioOnly, YES, statusBlock, completion);
+                } else {
+                    NSString *reason = [playStatus[@"reason"] isKindOfClass:[NSString class]] ? playStatus[@"reason"] : @"No direct audio stream available.";
+                    completion(nil, nil, [NSError errorWithDomain:@"AMLinkMedia" code:22 userInfo:@{NSLocalizedDescriptionKey: reason}]);
+                }
+                return;
+            }
+            if (statusBlock) statusBlock(@"Downloading YouTube audio...", 0.45f);
+            NSURL *dest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@.m4a", uid]];
+            AMDownloadURLToLocalFile([NSURL URLWithString:dl], ua, dest, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
+                completion(localURL, title, dlErr);
+            });
+            return;
+        }
+
+        if (bestAdaptiveVideoURL.length && bestAudioURL.length) {
+            if (statusBlock) statusBlock([NSString stringWithFormat:@"Downloading %ldp video...", (long)bestAdaptiveHeight], 0.35f);
+            NSURL *tmpV = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"yt_v_%@.mp4", uid]]];
+            NSURL *tmpA = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"yt_a_%@.m4a", uid]]];
+            NSURL *dest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@.mp4", uid]];
+            AMDownloadURLToLocalFile([NSURL URLWithString:bestAdaptiveVideoURL], ua, tmpV, nil, ^(NSURL * _Nullable vLocal, NSError * _Nullable vErr) {
+                if (vErr || !vLocal) {
+                    if (bestProgURL.length) {
+                        if (statusBlock) statusBlock(@"Downloading MP4 fallback...", 0.55f);
+                        AMDownloadURLToLocalFile([NSURL URLWithString:bestProgURL], ua, dest, nil, ^(NSURL * _Nullable pLocal, NSError * _Nullable pErr) {
+                            completion(pLocal, title, pErr);
+                        });
+                    } else {
+                        completion(nil, nil, vErr);
+                    }
+                    return;
+                }
+                if (statusBlock) statusBlock(@"Downloading audio track...", 0.65f);
+                AMDownloadURLToLocalFile([NSURL URLWithString:bestAudioURL], ua, tmpA, nil, ^(NSURL * _Nullable aLocal, NSError * _Nullable aErr) {
+                    if (aErr || !aLocal) {
+                        [[NSFileManager defaultManager] removeItemAtURL:dest error:nil];
+                        [[NSFileManager defaultManager] moveItemAtURL:vLocal toURL:dest error:nil];
+                        completion(dest, title, nil);
+                        return;
+                    }
+                    if (statusBlock) statusBlock(@"Muxing HD video + audio...", 0.85f);
+                    AMMuxVideoAndAudioFiles(vLocal, aLocal, dest, ^(NSURL * _Nullable muxedURL, NSError * _Nullable mErr) {
+                        [[NSFileManager defaultManager] removeItemAtURL:tmpV error:nil];
+                        [[NSFileManager defaultManager] removeItemAtURL:tmpA error:nil];
+                        if (muxedURL && !mErr) {
+                            completion(muxedURL, title, nil);
+                        } else if (bestProgURL.length) {
+                            AMDownloadURLToLocalFile([NSURL URLWithString:bestProgURL], ua, dest, nil, ^(NSURL * _Nullable pLocal, NSError * _Nullable pErr) {
+                                completion(pLocal, title, pErr);
+                            });
+                        } else {
+                            completion(nil, nil, mErr);
+                        }
+                    });
+                });
+            });
+            return;
+        }
+
+        if (bestProgURL.length) {
+            if (statusBlock) statusBlock(@"Downloading YouTube video...", 0.50f);
+            NSURL *dest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@.mp4", uid]];
+            AMDownloadURLToLocalFile([NSURL URLWithString:bestProgURL], ua, dest, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
+                completion(localURL, title, dlErr);
+            });
+            return;
+        }
+
+        if (!isFallback) {
+            AMResolveAndDownloadYouTube(videoID, audioOnly, YES, statusBlock, completion);
+        } else {
+            NSString *reason = [playStatus[@"reason"] isKindOfClass:[NSString class]] ? playStatus[@"reason"] : @"No direct video stream available.";
+            completion(nil, nil, [NSError errorWithDomain:@"AMLinkMedia" code:23 userInfo:@{NSLocalizedDescriptionKey: reason}]);
+        }
+    });
+}
+
+static void AMResolveAndDownloadTikTok(NSString *urlString,
+                                       BOOL audioOnly,
+                                       void (^statusBlock)(NSString *status, float progress),
+                                       void (^completion)(NSURL * _Nullable localURL, NSString * _Nullable title, NSError * _Nullable err)) {
+    if (statusBlock) statusBlock(@"Resolving TikTok link...", 0.20f);
+    NSCharacterSet *allowed = [[NSCharacterSet characterSetWithCharactersInString:@"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"] copy];
+    NSString *enc = [urlString stringByAddingPercentEncodingWithAllowedCharacters:allowed] ?: @"";
+    NSURL *apiURL = [NSURL URLWithString:[NSString stringWithFormat:@"https://www.tikwm.com/api/?url=%@&hd=1", enc]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:apiURL
+                                                       cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                   timeoutInterval:20.0];
+    NSString *ua = @"Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1";
+    [req setValue:ua forHTTPHeaderField:@"User-Agent"];
+
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        (void)resp;
+        if (err || !data) {
+            completion(nil, nil, err ?: [NSError errorWithDomain:@"AMLinkMedia" code:30 userInfo:@{NSLocalizedDescriptionKey: @"Network error contacting TikTok resolver."}]);
+            return;
+        }
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![obj isKindOfClass:[NSDictionary class]]) {
+            completion(nil, nil, [NSError errorWithDomain:@"AMLinkMedia" code:31 userInfo:@{NSLocalizedDescriptionKey: @"Invalid response from TikTok resolver."}]);
+            return;
+        }
+        NSDictionary *root = (NSDictionary *)obj;
+        NSDictionary *d = [root[@"data"] isKindOfClass:[NSDictionary class]] ? root[@"data"] : nil;
+        if (!d) {
+            NSString *msg = [root[@"msg"] isKindOfClass:[NSString class]] ? root[@"msg"] : @"Could not resolve TikTok URL.";
+            completion(nil, nil, [NSError errorWithDomain:@"AMLinkMedia" code:32 userInfo:@{NSLocalizedDescriptionKey: msg}]);
+            return;
+        }
+        NSString *title = AMSanitizeMediaFilenameTitle([d[@"title"] isKindOfClass:[NSString class]] ? d[@"title"] : nil, @"TikTok");
+        NSString *mediaStr = nil;
+        NSString *ext = audioOnly ? @"mp3" : @"mp4";
+        if (audioOnly) {
+            NSString *m1 = [d[@"music"] isKindOfClass:[NSString class]] ? d[@"music"] : nil;
+            NSDictionary *mi = [d[@"music_info"] isKindOfClass:[NSDictionary class]] ? d[@"music_info"] : nil;
+            NSString *m2 = [mi[@"play"] isKindOfClass:[NSString class]] ? mi[@"play"] : nil;
+            mediaStr = m1.length ? m1 : m2;
+            NSString *mt = [mi[@"title"] isKindOfClass:[NSString class]] ? mi[@"title"] : nil;
+            if (mt.length) title = AMSanitizeMediaFilenameTitle(mt, title);
+        } else {
+            NSString *v1 = [d[@"hdplay"] isKindOfClass:[NSString class]] ? d[@"hdplay"] : nil;
+            NSString *v2 = [d[@"play"] isKindOfClass:[NSString class]] ? d[@"play"] : nil;
+            mediaStr = v1.length ? v1 : v2;
+        }
+        if (!mediaStr.length) {
+            completion(nil, nil, [NSError errorWithDomain:@"AMLinkMedia" code:33 userInfo:@{NSLocalizedDescriptionKey: @"No downloadable TikTok stream found."}]);
+            return;
+        }
+        if ([mediaStr hasPrefix:@"/"]) {
+            mediaStr = [@"https://www.tikwm.com" stringByAppendingString:mediaStr];
+        }
+        if (statusBlock) statusBlock(audioOnly ? @"Downloading TikTok audio..." : @"Downloading TikTok HD video...", 0.55f);
+        NSURL *dest = [AMRockMotionMediaDirectoryURL() URLByAppendingPathComponent:[NSString stringWithFormat:@"tt_%@.%@", [NSUUID UUID].UUIDString, ext]];
+        AMDownloadURLToLocalFile([NSURL URLWithString:mediaStr], ua, dest, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
+            completion(localURL, title, dlErr);
+        });
+    }] resume];
+}
+
+// --- Native-Styled Import Video/Audio via Link Sheet VC ---
+
+@interface AMLinkMediaImportVC : UIViewController <UITextFieldDelegate>
+@property (nonatomic, weak) UIViewController *libraryPanelVC;
+@property (nonatomic, strong) UISegmentedControl *modeControl;
+@property (nonatomic, strong) UITextField *urlField;
+@property (nonatomic, strong) UIButton *importButton;
+@property (nonatomic, strong) UIButton *pasteButton;
+@property (nonatomic, strong) UIProgressView *progressView;
+@property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, assign) BOOL isBusy;
+@end
+
+@implementation AMLinkMediaImportVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.58];
+
+    UIView *card = [[UIView alloc] init];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.backgroundColor = [UIColor colorWithRed:0.105 green:0.114 blue:0.157 alpha:1.0];
+    card.layer.cornerRadius = 18.0;
+    card.layer.borderWidth = 1.0;
+    card.layer.borderColor = [UIColor colorWithRed:0.22 green:0.24 blue:0.33 alpha:0.9].CGColor;
+    card.layer.shadowColor = [UIColor blackColor].CGColor;
+    card.layer.shadowOpacity = 0.45;
+    card.layer.shadowRadius = 20.0;
+    card.layer.shadowOffset = CGSizeMake(0, 8);
+    [self.view addSubview:card];
+
+    UILabel *titleLbl = [[UILabel alloc] init];
+    titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    titleLbl.text = @"Import via Link";
+    titleLbl.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightBold];
+    titleLbl.textColor = [UIColor whiteColor];
+    [card addSubview:titleLbl];
+
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    closeBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    if (@available(iOS 13.0, *)) {
+        [closeBtn setImage:[UIImage systemImageNamed:@"xmark.circle.fill"] forState:UIControlStateNormal];
+    } else {
+        [closeBtn setTitle:@"Close" forState:UIControlStateNormal];
+    }
+    closeBtn.tintColor = [UIColor colorWithWhite:0.65 alpha:1.0];
+    [closeBtn addTarget:self action:@selector(onTapCancel) forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:closeBtn];
+
+    UILabel *subLbl = [[UILabel alloc] init];
+    subLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    subLbl.text = @"Paste a YouTube or TikTok link to add directly to the timeline.";
+    subLbl.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightRegular];
+    subLbl.textColor = [UIColor colorWithRed:0.65 green:0.68 blue:0.78 alpha:1.0];
+    subLbl.numberOfLines = 2;
+    [card addSubview:subLbl];
+
+    self.modeControl = [[UISegmentedControl alloc] initWithItems:@[@"Video (MP4)", @"Audio Only"]];
+    self.modeControl.translatesAutoresizingMaskIntoConstraints = NO;
+    self.modeControl.selectedSegmentIndex = 0;
+    self.modeControl.backgroundColor = [UIColor colorWithRed:0.15 green:0.165 blue:0.22 alpha:1.0];
+    if (@available(iOS 13.0, *)) {
+        self.modeControl.selectedSegmentTintColor = AMNativeMintColor();
+    }
+    [self.modeControl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.85 alpha:1.0],
+                                               NSFontAttributeName: [UIFont systemFontOfSize:13.0 weight:UIFontWeightSemibold]}
+                                    forState:UIControlStateNormal];
+    [self.modeControl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithRed:0.06 green:0.08 blue:0.11 alpha:1.0],
+                                               NSFontAttributeName: [UIFont systemFontOfSize:13.0 weight:UIFontWeightBold]}
+                                    forState:UIControlStateSelected];
+    [card addSubview:self.modeControl];
+
+    UIView *inputRow = [[UIView alloc] init];
+    inputRow.translatesAutoresizingMaskIntoConstraints = NO;
+    inputRow.backgroundColor = [UIColor colorWithRed:0.145 green:0.157 blue:0.212 alpha:1.0];
+    inputRow.layer.cornerRadius = 11.0;
+    inputRow.layer.borderWidth = 1.0;
+    inputRow.layer.borderColor = [UIColor colorWithRed:0.25 green:0.27 blue:0.36 alpha:0.9].CGColor;
+    [card addSubview:inputRow];
+
+    self.urlField = [[UITextField alloc] init];
+    self.urlField.translatesAutoresizingMaskIntoConstraints = NO;
+    self.urlField.delegate = self;
+    self.urlField.textColor = [UIColor whiteColor];
+    self.urlField.font = [UIFont systemFontOfSize:14.0];
+    self.urlField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    self.urlField.autocorrectionType = UITextAutocorrectionTypeNo;
+    self.urlField.keyboardType = UIKeyboardTypeURL;
+    self.urlField.returnKeyType = UIReturnKeyGo;
+    self.urlField.clearButtonMode = UITextFieldViewModeWhileEditing;
+    self.urlField.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"https://youtube.com/... or tiktok.com/..."
+                                                                          attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.48 alpha:1.0]}];
+    [inputRow addSubview:self.urlField];
+
+    self.pasteButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.pasteButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.pasteButton setTitle:@"Paste" forState:UIControlStateNormal];
+    self.pasteButton.titleLabel.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold];
+    [self.pasteButton setTitleColor:AMNativeMintColor() forState:UIControlStateNormal];
+    self.pasteButton.backgroundColor = [UIColor colorWithRed:0.19 green:0.21 blue:0.28 alpha:1.0];
+    self.pasteButton.layer.cornerRadius = 8.0;
+    [self.pasteButton addTarget:self action:@selector(onTapPaste) forControlEvents:UIControlEventTouchUpInside];
+    [inputRow addSubview:self.pasteButton];
+
+    self.progressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+    self.progressView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.progressView.progressTintColor = AMNativeMintColor();
+    self.progressView.trackTintColor = [UIColor colorWithRed:0.20 green:0.22 blue:0.29 alpha:1.0];
+    self.progressView.hidden = YES;
+    [card addSubview:self.progressView];
+
+    self.statusLabel = [[UILabel alloc] init];
+    self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.statusLabel.font = [UIFont systemFontOfSize:12.0 weight:UIFontWeightMedium];
+    self.statusLabel.textColor = [UIColor colorWithRed:0.75 green:0.80 blue:0.90 alpha:1.0];
+    self.statusLabel.numberOfLines = 2;
+    self.statusLabel.text = @"";
+    [card addSubview:self.statusLabel];
+
+    self.importButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.importButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.importButton setTitle:@"Import to Timeline" forState:UIControlStateNormal];
+    self.importButton.titleLabel.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightBold];
+    [self.importButton setTitleColor:[UIColor colorWithRed:0.05 green:0.07 blue:0.10 alpha:1.0] forState:UIControlStateNormal];
+    self.importButton.backgroundColor = AMNativeMintColor();
+    self.importButton.layer.cornerRadius = 12.0;
+    [self.importButton addTarget:self action:@selector(onTapImport) forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:self.importButton];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [card.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [card.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:-36.0],
+        [card.widthAnchor constraintLessThanOrEqualToConstant:356.0],
+        [card.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.view.leadingAnchor constant:20.0],
+        [card.trailingAnchor constraintLessThanOrEqualToAnchor:self.view.trailingAnchor constant:-20.0],
+        [card.widthAnchor constraintEqualToAnchor:self.view.widthAnchor constant:-40.0],
+
+        [titleLbl.topAnchor constraintEqualToAnchor:card.topAnchor constant:16.0],
+        [titleLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16.0],
+
+        [closeBtn.centerYAnchor constraintEqualToAnchor:titleLbl.centerYAnchor],
+        [closeBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14.0],
+        [closeBtn.widthAnchor constraintEqualToConstant:28.0],
+        [closeBtn.heightAnchor constraintEqualToConstant:28.0],
+
+        [subLbl.topAnchor constraintEqualToAnchor:titleLbl.bottomAnchor constant:6.0],
+        [subLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16.0],
+        [subLbl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16.0],
+
+        [self.modeControl.topAnchor constraintEqualToAnchor:subLbl.bottomAnchor constant:14.0],
+        [self.modeControl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16.0],
+        [self.modeControl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16.0],
+        [self.modeControl.heightAnchor constraintEqualToConstant:34.0],
+
+        [inputRow.topAnchor constraintEqualToAnchor:self.modeControl.bottomAnchor constant:12.0],
+        [inputRow.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16.0],
+        [inputRow.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16.0],
+        [inputRow.heightAnchor constraintEqualToConstant:44.0],
+
+        [self.pasteButton.trailingAnchor constraintEqualToAnchor:inputRow.trailingAnchor constant:-6.0],
+        [self.pasteButton.centerYAnchor constraintEqualToAnchor:inputRow.centerYAnchor],
+        [self.pasteButton.widthAnchor constraintEqualToConstant:58.0],
+        [self.pasteButton.heightAnchor constraintEqualToConstant:30.0],
+
+        [self.urlField.leadingAnchor constraintEqualToAnchor:inputRow.leadingAnchor constant:12.0],
+        [self.urlField.trailingAnchor constraintEqualToAnchor:self.pasteButton.leadingAnchor constant:-8.0],
+        [self.urlField.topAnchor constraintEqualToAnchor:inputRow.topAnchor],
+        [self.urlField.bottomAnchor constraintEqualToAnchor:inputRow.bottomAnchor],
+
+        [self.progressView.topAnchor constraintEqualToAnchor:inputRow.bottomAnchor constant:12.0],
+        [self.progressView.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16.0],
+        [self.progressView.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16.0],
+
+        [self.statusLabel.topAnchor constraintEqualToAnchor:self.progressView.bottomAnchor constant:6.0],
+        [self.statusLabel.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16.0],
+        [self.statusLabel.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16.0],
+
+        [self.importButton.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:14.0],
+        [self.importButton.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16.0],
+        [self.importButton.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16.0],
+        [self.importButton.heightAnchor constraintEqualToConstant:44.0],
+        [self.importButton.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-16.0],
+    ]];
+
+    NSString *clip = [UIPasteboard generalPasteboard].string;
+    if (clip.length && (AMExtractYouTubeVideoID(clip) || AMIsTikTokURLString(clip))) {
+        self.urlField.text = [clip stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    }
+}
+
+- (void)onTapPaste {
+    NSString *clip = [UIPasteboard generalPasteboard].string;
+    if (clip.length) {
+        self.urlField.text = [clip stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    }
+}
+
+- (void)onTapCancel {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    [textField resignFirstResponder];
+    [self onTapImport];
+    return YES;
+}
+
+- (void)setBusyState:(BOOL)busy status:(NSString *)status progress:(float)progress isError:(BOOL)isError {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.isBusy = busy;
+        self.importButton.enabled = !busy;
+        self.importButton.alpha = busy ? 0.55 : 1.0;
+        self.urlField.enabled = !busy;
+        self.modeControl.enabled = !busy;
+        self.pasteButton.enabled = !busy;
+        self.progressView.hidden = !busy;
+        if (busy) [self.progressView setProgress:progress animated:YES];
+        self.statusLabel.text = status ?: @"";
+        self.statusLabel.textColor = isError
+            ? [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0]
+            : [UIColor colorWithRed:0.75 green:0.82 blue:0.92 alpha:1.0];
+    });
+}
+
+- (void)onTapImport {
+    if (self.isBusy) return;
+    [self.urlField resignFirstResponder];
+    NSString *raw = [self.urlField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!raw.length) {
+        [self setBusyState:NO status:@"Paste a YouTube or TikTok URL first." progress:0.0f isError:YES];
+        return;
+    }
+
+    NSString *ytID = AMExtractYouTubeVideoID(raw);
+    BOOL isTT = AMIsTikTokURLString(raw);
+    if (!ytID && !isTT) {
+        [self setBusyState:NO status:@"Unsupported URL. Use a YouTube or TikTok link." progress:0.0f isError:YES];
+        return;
+    }
+
+    BOOL audioOnly = (self.modeControl.selectedSegmentIndex == 1);
+    __weak typeof(self) weakSelf = self;
+
+    void (^statusCb)(NSString *, float) = ^(NSString *st, float p) {
+        [weakSelf setBusyState:YES status:st progress:p isError:NO];
+    };
+
+    void (^doneCb)(NSURL * _Nullable, NSString * _Nullable, NSError * _Nullable) = ^(NSURL * _Nullable localURL, NSString * _Nullable title, NSError * _Nullable err) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if (err || !localURL) {
+                [strongSelf setBusyState:NO status:(err.localizedDescription ?: @"Download failed.") progress:0.0f isError:YES];
+                return;
+            }
+            [strongSelf setBusyState:YES status:@"Adding layer to timeline..." progress:0.95f isError:NO];
+            intptr_t slide = AMMainBinarySlide();
+            void *holder = AMRot3DCopyActiveHolderOnMain(slide);
+            if (!holder) {
+                [strongSelf setBusyState:NO status:@"Could not find active project timeline." progress:0.0f isError:YES];
+                return;
+            }
+            BOOL ok = audioOnly
+                ? AMInsertLocalAudioLayer(holder, localURL, title)
+                : AMInsertLocalVideoLayer(holder, localURL, title);
+            AMSwiftRelease(holder, slide);
+            if (!ok) {
+                [strongSelf setBusyState:NO status:@"Failed to insert media layer." progress:0.0f isError:YES];
+                return;
+            }
+            UIViewController *libVC = strongSelf.libraryPanelVC;
+            [strongSelf dismissViewControllerAnimated:YES completion:^{
+                if (libVC) {
+                    SEL dismissSel = @selector(handleTapGesture:);
+                    if ([libVC respondsToSelector:dismissSel]) {
+                        ((void (*)(id, SEL, id))objc_msgSend)(libVC, dismissSel, nil);
+                    } else {
+                        [libVC dismissViewControllerAnimated:YES completion:nil];
+                    }
+                }
+            }];
+        });
+    };
+
+    if (ytID) {
+        AMResolveAndDownloadYouTube(ytID, audioOnly, NO, statusCb, doneCb);
+    } else {
+        AMResolveAndDownloadTikTok(raw, audioOnly, statusCb, doneCb);
+    }
+}
+
+@end
+
+// --- LibraryPanelVC (+ Menu) Hook ---
+
+static IMP gOrigLibraryPanelViewDidLoad = NULL;
+static IMP gOrigLibraryPanelShouldReceiveTouch = NULL;
+static const void *kAMLibraryLinkBtnKey = &kAMLibraryLinkBtnKey;
+
+@interface AMLibraryLinkButtonHelper : NSObject
++ (void)onTapImportViaLink:(UIButton *)sender;
+@end
+
+@implementation AMLibraryLinkButtonHelper
++ (void)onTapImportViaLink:(UIButton *)sender {
+    UIResponder *r = sender.nextResponder;
+    UIViewController *libVC = nil;
+    while (r) {
+        if ([r isKindOfClass:[UIViewController class]]) {
+            libVC = (UIViewController *)r;
+            break;
+        }
+        r = r.nextResponder;
+    }
+    if (!libVC) return;
+    AMLinkMediaImportVC *vc = [[AMLinkMediaImportVC alloc] init];
+    vc.libraryPanelVC = libVC;
+    vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
+    vc.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
+    [libVC presentViewController:vc animated:YES completion:nil];
+}
+@end
+
+static void AMHook_libraryPanelViewDidLoad(id self, SEL _cmd) {
+    if (gOrigLibraryPanelViewDidLoad) {
+        ((void (*)(id, SEL))gOrigLibraryPanelViewDidLoad)(self, _cmd);
+    }
+    UIViewController *vc = (UIViewController *)self;
+    if (!vc.view) return;
+    if (objc_getAssociatedObject(vc, kAMLibraryLinkBtnKey)) return;
+
+    UIView *panelView = nil;
+    SEL panelSel = @selector(panelView);
+    if ([vc respondsToSelector:panelSel]) {
+        panelView = ((UIView *(*)(id, SEL))objc_msgSend)(vc, panelSel);
+    }
+
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.translatesAutoresizingMaskIntoConstraints = NO;
+    btn.backgroundColor = [UIColor colorWithRed:0.125 green:0.137 blue:0.188 alpha:0.96];
+    btn.layer.cornerRadius = 16.0;
+    btn.layer.borderWidth = 1.0;
+    btn.layer.borderColor = [UIColor colorWithRed:0.24 green:0.27 blue:0.36 alpha:0.95].CGColor;
+    btn.layer.shadowColor = [UIColor blackColor].CGColor;
+    btn.layer.shadowOpacity = 0.35;
+    btn.layer.shadowRadius = 8.0;
+    btn.layer.shadowOffset = CGSizeMake(0, 3);
+    btn.contentEdgeInsets = UIEdgeInsetsMake(0, 12, 0, 13);
+    btn.titleEdgeInsets = UIEdgeInsetsMake(0, 5, 0, -5);
+    [btn setTitle:@"Import via Link" forState:UIControlStateNormal];
+    [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    btn.titleLabel.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold];
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:12.0 weight:UIImageSymbolWeightBold];
+        UIImage *img = [[UIImage systemImageNamed:@"link" withConfiguration:cfg] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        [btn setImage:img forState:UIControlStateNormal];
+        btn.tintColor = AMNativeMintColor();
+    }
+    [btn addTarget:[AMLibraryLinkButtonHelper class] action:@selector(onTapImportViaLink:) forControlEvents:UIControlEventTouchUpInside];
+
+    [vc.view addSubview:btn];
+    objc_setAssociatedObject(vc, kAMLibraryLinkBtnKey, btn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    if (panelView && panelView.superview == vc.view) {
+        [NSLayoutConstraint activateConstraints:@[
+            [btn.bottomAnchor constraintEqualToAnchor:panelView.topAnchor constant:-8.0],
+            [btn.trailingAnchor constraintEqualToAnchor:panelView.trailingAnchor constant:-12.0],
+            [btn.heightAnchor constraintEqualToConstant:32.0],
+        ]];
+    } else {
+        [NSLayoutConstraint activateConstraints:@[
+            [btn.topAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor constant:12.0],
+            [btn.trailingAnchor constraintEqualToAnchor:vc.view.trailingAnchor constant:-12.0],
+            [btn.heightAnchor constraintEqualToConstant:32.0],
+        ]];
+    }
+}
+
+static BOOL AMHook_libraryPanelShouldReceiveTouch(id self, SEL _cmd, UIGestureRecognizer *gr, UITouch *touch) {
+    UIButton *btn = objc_getAssociatedObject(self, kAMLibraryLinkBtnKey);
+    if (btn && touch.view && ([touch.view isEqual:btn] || [touch.view isDescendantOfView:btn])) {
+        return NO;
+    }
+    if (gOrigLibraryPanelShouldReceiveTouch) {
+        return ((BOOL (*)(id, SEL, UIGestureRecognizer *, UITouch *))gOrigLibraryPanelShouldReceiveTouch)(self, _cmd, gr, touch);
+    }
+    return YES;
 }
 
 // ============================================================================
@@ -19576,6 +20682,14 @@ static void AlightMotionModsInit(void) {
                     @"drawRect:",
                     (IMP)AMHook_keyframeViewDrawRect,
                     &gOrigKeyframeViewDrawRect);
+    AMSwizzleMethod(@"_TtC12AlightMotion14LibraryPanelVC",
+                    @"viewDidLoad",
+                    (IMP)AMHook_libraryPanelViewDidLoad,
+                    &gOrigLibraryPanelViewDidLoad);
+    AMSwizzleMethod(@"_TtC12AlightMotion14LibraryPanelVC",
+                    @"gestureRecognizer:shouldReceiveTouch:",
+                    (IMP)AMHook_libraryPanelShouldReceiveTouch,
+                    &gOrigLibraryPanelShouldReceiveTouch);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         AMInstallCustomEffectCategoryIfNeeded();
@@ -19674,7 +20788,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-8";
+                static NSString *const kAMModBuildVersion = @"2026.11.27-9";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
