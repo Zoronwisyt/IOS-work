@@ -7100,6 +7100,9 @@ static BOOL AMBackupCopyFilePreserveMeta(NSFileManager *fm, NSString *srcPath, N
                          completion:(void (^ _Nullable)(BOOL ok, NSString *message))completion;
 @end
 
+static volatile int32_t gAMBackupCancelRequested = 0;
+static volatile double gAMLastMemoryPressureEpoch = 0.0;
+
 @implementation AMBackupManager
 
 + (instancetype)shared {
@@ -7143,19 +7146,29 @@ static BOOL AMBackupCopyFilePreserveMeta(NSFileManager *fm, NSString *srcPath, N
     if (self.isBusy) return;
 
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    // Back off background auto-backup if iOS recently signalled memory pressure (avoids background Jetsam kills on SideStore)
+    if (gAMLastMemoryPressureEpoch > 0.0 && (now - gAMLastMemoryPressureEpoch) < 60.0) {
+        return;
+    }
     if (self.lastAutoSaveEpoch > 0 && (now - self.lastAutoSaveEpoch) < 180.0) {
         return; // Throttle automatic background syncs to once every 3 minutes
     }
-    self.lastAutoSaveEpoch = now;
 
     UIApplication *app = [UIApplication sharedApplication];
     __block UIBackgroundTaskIdentifier bgTask = UIBackgroundTaskInvalid;
     bgTask = [app beginBackgroundTaskWithName:@"RockMotionAutoBackup" expirationHandler:^{
+        gAMBackupCancelRequested = 1;
         if (bgTask != UIBackgroundTaskInvalid) {
             [app endBackgroundTask:bgTask];
             bgTask = UIBackgroundTaskInvalid;
         }
     }];
+    if (bgTask == UIBackgroundTaskInvalid) {
+        return;
+    }
+
+    self.lastAutoSaveEpoch = now;
+    gAMBackupCancelRequested = 0;
 
     [self performBackupWithProgress:nil completion:^(BOOL ok, NSString *message) {
         (void)ok;
@@ -7405,30 +7418,35 @@ static BOOL AMBackupCopyFilePreserveMeta(NSFileManager *fm, NSString *srcPath, N
 
     NSUInteger total = entries.count;
     for (NSUInteger i = 0; i < total; i++) {
-        NSDictionary *item = entries[i];
-        NSString *src = item[@"src"];
-        NSString *rel = item[@"rel"];
-        [liveRelSet addObject:rel];
-
-        NSString *dst = [backupRoot stringByAppendingPathComponent:rel];
-        NSError *cpErr = nil;
-        if (!AMBackupCopyFilePreserveMeta(fm, src, dst, &cpErr)) {
-            if (outError && !*outError) *outError = cpErr;
+        if (gAMBackupCancelRequested) {
+            return NO;
         }
+        @autoreleasepool {
+            NSDictionary *item = entries[i];
+            NSString *src = item[@"src"];
+            NSString *rel = item[@"rel"];
+            [liveRelSet addObject:rel];
 
-        // Capture extended attributes (especially com.alightcreative.motion.sceneinfo)
-        NSDictionary<NSString *, NSString *> *xa = AMBackupReadAllXattrs(src);
-        if (xa.count > 0) {
-            xattrsMap[rel] = xa;
-        }
+            NSString *dst = [backupRoot stringByAppendingPathComponent:rel];
+            NSError *cpErr = nil;
+            if (!AMBackupCopyFilePreserveMeta(fm, src, dst, &cpErr)) {
+                if (outError && !*outError) *outError = cpErr;
+            }
 
-        if (progressBlock && (i % 8 == 0 || i + 1 == total)) {
-            float frac = total > 0 ? ((float)(i + 1) / (float)total) : 1.0f;
-            float p = progressBase + progressSpan * (0.85f * frac);
-            NSString *msg = [NSString stringWithFormat:@"Saving files (%lu / %lu)...", (unsigned long)(i + 1), (unsigned long)total];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                progressBlock(p, msg);
-            });
+            // Capture extended attributes (especially com.alightcreative.motion.sceneinfo)
+            NSDictionary<NSString *, NSString *> *xa = AMBackupReadAllXattrs(src);
+            if (xa.count > 0) {
+                xattrsMap[rel] = xa;
+            }
+
+            if (progressBlock && (i % 8 == 0 || i + 1 == total)) {
+                float frac = total > 0 ? ((float)(i + 1) / (float)total) : 1.0f;
+                float p = progressBase + progressSpan * (0.85f * frac);
+                NSString *msg = [NSString stringWithFormat:@"Saving files (%lu / %lu)...", (unsigned long)(i + 1), (unsigned long)total];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    progressBlock(p, msg);
+                });
+            }
         }
     }
 
@@ -7514,6 +7532,7 @@ static BOOL AMBackupCopyFilePreserveMeta(NSFileManager *fm, NSString *srcPath, N
         return;
     }
     self.isBusy = YES;
+    gAMBackupCancelRequested = 0;
 
     dispatch_async(self.ioQueue, ^{
         @autoreleasepool {
@@ -7682,6 +7701,7 @@ static BOOL AMBackupCopyFilePreserveMeta(NSFileManager *fm, NSString *srcPath, N
         return;
     }
     self.isBusy = YES;
+    gAMBackupCancelRequested = 0;
 
     dispatch_async(self.ioQueue, ^{
         @autoreleasepool {
@@ -8385,14 +8405,18 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc) {
 @property (nonatomic, strong, nullable) UIButton *assignFolderButton;
 @property (nonatomic, strong, nullable) AMHomepageFoldersInlineView *inlineFoldersView;
 @property (nonatomic, strong, nullable) NSTimer *pollTimer;
+@property (nonatomic, assign) NSTimeInterval currentPollInterval;
+@property (nonatomic, assign) BOOL isScanningProjects;
+@property (nonatomic, strong) dispatch_queue_t projectScanQueue;
 @property (nonatomic, strong) NSMutableSet<NSString *> *trackedSelectedTitles;
-@property (nonatomic, copy) NSArray<NSDictionary *> *cachedDiskProjects;
-@property (nonatomic, copy) NSSet<NSString *> *cachedProjectTitles;
+@property (nonatomic, copy, nullable) NSArray<NSDictionary *> *cachedDiskProjects;
+@property (nonatomic, copy, nullable) NSSet<NSString *> *cachedProjectTitles;
 @property (nonatomic, assign) NSTimeInterval lastDiskRefresh;
 + (instancetype)shared;
 - (void)start;
 - (void)tick;
 - (void)scheduleImmediateTick;
+- (void)purgeTransientCaches;
 @end
 
 @implementation AMHomepageSearchOverlayManager
@@ -8403,8 +8427,21 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc) {
     dispatch_once(&onceToken, ^{
         inst = [[AMHomepageSearchOverlayManager alloc] init];
         inst.trackedSelectedTitles = [NSMutableSet set];
+        inst.projectScanQueue = dispatch_queue_create("com.rockmotion.projects.scan", DISPATCH_QUEUE_SERIAL);
     });
     return inst;
+}
+
+- (void)setPollInterval:(NSTimeInterval)interval {
+    if (self.pollTimer && fabs(self.currentPollInterval - interval) < 0.01) return;
+    [self.pollTimer invalidate];
+    self.currentPollInterval = interval;
+    self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:interval
+                                                      target:self
+                                                    selector:@selector(tick)
+                                                    userInfo:nil
+                                                     repeats:YES];
+    self.pollTimer.tolerance = interval * 0.25;
 }
 
 - (void)start {
@@ -8414,12 +8451,38 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc) {
                                                  selector:@selector(onAppDidBecomeActive)
                                                      name:UIApplicationDidBecomeActiveNotification
                                                    object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(onAppDidEnterBackground)
+                                                     name:UIApplicationDidEnterBackgroundNotification
+                                                   object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(onAppWillEnterForeground)
+                                                     name:UIApplicationWillEnterForegroundNotification
+                                                   object:nil];
         [self onAppDidBecomeActive];
-        self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:0.15
-                                                          target:self
-                                                        selector:@selector(tick)
-                                                        userInfo:nil
-                                                         repeats:YES];
+        [self setPollInterval:0.25];
+    });
+}
+
+- (void)onAppDidEnterBackground {
+    [self.pollTimer invalidate];
+    self.pollTimer = nil;
+    self.currentPollInterval = 0.0;
+}
+
+- (void)onAppWillEnterForeground {
+    [self setPollInterval:0.25];
+    [self scheduleImmediateTick];
+}
+
+- (void)purgeTransientCaches {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *win = AMKeyWindow();
+        if (!win || !AMIsOnHomepage(win)) {
+            self.cachedDiskProjects = nil;
+            self.cachedProjectTitles = nil;
+            self.lastDiskRefresh = 0.0;
+        }
     });
 }
 
@@ -8445,15 +8508,39 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc) {
 
 - (void)refreshProjectCacheIfNeeded:(BOOL)force {
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (!force && self.cachedDiskProjects && (now - self.lastDiskRefresh) < 4.0) return;
-    self.lastDiskRefresh = now;
-    self.cachedDiskProjects = AMLoadUserProjectsFromDisk();
-    NSMutableSet<NSString *> *titles = [NSMutableSet set];
-    for (NSDictionary *p in self.cachedDiskProjects) {
-        NSString *t = p[@"title"];
-        if (t.length > 0) [titles addObject:t];
+    if (!force && self.cachedDiskProjects && (now - self.lastDiskRefresh) < 15.0) return;
+    if (force && !self.cachedDiskProjects) {
+        self.lastDiskRefresh = now;
+        self.cachedDiskProjects = AMLoadUserProjectsFromDisk();
+        NSMutableSet<NSString *> *titles = [NSMutableSet set];
+        for (NSDictionary *p in self.cachedDiskProjects) {
+            NSString *t = p[@"title"];
+            if (t.length > 0) [titles addObject:t];
+        }
+        self.cachedProjectTitles = titles;
+        return;
     }
-    self.cachedProjectTitles = titles;
+    if (self.isScanningProjects) return;
+    self.isScanningProjects = YES;
+    self.lastDiskRefresh = now;
+    __weak AMHomepageSearchOverlayManager *weakSelf = self;
+    dispatch_async(self.projectScanQueue, ^{
+        @autoreleasepool {
+            NSArray<NSDictionary *> *projects = AMLoadUserProjectsFromDisk();
+            NSMutableSet<NSString *> *titles = [NSMutableSet setWithCapacity:projects.count];
+            for (NSDictionary *p in projects) {
+                NSString *t = p[@"title"];
+                if (t.length > 0) [titles addObject:t];
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                AMHomepageSearchOverlayManager *strongSelf = weakSelf;
+                if (!strongSelf) return;
+                strongSelf.cachedDiskProjects = projects;
+                strongSelf.cachedProjectTitles = titles;
+                strongSelf.isScanningProjects = NO;
+            });
+        }
+    });
 }
 
 - (void)ensureButtonsInHostView:(UIView *)hostView {
@@ -8572,6 +8659,7 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc) {
     UIWindow *win = AMKeyWindow();
     if (!win) return;
     if (!AMIsOnHomepage(win)) {
+        [self setPollInterval:0.60];
         self.searchButton.hidden = YES;
         self.importProjectsButton.hidden = YES;
         self.backupButton.hidden = YES;
@@ -8580,6 +8668,7 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc) {
         self.inlineFoldersView.hidden = YES;
         return;
     }
+    [self setPollInterval:0.25];
 
     UIViewController *mainVC = AMFindMainVCInHierarchy(win.rootViewController, 0);
     UIView *hostView = (mainVC && mainVC.isViewLoaded && mainVC.view.window == win) ? mainVC.view : win;
@@ -8919,6 +9008,7 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc) {
     } completion:^(BOOL finished) {
         (void)finished;
         [self.player pause];
+        [self.player replaceCurrentItemWithPlayerItem:nil];
         [self.playerLayer removeFromSuperlayer];
         self.playerLayer = nil;
         self.player = nil;
@@ -13042,21 +13132,26 @@ static AMAutoBeatsAnalysisResult AMAutoBeatsAnalyzeAudio(const AMAutoBeatsAudioI
     std::vector<float> pcm;
     pcm.reserve((size_t)(decodeDurSec * kSampleRate) + 4096);
     while (reader.status == AVAssetReaderStatusReading) {
-        CMSampleBufferRef sbuf = [output copyNextSampleBuffer];
-        if (!sbuf) break;
-        CMBlockBufferRef bbuf = CMSampleBufferGetDataBuffer(sbuf);
-        if (bbuf) {
-            size_t totalLen = 0;
-            char *dataPtr = NULL;
-            if (CMBlockBufferGetDataPointer(bbuf, 0, NULL, &totalLen, &dataPtr) == kCMBlockBufferNoErr && dataPtr && totalLen >= 4) {
-                size_t nSamp = totalLen / sizeof(float);
-                size_t oldSz = pcm.size();
-                pcm.resize(oldSz + nSamp);
-                memcpy(pcm.data() + oldSz, dataPtr, nSamp * sizeof(float));
+        @autoreleasepool {
+            CMSampleBufferRef sbuf = [output copyNextSampleBuffer];
+            if (!sbuf) break;
+            CMBlockBufferRef bbuf = CMSampleBufferGetDataBuffer(sbuf);
+            if (bbuf) {
+                size_t totalLen = 0;
+                char *dataPtr = NULL;
+                if (CMBlockBufferGetDataPointer(bbuf, 0, NULL, &totalLen, &dataPtr) == kCMBlockBufferNoErr && dataPtr && totalLen >= 4) {
+                    size_t nSamp = totalLen / sizeof(float);
+                    size_t oldSz = pcm.size();
+                    pcm.resize(oldSz + nSamp);
+                    memcpy(pcm.data() + oldSz, dataPtr, nSamp * sizeof(float));
+                }
+            }
+            CFRelease(sbuf);
+            if (pcm.size() > (size_t)(720.0 * kSampleRate)) {
+                [reader cancelReading];
+                break;
             }
         }
-        CFRelease(sbuf);
-        if (pcm.size() > (size_t)(720.0 * kSampleRate)) break;
     }
 
     if (pcm.size() < 2048) {
@@ -14567,6 +14662,128 @@ static void AMHook_keyframeViewDrawRect(id self, SEL _cmd, CGRect rect) {
     CGContextRestoreGState(ctx);
 }
 
+// ============================================================================
+// Module 9: SideStore Stability, Memory-Pressure Guard & Ad-SDK Neutralizer
+// ============================================================================
+
+extern "C" size_t malloc_zone_pressure_relief(void *zone, size_t goal);
+
+static IMP gOrigALSdkInitWithConfig = NULL;
+static void AMHook_alSdkInitWithConfig(id self, SEL _cmd, id config, void (^completion)(id)) {
+    (void)self;
+    (void)_cmd;
+    (void)config;
+    if (completion) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(nil);
+        });
+    }
+}
+
+static IMP gOrigALSdkInitWithCompletion = NULL;
+static void AMHook_alSdkInitWithCompletion(id self, SEL _cmd, void (^completion)(id)) {
+    (void)self;
+    (void)_cmd;
+    if (completion) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(nil);
+        });
+    }
+}
+
+static IMP gOrigGADMobileAdsStart = NULL;
+static void AMHook_gadMobileAdsStart(id self, SEL _cmd, void (^completion)(id)) {
+    (void)self;
+    (void)_cmd;
+    if (completion) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(nil);
+        });
+    }
+}
+
+static IMP gOrigAppAttestGenerateKey = NULL;
+static void AMHook_appAttestGenerateKey(id self, SEL _cmd, void (^completion)(NSString *, NSError *)) {
+    (void)self;
+    (void)_cmd;
+    if (completion) {
+        NSError *err = [NSError errorWithDomain:@"com.apple.devicecheck.error" code:1 userInfo:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(nil, err);
+        });
+    }
+}
+
+static IMP gOrigAppAttestAttestKey = NULL;
+static void AMHook_appAttestAttestKey(id self, SEL _cmd, NSString *keyId, NSData *hash, void (^completion)(NSData *, NSError *)) {
+    (void)self;
+    (void)_cmd;
+    (void)keyId;
+    (void)hash;
+    if (completion) {
+        NSError *err = [NSError errorWithDomain:@"com.apple.devicecheck.error" code:1 userInfo:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(nil, err);
+        });
+    }
+}
+
+static void AMPurgeSideStoreMemoryCaches(BOOL isCritical) {
+    gAMLastMemoryPressureEpoch = [[NSDate date] timeIntervalSince1970];
+    [[NSURLCache sharedURLCache] removeAllCachedResponses];
+    [AMCategoryThumbCache() removeAllObjects];
+    [[AMHomepageSearchOverlayManager shared] purgeTransientCaches];
+    if (isCritical) {
+        malloc_zone_pressure_relief(NULL, 0);
+    }
+}
+
+static void AMInstallSideStoreStabilityGuard(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // Keep shared NSURLCache bounded so WebViews / API responses don't bloat RAM under SideStore Jetsam caps
+        NSURLCache *urlCache = [NSURLCache sharedURLCache];
+        if (urlCache.memoryCapacity > 8 * 1024 * 1024) {
+            urlCache.memoryCapacity = 8 * 1024 * 1024;
+        }
+        if (urlCache.diskCapacity > 32 * 1024 * 1024) {
+            urlCache.diskCapacity = 32 * 1024 * 1024;
+        }
+
+        // Kernel-level memory-pressure dispatch source (fires BEFORE iOS Jetsam kills the app)
+        static dispatch_source_t memSrc = nil;
+        memSrc = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,
+                                        0,
+                                        DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+                                        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+        if (memSrc) {
+            dispatch_source_set_event_handler(memSrc, ^{
+                unsigned long flags = dispatch_source_get_data(memSrc);
+                BOOL critical = (flags & DISPATCH_MEMORYPRESSURE_CRITICAL) != 0;
+                AMPurgeSideStoreMemoryCaches(critical);
+            });
+            dispatch_resume(memSrc);
+        }
+
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidReceiveMemoryWarningNotification
+                                                          object:nil
+                                                           queue:nil
+                                                      usingBlock:^(NSNotification *note) {
+            (void)note;
+            AMPurgeSideStoreMemoryCaches(YES);
+        }];
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                          object:nil
+                                                           queue:nil
+                                                      usingBlock:^(NSNotification *note) {
+            (void)note;
+            [[NSURLCache sharedURLCache] removeAllCachedResponses];
+            [AMCategoryThumbCache() removeAllObjects];
+            malloc_zone_pressure_relief(NULL, 0);
+        }];
+    });
+}
+
 static void AMSwizzleMethod(NSString *className, NSString *selName, IMP replacement, IMP *outOrig) {
     Class cls = NSClassFromString(className);
     if (!cls) return;
@@ -14737,6 +14954,29 @@ static void AlightMotionModsInit(void) {
                     @"setSelectedItem:",
                     (IMP)AMHook_tabBarSetSelectedItem,
                     &gOrigTabBarSetSelectedItem);
+
+    // Module 9: SideStore Stability, Memory-Pressure Guard & Ad-SDK Neutralizer
+    AMSwizzleMethod(@"ALSdk",
+                    @"initializeWithConfiguration:completionHandler:",
+                    (IMP)AMHook_alSdkInitWithConfig,
+                    &gOrigALSdkInitWithConfig);
+    AMSwizzleMethod(@"ALSdk",
+                    @"initializeSdkWithCompletionHandler:",
+                    (IMP)AMHook_alSdkInitWithCompletion,
+                    &gOrigALSdkInitWithCompletion);
+    AMSwizzleMethod(@"GADMobileAds",
+                    @"startWithCompletionHandler:",
+                    (IMP)AMHook_gadMobileAdsStart,
+                    &gOrigGADMobileAdsStart);
+    AMSwizzleMethod(@"DCAppAttestService",
+                    @"generateKeyWithCompletionHandler:",
+                    (IMP)AMHook_appAttestGenerateKey,
+                    &gOrigAppAttestGenerateKey);
+    AMSwizzleMethod(@"DCAppAttestService",
+                    @"attestKey:clientDataHash:completionHandler:",
+                    (IMP)AMHook_appAttestAttestKey,
+                    &gOrigAppAttestAttestKey);
+    AMInstallSideStoreStabilityGuard();
 
     [[AMBackupManager shared] startAutoSaveObservers];
     [[AMHomepageSearchOverlayManager shared] start];
