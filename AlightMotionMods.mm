@@ -18800,4 +18800,60 @@ static void AlightMotionModsInit(void) {
         (void)note;
         [[AMLaunchIntroManager shared] startIfNeeded];
     }];
+
+    // Module 11: GitHub Very-Good-IPA Auto-Update Popup Check
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        (void)note;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                static NSString *const kAMModBuildVersion = @"2026.11.27-1";
+                NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
+                NSURLRequest *req = [NSURLRequest requestWithURL:url
+                                                     cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                 timeoutInterval:10.0];
+                [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+                    (void)resp;
+                    if (err || !data) return;
+                    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                    if (![obj isKindOfClass:[NSDictionary class]]) return;
+                    NSDictionary *info = (NSDictionary *)obj;
+                    NSString *remoteVer = [info[@"version"] isKindOfClass:[NSString class]] ? info[@"version"] : nil;
+                    if (!remoteVer.length || [remoteVer isEqualToString:kAMModBuildVersion]) return;
+                    NSString *notes = [info[@"notes"] isKindOfClass:[NSString class]] ? info[@"notes"] : @"New build synced on GitHub.";
+                    NSString *dlStr = [info[@"downloadURL"] isKindOfClass:[NSString class]] ? info[@"downloadURL"] : @"https://github.com/Zoronwisyt/Very-Good-IPA/releases/latest";
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        UIWindow *win = nil;
+                        if (@available(iOS 13.0, *)) {
+                            for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                                if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+                                for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                                    if (w.isKeyWindow) { win = w; break; }
+                                }
+                                if (win) break;
+                            }
+                        }
+                        if (!win) win = [UIApplication sharedApplication].keyWindow;
+                        UIViewController *topVC = win.rootViewController;
+                        while (topVC.presentedViewController) topVC = topVC.presentedViewController;
+                        if (!topVC) return;
+                        NSString *msg = [NSString stringWithFormat:@"Rock Motion IPA v%@ is synced on GitHub.\n\n%@", remoteVer, notes];
+                        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Update Available"
+                                                                                    message:msg
+                                                                             preferredStyle:UIAlertControllerStyleAlert];
+                        [ac addAction:[UIAlertAction actionWithTitle:@"Update Now" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                            (void)a;
+                            NSURL *dlURL = [NSURL URLWithString:dlStr];
+                            if (dlURL) [[UIApplication sharedApplication] openURL:dlURL options:@{} completionHandler:nil];
+                        }]];
+                        [ac addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:nil]];
+                        [topVC presentViewController:ac animated:YES completion:nil];
+                    });
+                }] resume];
+            });
+        });
+    }];
 }
