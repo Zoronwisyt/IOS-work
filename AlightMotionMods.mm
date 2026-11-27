@@ -1608,6 +1608,7 @@ static void AMHook_effectMainWillDisplayCell(id self, SEL _cmd, UICollectionView
 
 static IMP gOrigURLsForResources = NULL;
 static NSArray<NSURL *> *AMEnsurePuppetSlotXMLs(void);
+static NSArray<NSURL *> *AMEnsureRot3DSlotXMLs(void);
 
 static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd, NSString *ext, NSString *subpath) {
     NSArray<NSURL *> *orig = nil;
@@ -1622,6 +1623,10 @@ static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd,
         NSArray<NSURL *> *puppetURLs = AMEnsurePuppetSlotXMLs();
         if (puppetURLs.count > 0) {
             [merged addObjectsFromArray:puppetURLs];
+        }
+        NSArray<NSURL *> *rot3dURLs = AMEnsureRot3DSlotXMLs();
+        if (rot3dURLs.count > 0) {
+            [merged addObjectsFromArray:rot3dURLs];
         }
         NSString *dir = AMCustomEffectsDir();
         NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
@@ -7838,16 +7843,18 @@ static volatile double gAMLastMemoryPressureEpoch = 0.0;
             if (scoped) [pickedURL stopAccessingSecurityScopedResource];
 
             // Reload in-memory mod stores right away (via runtime lookup to avoid declaration-order coupling)
-            Class puppetCls = NSClassFromString(@"AMPuppetStore");
-            if (puppetCls && [puppetCls respondsToSelector:@selector(shared)]) {
-                id pstore = ((id (*)(id, SEL))objc_msgSend)(puppetCls, @selector(shared));
-                SEL loadSel = NSSelectorFromString(@"loadFromDisk");
-                SEL syncSel = NSSelectorFromString(@"syncAllToRuntime");
-                if (pstore && [pstore respondsToSelector:loadSel]) {
-                    ((void (*)(id, SEL))objc_msgSend)(pstore, loadSel);
-                }
-                if (pstore && [pstore respondsToSelector:syncSel]) {
-                    ((void (*)(id, SEL))objc_msgSend)(pstore, syncSel);
+            for (NSString *storeName in @[@"AMPuppetStore", @"AMRot3DStore"]) {
+                Class storeCls = NSClassFromString(storeName);
+                if (storeCls && [storeCls respondsToSelector:@selector(shared)]) {
+                    id st = ((id (*)(id, SEL))objc_msgSend)(storeCls, @selector(shared));
+                    SEL loadSel = NSSelectorFromString(@"loadFromDisk");
+                    SEL syncSel = NSSelectorFromString(@"syncAllToRuntime");
+                    if (st && [st respondsToSelector:loadSel]) {
+                        ((void (*)(id, SEL))objc_msgSend)(st, loadSel);
+                    }
+                    if (st && [st respondsToSelector:syncSel]) {
+                        ((void (*)(id, SEL))objc_msgSend)(st, syncSel);
+                    }
                 }
             }
 
@@ -10055,35 +10062,47 @@ static NSArray<NSURL *> *AMEnsurePuppetSlotXMLs(void) {
     return cached;
 }
 
-// --- Metal setFragmentBytes Hook (Live Preview + Full-Res Video Export!) ---
+// --- Metal setFragmentBytes Hook (Live Preview + Full-Res Video Export: Puppet + 3D Rotate!) ---
+
+static const float kAMRot3DMagicFloat = 244853.75f;
+static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float headerFloats[16], const uint8_t *inBytes, float *outBuf, NSUInteger pLen, id encoder, SEL _cmd, IMP origFn);
 
 typedef struct {
     __unsafe_unretained id encoder;
+    int kind; // 0 = none, 1 = puppet, 2 = rot3d
     int magicIdx;
     int slot;
     NSUInteger length;
     float headerFloats[16];
 } AMPuppetPendingEncoder;
 
-static thread_local AMPuppetPendingEncoder gAMPendingPuppetEnc = { nil, -1, 0, 0, {0} };
+static thread_local AMPuppetPendingEncoder gAMPendingPuppetEnc = { nil, 0, -1, 0, 0, {0} };
 static IMP gOrigMTLSetFragmentBytes = NULL;
 
 static void AMHook_mtlSetFragmentBytes(id self, SEL _cmd, const void *bytes, NSUInteger length, NSUInteger index) {
-    if (index == 0 && bytes != NULL && length >= 276 && length <= 512) {
+    if (index == 0 && bytes != NULL && length >= 76 && length <= 512) {
         const float *f = (const float *)bytes;
         int maxScan = (int)(length / sizeof(float));
         if (maxScan > 10) maxScan = 10;
         int foundIdx = -1;
+        int foundKind = 0;
         for (int i = 0; i < maxScan - 1; ++i) {
-            if (f[i] == kAMPuppetMagicFloat) {
+            if (length >= 276 && f[i] == kAMPuppetMagicFloat) {
                 foundIdx = i;
+                foundKind = 1;
+                break;
+            }
+            if (length <= 256 && f[i] == kAMRot3DMagicFloat) {
+                foundIdx = i;
+                foundKind = 2;
                 break;
             }
         }
-        if (foundIdx >= 0) {
+        if (foundIdx >= 0 && foundKind > 0) {
             int slot = (int)roundf(f[foundIdx + 1]);
             if (slot >= 1 && slot <= kAMPuppetMaxSlots) {
                 gAMPendingPuppetEnc.encoder = self;
+                gAMPendingPuppetEnc.kind = foundKind;
                 gAMPendingPuppetEnc.magicIdx = foundIdx;
                 gAMPendingPuppetEnc.slot = slot;
                 gAMPendingPuppetEnc.length = length;
@@ -10091,23 +10110,38 @@ static void AMHook_mtlSetFragmentBytes(id self, SEL _cmd, const void *bytes, NSU
                 for (int k = 0; k < copyHdr; ++k) gAMPendingPuppetEnc.headerFloats[k] = f[k];
             } else {
                 gAMPendingPuppetEnc.encoder = nil;
+                gAMPendingPuppetEnc.kind = 0;
             }
         } else if (gAMPendingPuppetEnc.encoder == self) {
             gAMPendingPuppetEnc.encoder = nil;
+            gAMPendingPuppetEnc.kind = 0;
         }
     } else if (index == 1 && bytes != NULL && length == 0x140 && gAMPendingPuppetEnc.encoder == self) {
+        int kind = gAMPendingPuppetEnc.kind;
         int slot = gAMPendingPuppetEnc.slot;
         int magicIdx = gAMPendingPuppetEnc.magicIdx;
         NSUInteger pLen = gAMPendingPuppetEnc.length;
+        float hdrCopy[16];
+        memcpy(hdrCopy, gAMPendingPuppetEnc.headerFloats, sizeof(hdrCopy));
         gAMPendingPuppetEnc.encoder = nil;
+        gAMPendingPuppetEnc.kind = 0;
 
         const uint8_t *inBytes = (const uint8_t *)bytes;
+        if (kind == 2) {
+            float outBuf[64];
+            memset(outBuf, 0, sizeof(outBuf));
+            AMRot3DFillFragmentBuffer(slot, magicIdx, hdrCopy, inBytes, outBuf, pLen, self, _cmd, gOrigMTLSetFragmentBytes);
+            if (gOrigMTLSetFragmentBytes) {
+                ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))gOrigMTLSetFragmentBytes)(self, _cmd, bytes, length, index);
+            }
+            return;
+        }
         float shaderTimeSec = *(const float *)(inBytes + 0x110);
 
         float outBuf[128];
         memset(outBuf, 0, sizeof(outBuf));
         for (int k = 0; k < magicIdx && k < 16; ++k) {
-            outBuf[k] = gAMPendingPuppetEnc.headerFloats[k];
+            outBuf[k] = hdrCopy[k];
         }
         outBuf[magicIdx + 0] = kAMPuppetMagicFloat;
         outBuf[magicIdx + 1] = (float)slot;
@@ -14442,7 +14476,2837 @@ static UIImage *AMAutoBeatsTabIcon(void) {
 
 @end
 
-// --- Native EditingPanelVC Hooks (Adds exact Alight Motion 'Puppet' & 'Auto Beats' Cards!) ---
+// ============================================================================
+// Module 10: Jex Motion 3D Rotation (Metal GPU + 3D Gizmo Rings + ViewCube
+//            + Trackpad + Tick Ruler + Per-Axis Keyframes & Easing Graph)
+// ============================================================================
+
+static const int kAMRot3DMaxSlots = 16;
+static const int kAMRot3DTrackCount = 6; // 0=RotX, 1=RotY, 2=RotZ, 3=PivotX, 4=PivotY, 5=PivotZ
+static const int kAMRot3DMaxKeyframesPerTrack = 64;
+
+typedef struct {
+    int64_t timeMs;
+    float value;
+    int easingType; // 0=Cubic, 1=Step, 2=Elastic, 3=Bounce
+    float p1x;
+    float p1y;
+    float p2x;
+    float p2y;
+    float stepCount;
+} AMRot3DKeyframeC;
+
+typedef struct {
+    float currentValue;
+    int keyframeCount;
+    AMRot3DKeyframeC keyframes[kAMRot3DMaxKeyframesPerTrack];
+} AMRot3DTrackC;
+
+typedef struct {
+    BOOL active;
+    BOOL enabled;
+    uint64_t elementId;
+    int64_t startTimeMs;
+    int64_t endTimeMs;
+    float fov;          // 20..120 deg (Jex default = 60)
+    float zOffset;      // -300..+300 (perspective Z shift)
+    float bend;         // -180..+180 deg (Jex curved 3D plane bend)
+    float lighting;     // 0..1 directional 3D shading
+    int backfaceMode;   // 0=Both, 1=Hide Back, 2=Dim Back
+    BOOL showGizmo;
+    AMRot3DTrackC tracks[kAMRot3DTrackCount];
+} AMRot3DSlotRuntime;
+
+static os_unfair_lock gAMRot3DRuntimeLock = OS_UNFAIR_LOCK_INIT;
+static AMRot3DSlotRuntime gAMRot3DSlots[kAMRot3DMaxSlots + 1];
+static AMPuppetTransformSnapshot gAMRot3DTransforms[kAMRot3DMaxSlots + 1];
+static volatile int64_t gAMRot3DEditorCurrentTimeMs = 0;
+static volatile uint64_t gAMRot3DActiveElementId = 0;
+static volatile int gAMRot3DActiveTrackIndex = 0;
+static volatile BOOL gAMRot3DPanelVisible = NO;
+static volatile int gAMRot3DLastTransformSlotNotified = 0;
+
+static NSString *const kAMRot3DTransformUpdatedNotification = @"AMRot3DTransformUpdatedNotification";
+
+static float AMRot3DDefaultForTrack(int track) {
+    if (track == 3 || track == 4) return 0.5f; // PivotX / PivotY center
+    return 0.0f;
+}
+
+static UIColor *AMRot3DAxisColor(int track) {
+    if (track == 0) return [UIColor colorWithRed:1.00 green:0.30 blue:0.37 alpha:1.0]; // X = Red
+    if (track == 1) return [UIColor colorWithRed:0.20 green:0.83 blue:0.60 alpha:1.0]; // Y = Mint Green
+    if (track == 2) return [UIColor colorWithRed:0.23 green:0.51 blue:0.96 alpha:1.0]; // Z = Blue
+    return AMAccentGreenColor();
+}
+
+static NSString *AMRot3DTrackName(int track) {
+    switch (track) {
+        case 0: return @"Rotation X";
+        case 1: return @"Rotation Y";
+        case 2: return @"Rotation Z";
+        case 3: return @"Pivot X";
+        case 4: return @"Pivot Y";
+        case 5: return @"Pivot Z";
+        default: return @"Axis";
+    }
+}
+
+static NSString *AMRot3DTrackKey(int track) {
+    switch (track) {
+        case 0: return @"rotX";
+        case 1: return @"rotY";
+        case 2: return @"rotZ";
+        case 3: return @"pivotX";
+        case 4: return @"pivotY";
+        case 5: return @"pivotZ";
+        default: return @"rotX";
+    }
+}
+
+// --- Exact Port of Jex Motion Layer3DMath & Layer3DGizmo Math ---
+
+static void AMRot3DMat4Identity(float m[16]) {
+    memset(m, 0, 16 * sizeof(float));
+    m[0] = m[5] = m[10] = m[15] = 1.0f;
+}
+
+static void AMRot3DMat4Mul(float out[16], const float a[16], const float b[16]) {
+    float r[16];
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            r[col * 4 + row] =
+                a[0 * 4 + row] * b[col * 4 + 0] +
+                a[1 * 4 + row] * b[col * 4 + 1] +
+                a[2 * 4 + row] * b[col * 4 + 2] +
+                a[3 * 4 + row] * b[col * 4 + 3];
+        }
+    }
+    memcpy(out, r, sizeof(r));
+}
+
+// Exact Jex Layer3DMath.rotation(float deg, int axis): column-major right-handed rotation
+static void AMRot3DMat4RotationAxis(float m[16], float deg, int axis) {
+    AMRot3DMat4Identity(m);
+    double rad = (double)deg * (M_PI / 180.0);
+    float c = (float)cos(rad);
+    float s = (float)sin(rad);
+    int a = (axis + 1) % 3;
+    int b = (axis + 2) % 3;
+    m[a * 4 + a] = c;
+    m[b * 4 + b] = c;
+    m[a * 4 + b] = s;
+    m[b * 4 + a] = -s;
+}
+
+// Exact Jex Layer3DMath.angles(rx, ry, rz) = Rz(rz) * Ry(ry) * Rx(rx)
+static void AMRot3DMat4Angles(float out[16], float rx, float ry, float rz) {
+    float mx[16], my[16], mz[16], myx[16];
+    AMRot3DMat4RotationAxis(mx, rx, 0);
+    AMRot3DMat4RotationAxis(my, ry, 1);
+    AMRot3DMat4RotationAxis(mz, rz, 2);
+    AMRot3DMat4Mul(myx, my, mx);
+    AMRot3DMat4Mul(out, mz, myx);
+}
+
+// Exact Jex Layer3DMath.euler(float m[16]) with gimbal-lock fallback
+static void AMRot3DEulerFromMat4(const float m[16], float outEuler[3]) {
+    float s = -m[2];
+    if (s > 1.0f) s = 1.0f;
+    if (s < -1.0f) s = -1.0f;
+    double ry = asin((double)s);
+    double rx = 0.0, rz = 0.0;
+    if (fabs(cos(ry)) > 1e-4) {
+        rx = atan2((double)m[6], (double)m[10]);
+        rz = atan2((double)m[1], (double)m[0]);
+    } else {
+        rx = atan2((double)(-m[9]), (double)m[5]);
+        rz = 0.0;
+    }
+    const double rad2deg = 180.0 / M_PI;
+    outEuler[0] = (float)(rx * rad2deg);
+    outEuler[1] = (float)(ry * rad2deg);
+    outEuler[2] = (float)(rz * rad2deg);
+}
+
+static float AMRot3DWrapNear(float angle, float ref) {
+    float diff = fmodf(angle - ref, 360.0f);
+    if (diff > 180.0f) diff -= 360.0f;
+    if (diff < -180.0f) diff += 360.0f;
+    return ref + diff;
+}
+
+// Exact Jex Layer3DGizmo.eulerNear: chooses continuous Euler branch closest to refEuler
+static void AMRot3DEulerNear(const float m[16], const float refEuler[3], float outEuler[3]) {
+    float primary[3];
+    AMRot3DEulerFromMat4(m, primary);
+    float alt[3] = { primary[0] + 180.0f, 180.0f - primary[1], primary[2] + 180.0f };
+    float c1[3], c2[3];
+    float d1 = 0.0f, d2 = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        c1[i] = AMRot3DWrapNear(primary[i], refEuler[i]);
+        c2[i] = AMRot3DWrapNear(alt[i], refEuler[i]);
+        d1 += fabsf(c1[i] - refEuler[i]);
+        d2 += fabsf(c2[i] - refEuler[i]);
+    }
+    if (d2 < d1) {
+        outEuler[0] = c2[0]; outEuler[1] = c2[1]; outEuler[2] = c2[2];
+    } else {
+        outEuler[0] = c1[0]; outEuler[1] = c1[1]; outEuler[2] = c1[2];
+    }
+}
+
+// Exact Jex Layer3DGizmo.localTurn: R_start * R_axis(deltaDeg) -> continuous Euler near ref
+static void AMRot3DLocalTurn(const float startEuler[3], int axis, float deltaDeg, const float refEuler[3], float outEuler[3]) {
+    float baseM[16], turnM[16], combined[16];
+    AMRot3DMat4Angles(baseM, startEuler[0], startEuler[1], startEuler[2]);
+    AMRot3DMat4RotationAxis(turnM, deltaDeg, axis);
+    AMRot3DMat4Mul(combined, baseM, turnM);
+    AMRot3DEulerNear(combined, refEuler, outEuler);
+}
+
+static float AMRot3DEvalTrackAtMs(const AMRot3DTrackC *tr, int64_t timeMs) {
+    if (!tr) return 0.0f;
+    int n = tr->keyframeCount;
+    if (n <= 0) return tr->currentValue;
+    if (n == 1 || timeMs <= tr->keyframes[0].timeMs) return tr->keyframes[0].value;
+    if (timeMs >= tr->keyframes[n - 1].timeMs) return tr->keyframes[n - 1].value;
+    for (int i = 0; i < n - 1; ++i) {
+        const AMRot3DKeyframeC *k0 = &tr->keyframes[i];
+        const AMRot3DKeyframeC *k1 = &tr->keyframes[i + 1];
+        if (timeMs >= k0->timeMs && timeMs <= k1->timeMs) {
+            int64_t dt = k1->timeMs - k0->timeMs;
+            if (dt <= 0) return k1->value;
+            float u = (float)((double)(timeMs - k0->timeMs) / (double)dt);
+            float e = AMPuppetEvalEasing(k0->easingType, k0->p1x, k0->p1y, k0->p2x, k0->p2y, k0->stepCount, u);
+            return k0->value + (k1->value - k0->value) * e;
+        }
+    }
+    return tr->currentValue;
+}
+
+// --- Built-in Internal 3D Rotation Slot XMLs (1..16) with Analytic Metal GPU Shader ---
+
+static NSString *AMRot3DSlotsDir(void) {
+    NSString *dir = [AMCustomEffectsDir() stringByAppendingPathComponent:@"Rot3DSlots"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+static NSString *AMRot3DEffectIdForSlot(int slot) {
+    return [NSString stringWithFormat:@"com.alightcreative.effects.am_rot3d_slot_%d", slot];
+}
+
+static NSString *AMRot3DBuildSlotXML(int slot) {
+    return [NSString stringWithFormat:
+        @"<?xml version='1.0' encoding='UTF-8' ?>\n"
+        @"<effect id=\"com.alightcreative.effects.am_rot3d_slot_%d\" compat=\"acScreenNorm-y\" name=\"3D Rotate\" desc=\"Jex Motion 3D Layer Rotation.\" category=\"3d\" tags=\"3d,rotate,perspective\" thumb=\"thumb/flip.webp\" internal=\"true\" overdraw=\"true\" max-overdraw=\"1.0\" maxOverdraw=\"1.0\">\n"
+        @"    <params>\n"
+        @"        <texture id=\"inputImg\" srcType=\"content\" />\n"
+        @"        <float id=\"amRot3DMagic\" value=\"244853.75\" />\n"
+        @"        <float id=\"rot3DSlot\" value=\"%d.0\" />\n"
+        @"        <float id=\"rotEnabled\" value=\"0.0\" />\n"
+        @"        <float id=\"r00\" value=\"1.0\" />\n"
+        @"        <float id=\"r01\" value=\"0.0\" />\n"
+        @"        <float id=\"r02\" value=\"0.0\" />\n"
+        @"        <float id=\"r10\" value=\"0.0\" />\n"
+        @"        <float id=\"r11\" value=\"1.0\" />\n"
+        @"        <float id=\"r12\" value=\"0.0\" />\n"
+        @"        <float id=\"r20\" value=\"0.0\" />\n"
+        @"        <float id=\"r21\" value=\"0.0\" />\n"
+        @"        <float id=\"r22\" value=\"1.0\" />\n"
+        @"        <float id=\"pivotX\" value=\"0.5\" />\n"
+        @"        <float id=\"pivotY\" value=\"0.5\" />\n"
+        @"        <float id=\"pivotZ\" value=\"0.0\" />\n"
+        @"        <float id=\"camDist\" value=\"0.8660254\" />\n"
+        @"        <float id=\"zOffset\" value=\"0.0\" />\n"
+        @"        <float id=\"bendRad\" value=\"0.0\" />\n"
+        @"        <float id=\"lightingAmt\" value=\"0.0\" />\n"
+        @"        <float id=\"backfaceMode\" value=\"0.0\" />\n"
+        @"    </params>\n"
+        @"    <shader type=\"fragment\" precision=\"high\"><![CDATA[\n"
+        @"        void main() {\n"
+        @"            float keep = acTime * 0.0 + amRot3DMagic * 0.0 + rot3DSlot * 0.0;\n"
+        @"            if (rotEnabled < 0.5) {\n"
+        @"                gl_FragColor = texture2DCv(inputImg.texture, acScreenNorm + vec2(keep, 0.0));\n"
+        @"                return;\n"
+        @"            }\n"
+        @"            vec2 aspect = vec2(acLayerSize.x / max(acLayerSize.y, 1.0), 1.0);\n"
+        @"            vec2 invAspect = vec2(1.0 / max(aspect.x, 0.0001), 1.0);\n"
+        @"            vec2 uv = (acLayerNorm - vec2(pivotX, pivotY)) * aspect;\n"
+        @"            float cd = max(camDist, 0.15);\n"
+        @"            vec3 roP = vec3(0.0, 0.0, cd - zOffset);\n"
+        @"            vec3 rdW = vec3(uv.x, uv.y, -cd);\n"
+        @"            vec3 roL = vec3(\n"
+        @"                r00 * roP.x + r01 * roP.y + r02 * roP.z,\n"
+        @"                r10 * roP.x + r11 * roP.y + r12 * roP.z,\n"
+        @"                r20 * roP.x + r21 * roP.y + r22 * roP.z\n"
+        @"            );\n"
+        @"            vec3 rdL = vec3(\n"
+        @"                r00 * rdW.x + r01 * rdW.y + r02 * rdW.z,\n"
+        @"                r10 * rdW.x + r11 * rdW.y + r12 * rdW.z,\n"
+        @"                r20 * rdW.x + r21 * rdW.y + r22 * rdW.z\n"
+        @"            );\n"
+        @"            vec2 hitXY;\n"
+        @"            float facing;\n"
+        @"            vec3 locNorm = vec3(0.0, 0.0, 1.0);\n"
+        @"            if (abs(bendRad) < 0.008) {\n"
+        @"                if (abs(rdL.z) < 0.00001) { gl_FragColor = vec4(0.0); return; }\n"
+        @"                float t = (-pivotZ - roL.z) / rdL.z;\n"
+        @"                if (t <= 0.0001) { gl_FragColor = vec4(0.0); return; }\n"
+        @"                hitXY = roL.xy + t * rdL.xy;\n"
+        @"                facing = -rdL.z;\n"
+        @"            } else {\n"
+        @"                float span = max(aspect.x, 0.2);\n"
+        @"                float R = span / bendRad;\n"
+        @"                float cz = -pivotZ + R;\n"
+        @"                float ox = roL.x;\n"
+        @"                float oz = roL.z - cz;\n"
+        @"                float qa = rdL.x * rdL.x + rdL.z * rdL.z;\n"
+        @"                float qb = ox * rdL.x + oz * rdL.z;\n"
+        @"                float qc = ox * ox + oz * oz - R * R;\n"
+        @"                float disc = qb * qb - qa * qc;\n"
+        @"                if (disc < 0.0 || qa < 0.000001) { gl_FragColor = vec4(0.0); return; }\n"
+        @"                float sdisc = sqrt(disc);\n"
+        @"                float t1 = (-qb - sdisc) / qa;\n"
+        @"                float t2 = (-qb + sdisc) / qa;\n"
+        @"                float bestT = -1.0;\n"
+        @"                vec2 bestUV = vec2(-10.0, -10.0);\n"
+        @"                float bestFace = 1.0;\n"
+        @"                vec3 bestN = vec3(0.0, 0.0, 1.0);\n"
+        @"                for (int k = 0; k < 2; k++) {\n"
+        @"                    float tk = (k == 0) ? t1 : t2;\n"
+        @"                    if (tk <= 0.0001) continue;\n"
+        @"                    vec3 hp = roL + tk * rdL;\n"
+        @"                    float ang = atan(hp.x, (R > 0.0 ? (cz - hp.z) : (hp.z - cz)));\n"
+        @"                    float arcX = (R > 0.0 ? ang : -ang) * abs(R);\n"
+        @"                    vec2 uvk = vec2(arcX, hp.y) * invAspect + vec2(pivotX, pivotY);\n"
+        @"                    if (uvk.x >= -0.005 && uvk.x <= 1.005 && uvk.y >= -0.005 && uvk.y <= 1.005) {\n"
+        @"                        bestT = tk;\n"
+        @"                        bestUV = vec2(arcX, hp.y);\n"
+        @"                        vec3 rn = normalize(vec3(hp.x, 0.0, hp.z - cz)) * (R > 0.0 ? -1.0 : 1.0);\n"
+        @"                        bestN = rn;\n"
+        @"                        bestFace = -dot(rn, rdL);\n"
+        @"                        break;\n"
+        @"                    }\n"
+        @"                }\n"
+        @"                if (bestT <= 0.0) { gl_FragColor = vec4(0.0); return; }\n"
+        @"                hitXY = bestUV;\n"
+        @"                facing = bestFace;\n"
+        @"                locNorm = bestN;\n"
+        @"            }\n"
+        @"            if (backfaceMode > 0.5 && backfaceMode < 1.5 && facing < 0.0) {\n"
+        @"                gl_FragColor = vec4(0.0);\n"
+        @"                return;\n"
+        @"            }\n"
+        @"            vec2 srcNorm = hitXY * invAspect + vec2(pivotX, pivotY);\n"
+        @"            vec2 pxF = 1.0 / max(acLayerSize, vec2(1.0, 1.0));\n"
+        @"            float inX = smoothstep(-pxF.x, pxF.x, srcNorm.x) * (1.0 - smoothstep(1.0 - pxF.x, 1.0 + pxF.x, srcNorm.x));\n"
+        @"            float inY = smoothstep(-pxF.y, pxF.y, srcNorm.y) * (1.0 - smoothstep(1.0 - pxF.y, 1.0 + pxF.y, srcNorm.y));\n"
+        @"            float mask = inX * inY;\n"
+        @"            if (mask <= 0.0005) { gl_FragColor = vec4(0.0); return; }\n"
+        @"            vec4 sc = vec4(srcNorm, 0.0, 1.0) * acLayerToScreen;\n"
+        @"            vec4 col = texture2DCv(inputImg.texture, sc.xy / sc.w + vec2(keep, 0.0)) * mask;\n"
+        @"            if (backfaceMode >= 1.5 && facing < 0.0) {\n"
+        @"                col.rgb *= 0.52;\n"
+        @"            }\n"
+        @"            if (lightingAmt > 0.001) {\n"
+        @"                vec3 fn = (facing >= 0.0) ? locNorm : -locNorm;\n"
+        @"                vec3 nW = normalize(vec3(\n"
+        @"                    r00 * fn.x + r10 * fn.y + r20 * fn.z,\n"
+        @"                    r01 * fn.x + r11 * fn.y + r21 * fn.z,\n"
+        @"                    r02 * fn.x + r12 * fn.y + r22 * fn.z\n"
+        @"                ));\n"
+        @"                float ndl = max(dot(nW, vec3(0.35, 0.45, 0.82)), 0.0);\n"
+        @"                float shade = mix(1.0, 0.32 + 0.78 * ndl, clamp(lightingAmt, 0.0, 1.0));\n"
+        @"                col.rgb *= shade;\n"
+        @"            }\n"
+        @"            gl_FragColor = col;\n"
+        @"        }\n"
+        @"    ]]></shader>\n"
+        @"</effect>\n",
+        slot, slot];
+}
+
+static NSArray<NSURL *> *AMEnsureRot3DSlotXMLs(void) {
+    static NSArray<NSURL *> *cached = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *dir = AMRot3DSlotsDir();
+        NSString *verFile = [dir stringByAppendingPathComponent:@".rot3d_xml_v1"];
+        BOOL needsWrite = ![[NSFileManager defaultManager] fileExistsAtPath:verFile];
+        NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:kAMRot3DMaxSlots];
+        for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
+            NSString *p = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"am_rot3d_slot_%d.xml", s]];
+            if (needsWrite || ![[NSFileManager defaultManager] fileExistsAtPath:p]) {
+                NSString *xml = AMRot3DBuildSlotXML(s);
+                [xml writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            }
+            [urls addObject:[NSURL fileURLWithPath:p]];
+        }
+        if (needsWrite) {
+            [@"1" writeToFile:verFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+        cached = [urls copy];
+    });
+    return cached;
+}
+
+static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float headerFloats[16], const uint8_t *inBytes, float *outBuf, NSUInteger pLen, id encoder, SEL _cmd, IMP origFn) {
+    float shaderTimeSec = *(const float *)(inBytes + 0x110);
+    for (int k = 0; k < magicIdx && k < 16; ++k) {
+        outBuf[k] = headerFloats[k];
+    }
+    outBuf[magicIdx + 0] = kAMRot3DMagicFloat;
+    outBuf[magicIdx + 1] = (float)slot;
+
+    BOOL notifyTransform = NO;
+    os_unfair_lock_lock(&gAMRot3DRuntimeLock);
+    AMPuppetTransformSnapshot *tr = &gAMRot3DTransforms[slot];
+    BOOL wasValid = tr->valid;
+    BOOL matrixChanged = (!wasValid || memcmp(tr->layerToScreen, inBytes + 0x80, 16 * sizeof(float)) != 0);
+    memcpy(tr->screenToLayer, inBytes + 0x40, 16 * sizeof(float));
+    memcpy(tr->layerToScreen, inBytes + 0x80, 16 * sizeof(float));
+    memcpy(tr->screenSize, inBytes + 0xD0, 2 * sizeof(float));
+    memcpy(tr->layerSize, inBytes + 0xE0, 2 * sizeof(float));
+    tr->lastShaderTime = shaderTimeSec;
+    tr->valid = YES;
+
+    AMRot3DSlotRuntime *rt = &gAMRot3DSlots[slot];
+    if (matrixChanged && (!wasValid || (gAMRot3DPanelVisible && rt->active && rt->elementId == gAMRot3DActiveElementId))) {
+        notifyTransform = YES;
+    }
+
+    if (rt->active && rt->startTimeMs > 50 && gAMRot3DPanelVisible && rt->elementId == gAMRot3DActiveElementId) {
+        double edSec = (double)gAMRot3DEditorCurrentTimeMs / 1000.0;
+        double edLocalSec = (double)(gAMRot3DEditorCurrentTimeMs - rt->startTimeMs) / 1000.0;
+        if (fabs((double)shaderTimeSec - edLocalSec) + 0.02 < fabs((double)shaderTimeSec - edSec)) {
+            tr->timeMode = 1;
+        } else if (fabs((double)shaderTimeSec - edSec) + 0.02 < fabs((double)shaderTimeSec - edLocalSec)) {
+            tr->timeMode = 2;
+        }
+    }
+
+    int64_t evalTimeMs = (int64_t)llround((double)shaderTimeSec * 1000.0);
+    if (tr->timeMode != 2 && rt->startTimeMs > 0) {
+        evalTimeMs = rt->startTimeMs + (int64_t)llround((double)shaderTimeSec * 1000.0);
+    }
+
+    if (rt->active && rt->enabled) {
+        float rx = AMRot3DEvalTrackAtMs(&rt->tracks[0], evalTimeMs);
+        float ry = AMRot3DEvalTrackAtMs(&rt->tracks[1], evalTimeMs);
+        float rz = AMRot3DEvalTrackAtMs(&rt->tracks[2], evalTimeMs);
+        float px = AMRot3DEvalTrackAtMs(&rt->tracks[3], evalTimeMs);
+        float py = AMRot3DEvalTrackAtMs(&rt->tracks[4], evalTimeMs);
+        float pz = AMRot3DEvalTrackAtMs(&rt->tracks[5], evalTimeMs) / 500.0f;
+        float fov = fminf(fmaxf(rt->fov, 15.0f), 140.0f);
+        float camDist = 0.5f / tanf(fov * (float)(M_PI / 360.0));
+        float zOff = rt->zOffset / 500.0f;
+        float bendRad = rt->bend * (float)(M_PI / 180.0);
+        float lightAmt = fminf(fmaxf(rt->lighting, 0.0f), 1.0f);
+        float bfMode = (float)rt->backfaceMode;
+
+        // Exact identity fast-path when all transforms are zero (zero resampling blur)
+        BOOL isIdentity = (fabsf(rx) < 0.001f && fabsf(ry) < 0.001f && fabsf(rz) < 0.001f &&
+                           fabsf(pz) < 0.0005f && fabsf(zOff) < 0.0005f && fabsf(bendRad) < 0.005f &&
+                           lightAmt < 0.001f);
+        if (isIdentity) {
+            outBuf[magicIdx + 2] = 0.0f;
+        } else {
+            float R[16];
+            AMRot3DMat4Angles(R, rx, ry, rz);
+            // Upload R^T rows (= columns of column-major R)
+            outBuf[magicIdx + 2]  = 1.0f;
+            outBuf[magicIdx + 3]  = R[0];  outBuf[magicIdx + 4]  = R[1];  outBuf[magicIdx + 5]  = R[2];
+            outBuf[magicIdx + 6]  = R[4];  outBuf[magicIdx + 7]  = R[5];  outBuf[magicIdx + 8]  = R[6];
+            outBuf[magicIdx + 9]  = R[8];  outBuf[magicIdx + 10] = R[9];  outBuf[magicIdx + 11] = R[10];
+            outBuf[magicIdx + 12] = px;
+            outBuf[magicIdx + 13] = py;
+            outBuf[magicIdx + 14] = pz;
+            outBuf[magicIdx + 15] = camDist;
+            outBuf[magicIdx + 16] = zOff;
+            outBuf[magicIdx + 17] = bendRad;
+            outBuf[magicIdx + 18] = lightAmt;
+            outBuf[magicIdx + 19] = bfMode;
+        }
+    } else {
+        outBuf[magicIdx + 2] = 0.0f;
+    }
+    os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
+
+    if (origFn) {
+        NSUInteger uploadLen = (pLen <= 64 * sizeof(float)) ? pLen : 64 * sizeof(float);
+        ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))origFn)(encoder, _cmd, outBuf, uploadLen, 0);
+    }
+    if (notifyTransform) {
+        int prev = gAMRot3DLastTransformSlotNotified;
+        if (prev != slot) {
+            gAMRot3DLastTransformSlotNotified = slot;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                gAMRot3DLastTransformSlotNotified = 0;
+                [[NSNotificationCenter defaultCenter] postNotificationName:kAMRot3DTransformUpdatedNotification object:@(slot)];
+            });
+        }
+    }
+}
+
+// --- Persistent 3D Rotation Store (Documents/AMRot3DData.json) ---
+
+@interface AMRot3DStore : NSObject
++ (instancetype)shared;
+- (NSMutableDictionary *)layerDictForSlot:(int)slot create:(BOOL)create elementId:(uint64_t)elementId;
+- (NSMutableDictionary *)layerDictForElementId:(uint64_t)elementId;
+- (int)slotForElementId:(uint64_t)elementId;
+- (void)bindSlot:(int)slot toElementId:(uint64_t)elementId startTimeMs:(int64_t)startMs endTimeMs:(int64_t)endMs;
+- (void)loadFromDisk;
+- (void)syncAllToRuntime;
+- (void)save;
+@end
+
+@implementation AMRot3DStore {
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *_slots;
+}
+
++ (instancetype)shared {
+    static AMRot3DStore *inst = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        inst = [[AMRot3DStore alloc] init];
+    });
+    return inst;
+}
+
+- (NSString *)storePath {
+    NSArray<NSString *> *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return [docs.firstObject stringByAppendingPathComponent:@"AMRot3DData.json"];
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _slots = [NSMutableDictionary dictionary];
+        [self loadFromDisk];
+        [self syncAllToRuntime];
+    }
+    return self;
+}
+
+- (void)loadFromDisk {
+    [_slots removeAllObjects];
+    NSData *data = [NSData dataWithContentsOfFile:[self storePath]];
+    if (!data) return;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *slots = ((NSDictionary *)obj)[@"slots"];
+        if ([slots isKindOfClass:[NSDictionary class]]) {
+            for (NSString *k in slots) {
+                if ([slots[k] isKindOfClass:[NSMutableDictionary class]]) {
+                    _slots[k] = slots[k];
+                } else if ([slots[k] isKindOfClass:[NSDictionary class]]) {
+                    _slots[k] = [slots[k] mutableCopy];
+                }
+            }
+        }
+    }
+}
+
+- (void)save {
+    [self syncAllToRuntime];
+    NSDictionary *root = @{@"version": @1, @"slots": _slots ?: @{}};
+    NSData *data = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
+    if (data) {
+        [data writeToFile:[self storePath] atomically:YES];
+    }
+}
+
+- (NSMutableDictionary *)layerDictForSlot:(int)slot create:(BOOL)create elementId:(uint64_t)elementId {
+    if (slot < 1 || slot > kAMRot3DMaxSlots) return nil;
+    NSString *key = [NSString stringWithFormat:@"%d", slot];
+    NSMutableDictionary *d = _slots[key];
+    if (!d && create) {
+        NSMutableDictionary *tracks = [NSMutableDictionary dictionary];
+        for (int t = 0; t < kAMRot3DTrackCount; ++t) {
+            tracks[AMRot3DTrackKey(t)] = [NSMutableDictionary dictionaryWithDictionary:@{
+                @"v": @(AMRot3DDefaultForTrack(t)),
+                @"keyframes": [NSMutableArray array]
+            }];
+        }
+        d = [NSMutableDictionary dictionaryWithDictionary:@{
+            @"slot": @(slot),
+            @"elementId": @(elementId),
+            @"enabled": @(YES),
+            @"startTimeMs": @(0),
+            @"endTimeMs": @(5000),
+            @"fov": @(60.0),
+            @"zOffset": @(0.0),
+            @"bend": @(0.0),
+            @"lighting": @(0.0),
+            @"backfaceMode": @(0),
+            @"showGizmo": @(YES),
+            @"tracks": tracks
+        }];
+        _slots[key] = d;
+    }
+    return d;
+}
+
+- (NSMutableDictionary *)layerDictForElementId:(uint64_t)elementId {
+    if (elementId == 0) return nil;
+    for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
+        NSMutableDictionary *d = _slots[[NSString stringWithFormat:@"%d", s]];
+        if (d && [d[@"elementId"] unsignedLongLongValue] == elementId) {
+            return d;
+        }
+    }
+    return nil;
+}
+
+- (int)slotForElementId:(uint64_t)elementId {
+    NSMutableDictionary *d = [self layerDictForElementId:elementId];
+    return d ? [d[@"slot"] intValue] : 0;
+}
+
+- (void)bindSlot:(int)slot toElementId:(uint64_t)elementId startTimeMs:(int64_t)startMs endTimeMs:(int64_t)endMs {
+    NSMutableDictionary *d = [self layerDictForSlot:slot create:YES elementId:elementId];
+    if (!d) return;
+    d[@"slot"] = @(slot);
+    d[@"elementId"] = @(elementId);
+    if (startMs >= 0) d[@"startTimeMs"] = @(startMs);
+    if (endMs > startMs) d[@"endTimeMs"] = @(endMs);
+    if (![d[@"tracks"] isKindOfClass:[NSMutableDictionary class]]) {
+        d[@"tracks"] = d[@"tracks"] ? [d[@"tracks"] mutableCopy] : [NSMutableDictionary dictionary];
+    }
+    for (int t = 0; t < kAMRot3DTrackCount; ++t) {
+        NSString *tk = AMRot3DTrackKey(t);
+        if (![d[@"tracks"][tk] isKindOfClass:[NSMutableDictionary class]]) {
+            d[@"tracks"][tk] = [NSMutableDictionary dictionaryWithDictionary:@{
+                @"v": @(AMRot3DDefaultForTrack(t)),
+                @"keyframes": [NSMutableArray array]
+            }];
+        }
+    }
+    [self save];
+}
+
+- (void)syncAllToRuntime {
+    os_unfair_lock_lock(&gAMRot3DRuntimeLock);
+    for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
+        AMRot3DSlotRuntime *rt = &gAMRot3DSlots[s];
+        memset(rt, 0, sizeof(*rt));
+        NSDictionary *d = _slots[[NSString stringWithFormat:@"%d", s]];
+        if (!d) continue;
+        rt->active = YES;
+        rt->enabled = (d[@"enabled"] == nil) ? YES : [d[@"enabled"] boolValue];
+        rt->elementId = [d[@"elementId"] unsignedLongLongValue];
+        rt->startTimeMs = [d[@"startTimeMs"] longLongValue];
+        rt->endTimeMs = [d[@"endTimeMs"] longLongValue];
+        rt->fov = d[@"fov"] ? [d[@"fov"] floatValue] : 60.0f;
+        if (rt->fov < 15.0f || rt->fov > 140.0f) rt->fov = 60.0f;
+        rt->zOffset = [d[@"zOffset"] floatValue];
+        rt->bend = [d[@"bend"] floatValue];
+        rt->lighting = [d[@"lighting"] floatValue];
+        rt->backfaceMode = [d[@"backfaceMode"] intValue];
+        rt->showGizmo = (d[@"showGizmo"] == nil) ? YES : [d[@"showGizmo"] boolValue];
+        NSDictionary *tracks = [d[@"tracks"] isKindOfClass:[NSDictionary class]] ? d[@"tracks"] : @{};
+        for (int t = 0; t < kAMRot3DTrackCount; ++t) {
+            AMRot3DTrackC *tc = &rt->tracks[t];
+            NSDictionary *td = [tracks[AMRot3DTrackKey(t)] isKindOfClass:[NSDictionary class]] ? tracks[AMRot3DTrackKey(t)] : nil;
+            tc->currentValue = td[@"v"] ? [td[@"v"] floatValue] : AMRot3DDefaultForTrack(t);
+            NSArray *kfs = [td[@"keyframes"] isKindOfClass:[NSArray class]] ? td[@"keyframes"] : @[];
+            int kn = (int)kfs.count;
+            if (kn > kAMRot3DMaxKeyframesPerTrack) kn = kAMRot3DMaxKeyframesPerTrack;
+            tc->keyframeCount = kn;
+            for (int k = 0; k < kn; ++k) {
+                NSDictionary *kd = kfs[k];
+                AMRot3DKeyframeC *kc = &tc->keyframes[k];
+                kc->timeMs = [kd[@"t"] longLongValue];
+                kc->value = [kd[@"v"] floatValue];
+                kc->easingType = [kd[@"easingType"] intValue];
+                kc->p1x = kd[@"p1x"] ? [kd[@"p1x"] floatValue] : 0.42f;
+                kc->p1y = kd[@"p1y"] ? [kd[@"p1y"] floatValue] : 0.0f;
+                kc->p2x = kd[@"p2x"] ? [kd[@"p2x"] floatValue] : 0.58f;
+                kc->p2y = kd[@"p2y"] ? [kd[@"p2y"] floatValue] : 1.0f;
+                kc->stepCount = kd[@"stepCount"] ? [kd[@"stepCount"] floatValue] : 4.0f;
+            }
+        }
+    }
+    os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
+}
+
+@end
+
+// --- Native SceneElement Effect Attachment for 3D Rotation Slots ---
+
+static AMPuppetAttachCtx gAMRot3DAttachCtx;
+
+static int AMRot3DMatchSlotFromSwiftString(uint64_t strLo, uint64_t strHi, intptr_t slide) {
+    typedef uint8_t (*AMStrEqFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint8_t);
+    AMStrEqFn strEq = (AMStrEqFn)(0x1025b7bb8ULL + slide);
+    static AMSwiftString slotStrs[kAMRot3DMaxSlots + 1];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
+            slotStrs[s] = AMMakeSwiftString(AMRot3DEffectIdForSlot(s));
+        }
+    });
+    for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
+        if (strLo == slotStrs[s].lo && strHi == slotStrs[s].hi) return s;
+        if (strEq && (strEq(strLo, strHi, slotStrs[s].lo, slotStrs[s].hi, 0) & 1)) return s;
+    }
+    return 0;
+}
+
+static void AMRot3DAttachEditCallback(void *scenePtr) {
+    if (!scenePtr || gAMRot3DAttachCtx.targetElementId == 0) return;
+    intptr_t slide = AMMainBinarySlide();
+
+    typedef void *(*MetaFn)(uintptr_t);
+    typedef void (*DestroyFn)(void *, void *);
+    typedef void *(*BridgeRetainFn)(void *);
+
+    void *sceneMeta = ((MetaFn)(0x1003c6b10ULL + slide))(0);
+    void *elMeta = ((MetaFn)(0x1003e0404ULL + slide))(0);
+    void *efMeta = ((MetaFn)(0x100459f90ULL + slide))(0);
+    if (!sceneMeta || !elMeta || !efMeta) return;
+
+    int32_t elementsOff = *(int32_t *)((uint8_t *)sceneMeta + 0x1c);
+    void *elVWT = *(void **)((uint8_t *)elMeta - 8);
+    uint8_t elAlignMask = *(uint8_t *)((uint8_t *)elVWT + 0x50);
+    size_t elStride = *(size_t *)((uint8_t *)elVWT + 0x48);
+    int32_t startOff = *(int32_t *)((uint8_t *)elMeta + 0x14);
+    int32_t endOff = *(int32_t *)((uint8_t *)elMeta + 0x18);
+    int32_t vfxOff = *(int32_t *)((uint8_t *)elMeta + 0x78);
+
+    void *efVWT = *(void **)((uint8_t *)efMeta - 8);
+    uint8_t efAlignMask = *(uint8_t *)((uint8_t *)efVWT + 0x50);
+    size_t efSize = *(size_t *)((uint8_t *)efVWT + 0x40);
+    size_t efStride = *(size_t *)((uint8_t *)efVWT + 0x48);
+    int32_t efIdOff = *(int32_t *)((uint8_t *)efMeta + 0x14);
+    int32_t efParamsOff = *(int32_t *)((uint8_t *)efMeta + 0x18);
+    int32_t efRenderGroupOff = *(int32_t *)((uint8_t *)efMeta + 0x1c);
+    int32_t efDisabledOff = *(int32_t *)((uint8_t *)efMeta + 0x20);
+    int32_t efLocalOff = *(int32_t *)((uint8_t *)efMeta + 0x24);
+    int32_t efHiddenOff = *(int32_t *)((uint8_t *)efMeta + 0x28);
+
+    void *makeUnique = dlsym(RTLD_DEFAULT, "$sSa36_makeUniqueAndReserveCapacityIfNotUniqueyyF");
+    void **elementsField = (void **)((uint8_t *)scenePtr + elementsOff);
+    if (makeUnique && *elementsField) {
+        struct { uint64_t selfPtr, metaPtr, fnPtr; } uArgs = {
+            (uint64_t)elementsField, (uint64_t)elMeta, (uint64_t)makeUnique
+        };
+        __asm__ volatile(
+            "mov x9, %0\n"
+            "ldr x20, [x9, #0]\n"
+            "ldr x0,  [x9, #8]\n"
+            "ldr x16, [x9, #16]\n"
+            "blr x16\n"
+            :
+            : "r"(&uArgs)
+            : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+              "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+              "x16", "x17", "x20", "x30", "memory"
+        );
+    }
+
+    void *arrStorage = *elementsField;
+    if (!arrStorage) return;
+    int64_t count = *(int64_t *)((uint8_t *)arrStorage + 0x10);
+    size_t elHdrOff = (0x20 + (size_t)elAlignMask) & ~(size_t)elAlignMask;
+    uint8_t *basePtr = (uint8_t *)arrStorage + elHdrOff;
+    size_t efHdrOff = (0x20 + (size_t)efAlignMask) & ~(size_t)efAlignMask;
+
+    BOOL usedSlots[kAMRot3DMaxSlots + 1];
+    memset(usedSlots, 0, sizeof(usedSlots));
+    uint8_t *targetEl = NULL;
+    int existingSlot = 0;
+
+    for (int64_t i = 0; i < count; ++i) {
+        uint8_t *elPtr = basePtr + (size_t)i * elStride;
+        uint64_t eid = *(uint64_t *)(elPtr + 0x18);
+        void *vfxArr = *(void **)(elPtr + vfxOff);
+        if (vfxArr) {
+            int64_t vcnt = *(int64_t *)((uint8_t *)vfxArr + 0x10);
+            if (vcnt > 0 && vcnt < 256) {
+                uint8_t *efBase = (uint8_t *)vfxArr + efHdrOff;
+                for (int64_t j = 0; j < vcnt; ++j) {
+                    uint8_t *efPtr = efBase + (size_t)j * efStride;
+                    uint64_t slo = *(uint64_t *)(efPtr + efIdOff);
+                    uint64_t shi = *(uint64_t *)(efPtr + efIdOff + 8);
+                    int matched = AMRot3DMatchSlotFromSwiftString(slo, shi, slide);
+                    if (matched >= 1 && matched <= kAMRot3DMaxSlots) {
+                        usedSlots[matched] = YES;
+                        if (eid == gAMRot3DAttachCtx.targetElementId && existingSlot == 0) {
+                            existingSlot = matched;
+                        }
+                    }
+                }
+            }
+        }
+        if (eid == gAMRot3DAttachCtx.targetElementId) {
+            targetEl = elPtr;
+        }
+    }
+
+    if (!targetEl) return;
+    gAMRot3DAttachCtx.startTimeMs = *(int64_t *)(targetEl + startOff);
+    gAMRot3DAttachCtx.endTimeMs = *(int64_t *)(targetEl + endOff);
+
+    if (existingSlot > 0) {
+        gAMRot3DAttachCtx.assignedSlot = existingSlot;
+        return;
+    }
+    if (!gAMRot3DAttachCtx.shouldAttachIfMissing) return;
+
+    int chosenSlot = [[AMRot3DStore shared] slotForElementId:gAMRot3DAttachCtx.targetElementId];
+    if (chosenSlot < 1 || chosenSlot > kAMRot3DMaxSlots || usedSlots[chosenSlot]) {
+        chosenSlot = 0;
+        for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
+            if (!usedSlots[s]) { chosenSlot = s; break; }
+        }
+    }
+    if (chosenSlot == 0) chosenSlot = 1;
+
+    void *emptyDict = dlsym(RTLD_DEFAULT, "_swiftEmptyDictionarySingleton");
+    void *emptySet = dlsym(RTLD_DEFAULT, "_swiftEmptySetSingleton");
+    if (!emptyDict || !emptySet) return;
+    BridgeRetainFn bridgeRetain = (BridgeRetainFn)(0x1025bb41cULL + slide);
+
+    uint8_t *efBuf = (uint8_t *)calloc(1, efSize + 32);
+    if (!efBuf) return;
+
+    arc4random_buf(efBuf, 16);
+    efBuf[6] = (efBuf[6] & 0x0F) | 0x40;
+    efBuf[8] = (efBuf[8] & 0x3F) | 0x80;
+
+    AMSwiftString idStr = AMMakeSwiftString(AMRot3DEffectIdForSlot(chosenSlot));
+    *(uint64_t *)(efBuf + efIdOff) = idStr.lo;
+    *(uint64_t *)(efBuf + efIdOff + 8) = idStr.hi;
+
+    bridgeRetain(emptyDict);
+    *(void **)(efBuf + efParamsOff) = emptyDict;
+
+    *(int64_t *)(efBuf + efRenderGroupOff) = 0;
+
+    bridgeRetain(emptySet);
+    *(void **)(efBuf + efDisabledOff) = emptySet;
+
+    *(uint8_t *)(efBuf + efLocalOff) = 1;
+    *(uint8_t *)(efBuf + efHiddenOff) = 0;
+
+    uintptr_t addEfAddr = (uintptr_t)(0x1006e89dcULL + slide);
+    struct { uint64_t elPtr, efPtr, fn; } aeArgs = {
+        (uint64_t)targetEl, (uint64_t)efBuf, (uint64_t)addEfAddr
+    };
+    __asm__ volatile(
+        "mov x9, %0\n"
+        "ldr x0,  [x9, #0]\n"
+        "mov x1,  #0\n"
+        "mov x2,  #0\n"
+        "mov x3,  #0\n"
+        "mov x4,  #0\n"
+        "ldr x5,  [x9, #8]\n"
+        "ldr x16, [x9, #16]\n"
+        "blr x16\n"
+        :
+        : "r"(&aeArgs)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+          "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+          "x16", "x17", "x20", "x30", "memory",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"
+    );
+
+    ((DestroyFn)(0x1000199c0ULL + slide))(efBuf, (void *)(0x100459f90ULL + slide));
+    free(efBuf);
+
+    gAMRot3DAttachCtx.assignedSlot = chosenSlot;
+    gAMRot3DAttachCtx.didAttach = YES;
+}
+
+static int AMRot3DSyncOrAttachEffect(void *holder, uint64_t elementId, BOOL attachIfMissing, int64_t *outStartMs, int64_t *outEndMs) {
+    if (!holder || elementId == 0) return 0;
+    intptr_t slide = AMMainBinarySlide();
+
+    memset(&gAMRot3DAttachCtx, 0, sizeof(gAMRot3DAttachCtx));
+    gAMRot3DAttachCtx.targetElementId = elementId;
+    gAMRot3DAttachCtx.shouldAttachIfMissing = attachIfMissing;
+
+    struct { uint64_t cb, holderPtr, fn; } peArgs = {
+        (uint64_t)AMRot3DAttachEditCallback, (uint64_t)holder, (uint64_t)(0x100392588ULL + slide)
+    };
+    __asm__ volatile(
+        "mov x9, %0\n"
+        "mov w0, #4\n"
+        "mov x1, #0\n"
+        "mov w2, #2\n"
+        "ldr x3,  [x9, #0]\n"
+        "mov x4, #0\n"
+        "ldr x20, [x9, #8]\n"
+        "ldr x16, [x9, #16]\n"
+        "blr x16\n"
+        :
+        : "r"(&peArgs)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+          "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+          "x16", "x17", "x20", "x30", "memory",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"
+    );
+
+    if (outStartMs) *outStartMs = gAMRot3DAttachCtx.startTimeMs;
+    if (outEndMs) *outEndMs = gAMRot3DAttachCtx.endTimeMs;
+    int slot = gAMRot3DAttachCtx.assignedSlot;
+    if (slot >= 1 && slot <= kAMRot3DMaxSlots) {
+        [[AMRot3DStore shared] bindSlot:slot
+                            toElementId:elementId
+                            startTimeMs:gAMRot3DAttachCtx.startTimeMs
+                              endTimeMs:gAMRot3DAttachCtx.endTimeMs];
+    }
+    return slot;
+}
+
+// --- Crisp Alight Motion Vector Icon for 3D Rotate Card ---
+
+static UIImage *AMRot3DTabIcon(void) {
+    static UIImage *img = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        CGSize sz = CGSizeMake(28.0, 28.0);
+        UIGraphicsBeginImageContextWithOptions(sz, NO, 0.0);
+        CGContextRef ctx = UIGraphicsGetCurrentContext();
+        [[UIColor whiteColor] setStroke];
+        [[UIColor whiteColor] setFill];
+        CGContextSetLineCap(ctx, kCGLineCapRound);
+        CGContextSetLineJoin(ctx, kCGLineJoinRound);
+
+        // Outer Z orbit ring
+        UIBezierPath *outer = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(4.0, 4.0, 20.0, 20.0)];
+        outer.lineWidth = 1.5;
+        [outer stroke];
+
+        // Tilted Y meridian ellipse
+        UIBezierPath *meridian = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(9.5, 4.0, 9.0, 20.0)];
+        meridian.lineWidth = 1.4;
+        [meridian stroke];
+
+        // Tilted X equator ellipse
+        UIBezierPath *equator = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(4.0, 9.5, 20.0, 9.0)];
+        equator.lineWidth = 1.4;
+        [equator stroke];
+
+        // Center pivot dot
+        UIBezierPath *dot = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(12.2, 12.2, 3.6, 3.6)];
+        [dot fill];
+
+        img = [UIGraphicsGetImageFromCurrentImageContext() imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        UIGraphicsEndImageContext();
+    });
+    return img;
+}
+
+// --- Interactive 3D Gizmo Rings + Perspective Quad + ViewCube Overlay ---
+
+@protocol AMRot3DCanvasOverlayDelegate <NSObject>
+- (void)rot3DCanvasDidSelectAxis:(int)axis;
+- (void)rot3DCanvasDidUpdateEulerX:(float)rx y:(float)ry z:(float)rz ended:(BOOL)ended;
+- (void)rot3DCanvasDidTapViewCubePreset;
+@end
+
+@interface AMRot3DCanvasOverlayView : UIView
+@property (nonatomic, weak) id<AMRot3DCanvasOverlayDelegate> delegate;
+@property (nonatomic, weak) UIView *previewView;
+@property (nonatomic, assign) int slot;
+@property (nonatomic, assign) int64_t currentTimeMs;
+@property (nonatomic, assign) int activeAxis; // 0=X, 1=Y, 2=Z
+@property (nonatomic, assign) BOOL showGizmo;
+@end
+
+@implementation AMRot3DCanvasOverlayView {
+    int _dragAxis; // -1=none, 0=X ring, 1=Y ring, 2=Z ring, 3=free trackball
+    float _startEuler[3];
+    float _lastEuler[3];
+    float _startAngle;
+    float _ringSign;
+    CGPoint _lastTouchPt;
+    CGPoint _pivotViewPt;
+    float _ringDeltaDeg;
+    CGRect _viewCubeRect;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor clearColor];
+        self.opaque = NO;
+        self.multipleTouchEnabled = YES;
+        _dragAxis = -1;
+        _showGizmo = YES;
+    }
+    return self;
+}
+
+- (AVPlayerLayer *)hostPlayerLayer {
+    UIView *pv = self.previewView;
+    if (!pv) return nil;
+    if ([pv respondsToSelector:@selector(playerLayer)]) {
+        AVPlayerLayer *pl = ((AVPlayerLayer *(*)(id, SEL))objc_msgSend)(pv, @selector(playerLayer));
+        if ([pl isKindOfClass:[AVPlayerLayer class]]) return pl;
+    }
+    for (CALayer *sub in pv.layer.sublayers) {
+        if ([sub isKindOfClass:[AVPlayerLayer class]]) return (AVPlayerLayer *)sub;
+    }
+    return nil;
+}
+
+- (BOOL)getSnapshot:(AMPuppetTransformSnapshot *)outSnap runtime:(AMRot3DSlotRuntime *)outRt {
+    if (self.slot < 1 || self.slot > kAMRot3DMaxSlots) return NO;
+    os_unfair_lock_lock(&gAMRot3DRuntimeLock);
+    if (outSnap) *outSnap = gAMRot3DTransforms[self.slot];
+    if (outRt) *outRt = gAMRot3DSlots[self.slot];
+    os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
+    return outSnap ? outSnap->valid : YES;
+}
+
+- (CGPoint)viewPointFromLayerNorm:(CGPoint)ln snapshot:(const AMPuppetTransformSnapshot *)snap {
+    AVPlayerLayer *pl = [self hostPlayerLayer];
+    UIView *pv = self.previewView;
+    if (!pl || !pv) return CGPointMake(self.bounds.size.width * ln.x, self.bounds.size.height * (1.0 - ln.y));
+    CGRect vr = pl.videoRect;
+    if (vr.size.width < 1.0 || vr.size.height < 1.0) vr = pl.bounds;
+    if (vr.size.width < 1.0 || vr.size.height < 1.0) return CGPointMake(self.bounds.size.width * ln.x, self.bounds.size.height * (1.0 - ln.y));
+    CGPoint screenUV = (snap && snap->valid) ? AMPuppetMulRowMat4(ln, snap->layerToScreen) : ln;
+    CGPoint ptPL = CGPointMake(vr.origin.x + screenUV.x * vr.size.width,
+                               vr.origin.y + (1.0 - screenUV.y) * vr.size.height);
+    CGPoint ptPV = [pv.layer convertPoint:ptPL fromLayer:pl];
+    return [self convertPoint:ptPV fromView:pv];
+}
+
+// Project a local 3D point (lx, ly, lz) in layer-aspect space through R + perspective into view coordinates
+- (BOOL)projectLocal3D:(float)lx y:(float)ly z:(float)lz
+                     R:(const float[16])R
+                pivotX:(float)px pivotY:(float)py
+               camDist:(float)cd zOffset:(float)zOff
+                aspect:(float)asp
+              snapshot:(const AMPuppetTransformSnapshot *)snap
+               outView:(CGPoint *)outPt
+                outZ:(float *)outZ {
+    float wx = R[0] * lx + R[4] * ly + R[8]  * lz;
+    float wy = R[1] * lx + R[5] * ly + R[9]  * lz;
+    float wz = R[2] * lx + R[6] * ly + R[10] * lz + zOff;
+    float denom = cd - wz;
+    if (denom < 0.05f) return NO;
+    float scale = cd / denom;
+    float sx = (wx * scale) / fmaxf(asp, 0.0001f) + px;
+    float sy = (wy * scale) + py;
+    if (outPt) *outPt = [self viewPointFromLayerNorm:CGPointMake(sx, sy) snapshot:snap];
+    if (outZ) *outZ = wz;
+    return YES;
+}
+
+- (void)evalCurrentState:(const AMRot3DSlotRuntime *)rt euler:(float[3])euler pivot:(float[3])pivot {
+    int64_t tMs = self.currentTimeMs;
+    euler[0] = AMRot3DEvalTrackAtMs(&rt->tracks[0], tMs);
+    euler[1] = AMRot3DEvalTrackAtMs(&rt->tracks[1], tMs);
+    euler[2] = AMRot3DEvalTrackAtMs(&rt->tracks[2], tMs);
+    pivot[0] = AMRot3DEvalTrackAtMs(&rt->tracks[3], tMs);
+    pivot[1] = AMRot3DEvalTrackAtMs(&rt->tracks[4], tMs);
+    pivot[2] = AMRot3DEvalTrackAtMs(&rt->tracks[5], tMs) / 500.0f;
+}
+
+- (int)hitTestRingAtPoint:(CGPoint)pt outRingSign:(float *)outSign outPivot:(CGPoint *)outPivot {
+    AMPuppetTransformSnapshot snap;
+    AMRot3DSlotRuntime rt;
+    if (![self getSnapshot:&snap runtime:&rt] || !rt.active || !self.showGizmo) return -1;
+
+    float euler[3], piv[3], R[16];
+    [self evalCurrentState:&rt euler:euler pivot:piv];
+    AMRot3DMat4Angles(R, euler[0], euler[1], euler[2]);
+    float asp = (snap.layerSize[1] > 1.0f) ? (snap.layerSize[0] / snap.layerSize[1]) : 1.0f;
+    float fov = fminf(fmaxf(rt.fov, 15.0f), 140.0f);
+    float cd = 0.5f / tanf(fov * (float)(M_PI / 360.0));
+    float zOff = rt.zOffset / 500.0f;
+    float ringR = 0.36f * fminf(asp, 1.0f);
+    if (ringR < 0.22f) ringR = 0.22f;
+
+    CGPoint pivView = CGPointZero;
+    float pivZ = 0.0f;
+    [self projectLocal3D:0 y:0 z:0 R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&pivView outZ:&pivZ];
+    if (outPivot) *outPivot = pivView;
+
+    int bestAxis = -1;
+    CGFloat bestDist = 22.0;
+    const int steps = 40;
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int i = 0; i < steps; ++i) {
+            float a = (float)i * (float)(2.0 * M_PI / steps);
+            float ca = cosf(a) * ringR, sa = sinf(a) * ringR;
+            float lx = 0, ly = 0, lz = 0;
+            if (axis == 0) { ly = ca; lz = sa; }
+            else if (axis == 1) { lx = ca; lz = sa; }
+            else { lx = ca; ly = sa; }
+            CGPoint vp;
+            float wz = 0.0f;
+            if (![self projectLocal3D:lx y:ly z:lz R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&vp outZ:&wz]) continue;
+            CGFloat d = hypot(pt.x - vp.x, pt.y - vp.y);
+            // Slightly prefer front-facing ring segments
+            CGFloat score = d + ((wz < pivZ) ? 5.0 : 0.0);
+            if (score < bestDist) {
+                bestDist = score;
+                bestAxis = axis;
+            }
+        }
+    }
+    if (bestAxis >= 0 && outSign) {
+        // World-space Z component of grabbed axis determines clockwise vs CCW screen spin
+        float axisZ = R[bestAxis * 4 + 2];
+        *outSign = (axisZ >= 0.0f) ? -1.0f : 1.0f;
+    }
+    return bestAxis;
+}
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.hidden || self.alpha < 0.01 || !self.userInteractionEnabled) return nil;
+    if (!CGRectContainsPoint(self.bounds, point)) return nil;
+    if (event && event.allTouches.count >= 2) return nil;
+    if (CGRectContainsPoint(_viewCubeRect, point)) return self;
+    if (self.showGizmo) {
+        if ([self hitTestRingAtPoint:point outRingSign:NULL outPivot:NULL] >= 0) return self;
+    }
+    return nil;
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (event.allTouches.count >= 2) { _dragAxis = -1; return; }
+    UITouch *t = [touches anyObject];
+    if (!t) return;
+    CGPoint pt = [t locationInView:self];
+    if (CGRectContainsPoint(_viewCubeRect, pt)) {
+        _dragAxis = -1;
+        [self.delegate rot3DCanvasDidTapViewCubePreset];
+        return;
+    }
+    float sign = 1.0f;
+    CGPoint pivPt = CGPointZero;
+    int axis = [self hitTestRingAtPoint:pt outRingSign:&sign outPivot:&pivPt];
+    if (axis >= 0) {
+        AMRot3DSlotRuntime rt;
+        [self getSnapshot:NULL runtime:&rt];
+        float piv[3];
+        [self evalCurrentState:&rt euler:_startEuler pivot:piv];
+        memcpy(_lastEuler, _startEuler, sizeof(_lastEuler));
+        _dragAxis = axis;
+        _ringSign = sign;
+        _pivotViewPt = pivPt;
+        _startAngle = atan2f((float)(pt.y - pivPt.y), (float)(pt.x - pivPt.x));
+        _lastTouchPt = pt;
+        _ringDeltaDeg = 0.0f;
+        self.activeAxis = axis;
+        [self.delegate rot3DCanvasDidSelectAxis:axis];
+        [self setNeedsDisplay];
+    }
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (event.allTouches.count >= 2 || _dragAxis < 0 || _dragAxis > 2) return;
+    UITouch *t = [touches anyObject];
+    if (!t) return;
+    CGPoint pt = [t locationInView:self];
+    float curAngle = atan2f((float)(pt.y - _pivotViewPt.y), (float)(pt.x - _pivotViewPt.x));
+    float dRad = curAngle - _startAngle;
+    while (dRad > (float)M_PI) dRad -= (float)(2.0 * M_PI);
+    while (dRad < -(float)M_PI) dRad += (float)(2.0 * M_PI);
+    _startAngle = curAngle;
+    _ringDeltaDeg += dRad * (float)(180.0 / M_PI) * _ringSign;
+
+    float nextEuler[3];
+    AMRot3DLocalTurn(_startEuler, _dragAxis, _ringDeltaDeg, _lastEuler, nextEuler);
+    memcpy(_lastEuler, nextEuler, sizeof(_lastEuler));
+    [self.delegate rot3DCanvasDidUpdateEulerX:nextEuler[0] y:nextEuler[1] z:nextEuler[2] ended:NO];
+    [self setNeedsDisplay];
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)touches; (void)event;
+    if (_dragAxis >= 0 && _dragAxis <= 2) {
+        [self.delegate rot3DCanvasDidUpdateEulerX:_lastEuler[0] y:_lastEuler[1] z:_lastEuler[2] ended:YES];
+    }
+    _dragAxis = -1;
+    _ringDeltaDeg = 0.0f;
+    [self setNeedsDisplay];
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)touches; (void)event;
+    _dragAxis = -1;
+    _ringDeltaDeg = 0.0f;
+    [self setNeedsDisplay];
+}
+
+// Exact Jex Layer3DViewCube painter-sorted 3D orientation cube + X/Y/Z axis arrows
+- (void)drawViewCubeInContext:(CGContextRef)ctx rotationMatrix:(const float[16])R {
+    CGFloat boxSz = 56.0;
+    _viewCubeRect = CGRectMake(self.bounds.size.width - boxSz - 12.0, 12.0, boxSz, boxSz);
+    CGPoint c = CGPointMake(CGRectGetMidX(_viewCubeRect), CGRectGetMidY(_viewCubeRect));
+
+    UIBezierPath *bg = [UIBezierPath bezierPathWithRoundedRect:_viewCubeRect cornerRadius:12.0];
+    [[UIColor colorWithRed:0.08 green:0.09 blue:0.14 alpha:0.78] setFill];
+    [bg fill];
+    [[UIColor colorWithWhite:1.0 alpha:0.12] setStroke];
+    bg.lineWidth = 1.0;
+    [bg stroke];
+
+    // 8 cube corners (±11) projected with Jex perspective 100/(z+100)
+    float corners[8][3];
+    for (int i = 0; i < 8; ++i) {
+        float x = (i & 1) ? 11.0f : -11.0f;
+        float y = (i & 2) ? 11.0f : -11.0f;
+        float z = (i & 4) ? 11.0f : -11.0f;
+        float rx = R[0] * x + R[4] * y + R[8]  * z;
+        float ry = R[1] * x + R[5] * y + R[9]  * z;
+        float rz = R[2] * x + R[6] * y + R[10] * z;
+        float sc = 100.0f / (100.0f - rz);
+        corners[i][0] = rx * sc;
+        corners[i][1] = -ry * sc;
+        corners[i][2] = rz;
+    }
+
+    static const int faces[6][4] = {
+        {0, 2, 3, 1}, // -Z back
+        {4, 5, 7, 6}, // +Z front
+        {0, 1, 5, 4}, // -Y bottom
+        {2, 6, 7, 3}, // +Y top
+        {0, 4, 6, 2}, // -X left
+        {1, 3, 7, 5}  // +X right
+    };
+    int order[6] = {0, 1, 2, 3, 4, 5};
+    float fDepth[6];
+    for (int f = 0; f < 6; ++f) {
+        fDepth[f] = 0.25f * (corners[faces[f][0]][2] + corners[faces[f][1]][2] + corners[faces[f][2]][2] + corners[faces[f][3]][2]);
+    }
+    for (int i = 0; i < 6; ++i) {
+        for (int j = i + 1; j < 6; ++j) {
+            if (fDepth[order[j]] < fDepth[order[i]]) {
+                int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+            }
+        }
+    }
+
+    for (int idx = 0; idx < 6; ++idx) {
+        int f = order[idx];
+        UIBezierPath *fp = [UIBezierPath bezierPath];
+        for (int k = 0; k < 4; ++k) {
+            int vi = faces[f][k];
+            CGPoint p = CGPointMake(c.x + corners[vi][0], c.y + corners[vi][1]);
+            if (k == 0) [fp moveToPoint:p]; else [fp addLineToPoint:p];
+        }
+        [fp closePath];
+        UIColor *fillCol = (f == 1)
+            ? [AMAccentGreenColor() colorWithAlphaComponent:0.42]
+            : [UIColor colorWithRed:0.22 green:0.25 blue:0.35 alpha:0.65];
+        [fillCol setFill];
+        [fp fill];
+        [[UIColor colorWithWhite:1.0 alpha:0.38] setStroke];
+        fp.lineWidth = 0.9;
+        [fp stroke];
+    }
+
+    // 3 axis arrows (X=Red, Y=Green, Z=Blue, length 22)
+    for (int a = 0; a < 3; ++a) {
+        float vx = R[a * 4 + 0] * 21.0f;
+        float vy = R[a * 4 + 1] * 21.0f;
+        float vz = R[a * 4 + 2] * 21.0f;
+        float sc = 100.0f / (100.0f - vz);
+        CGPoint tip = CGPointMake(c.x + vx * sc, c.y - vy * sc);
+        CGContextSaveGState(ctx);
+        [AMRot3DAxisColor(a) setStroke];
+        CGContextSetLineWidth(ctx, 1.8);
+        CGContextMoveToPoint(ctx, c.x, c.y);
+        CGContextAddLineToPoint(ctx, tip.x, tip.y);
+        CGContextStrokePath(ctx);
+        [AMRot3DAxisColor(a) setFill];
+        CGContextFillEllipseInRect(ctx, CGRectMake(tip.x - 2.2, tip.y - 2.2, 4.4, 4.4));
+        CGContextRestoreGState(ctx);
+    }
+}
+
+- (void)drawRect:(CGRect)rect {
+    (void)rect;
+    if (self.slot < 1 || self.slot > kAMRot3DMaxSlots) return;
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) return;
+
+    AMPuppetTransformSnapshot snap;
+    AMRot3DSlotRuntime rt;
+    if (![self getSnapshot:&snap runtime:&rt] || !rt.active) return;
+
+    float euler[3], piv[3], R[16];
+    [self evalCurrentState:&rt euler:euler pivot:piv];
+    AMRot3DMat4Angles(R, euler[0], euler[1], euler[2]);
+
+    // Always draw miniature Jex 3D ViewCube in top-right of preview
+    [self drawViewCubeInContext:ctx rotationMatrix:R];
+
+    if (!self.showGizmo || !snap.valid) return;
+
+    float asp = (snap.layerSize[1] > 1.0f) ? (snap.layerSize[0] / snap.layerSize[1]) : 1.0f;
+    float fov = fminf(fmaxf(rt.fov, 15.0f), 140.0f);
+    float cd = 0.5f / tanf(fov * (float)(M_PI / 360.0));
+    float zOff = rt.zOffset / 500.0f;
+
+    // 1. Projected 3D layer quad outline
+    float qx[4] = { (0.0f - piv[0]) * asp, (1.0f - piv[0]) * asp, (1.0f - piv[0]) * asp, (0.0f - piv[0]) * asp };
+    float qy[4] = { (0.0f - piv[1]),       (0.0f - piv[1]),       (1.0f - piv[1]),       (1.0f - piv[1]) };
+    CGPoint quadPts[4];
+    BOOL quadOk = YES;
+    for (int i = 0; i < 4; ++i) {
+        if (![self projectLocal3D:qx[i] y:qy[i] z:-piv[2] R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&quadPts[i] outZ:NULL]) {
+            quadOk = NO;
+            break;
+        }
+    }
+    if (quadOk) {
+        CGContextSaveGState(ctx);
+        CGFloat dash[] = {5.0, 4.0};
+        CGContextSetLineDash(ctx, 0.0, dash, 2);
+        CGContextSetLineWidth(ctx, 1.2);
+        [[AMAccentGreenColor() colorWithAlphaComponent:0.55] setStroke];
+        CGContextMoveToPoint(ctx, quadPts[0].x, quadPts[0].y);
+        for (int i = 1; i < 4; ++i) CGContextAddLineToPoint(ctx, quadPts[i].x, quadPts[i].y);
+        CGContextClosePath(ctx);
+        CGContextStrokePath(ctx);
+        CGContextRestoreGState(ctx);
+    }
+
+    // 2. 3D Rotation Gizmo Rings (X=Red, Y=Green, Z=Blue) centered at 3D pivot
+    CGPoint pivView = CGPointZero;
+    float pivZ = 0.0f;
+    if (![self projectLocal3D:0 y:0 z:0 R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&pivView outZ:&pivZ]) return;
+
+    float ringR = 0.36f * fminf(asp, 1.0f);
+    if (ringR < 0.22f) ringR = 0.22f;
+
+    const int steps = 48;
+    NSArray<NSString *> *axisLetters = @[@"X", @"Y", @"Z"];
+    NSDictionary *lblAttrs = @{
+        NSFontAttributeName: AMThemeFont(9.5, UIFontWeightBold),
+        NSForegroundColorAttributeName: [UIColor whiteColor]
+    };
+
+    for (int axis = 0; axis < 3; ++axis) {
+        BOOL isActive = (axis == _dragAxis) || (_dragAxis < 0 && axis == self.activeAxis);
+        UIColor *col = AMRot3DAxisColor(axis);
+        CGPoint prevPt = CGPointZero;
+        float prevZ = 0.0f;
+        BOOL hasPrev = NO;
+        CGPoint bestLabelPt = pivView;
+        float bestLabelZ = -1e9f;
+
+        for (int i = 0; i <= steps; ++i) {
+            float a = (float)i * (float)(2.0 * M_PI / steps);
+            float ca = cosf(a) * ringR, sa = sinf(a) * ringR;
+            float lx = 0, ly = 0, lz = 0;
+            if (axis == 0) { ly = ca; lz = sa; }
+            else if (axis == 1) { lx = ca; lz = sa; }
+            else { lx = ca; ly = sa; }
+            CGPoint vp;
+            float wz = 0.0f;
+            if (![self projectLocal3D:lx y:ly z:lz R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&vp outZ:&wz]) {
+                hasPrev = NO;
+                continue;
+            }
+            if (wz > bestLabelZ && i < steps) {
+                bestLabelZ = wz;
+                bestLabelPt = vp;
+            }
+            if (hasPrev) {
+                BOOL front = (0.5f * (prevZ + wz)) >= (pivZ - 0.02f);
+                CGContextSaveGState(ctx);
+                CGContextSetLineCap(ctx, kCGLineCapRound);
+                if (front) {
+                    [[col colorWithAlphaComponent:(isActive ? 1.0 : 0.78)] setStroke];
+                    CGContextSetLineWidth(ctx, isActive ? 2.8 : 1.9);
+                } else {
+                    [[col colorWithAlphaComponent:(isActive ? 0.42 : 0.25)] setStroke];
+                    CGContextSetLineWidth(ctx, isActive ? 1.8 : 1.2);
+                    CGFloat bdash[] = {3.0, 3.0};
+                    CGContextSetLineDash(ctx, 0.0, bdash, 2);
+                }
+                CGContextMoveToPoint(ctx, prevPt.x, prevPt.y);
+                CGContextAddLineToPoint(ctx, vp.x, vp.y);
+                CGContextStrokePath(ctx);
+                CGContextRestoreGState(ctx);
+            }
+            prevPt = vp;
+            prevZ = wz;
+            hasPrev = YES;
+        }
+
+        // Axis badge pill on front-most ring apex
+        CGRect pill = CGRectMake(bestLabelPt.x - 8.0, bestLabelPt.y - 8.0, 16.0, 16.0);
+        UIBezierPath *pb = [UIBezierPath bezierPathWithOvalInRect:pill];
+        [[col colorWithAlphaComponent:(isActive ? 0.96 : 0.80)] setFill];
+        [pb fill];
+        NSString *letter = axisLetters[axis];
+        CGSize lsz = [letter sizeWithAttributes:lblAttrs];
+        [letter drawAtPoint:CGPointMake(CGRectGetMidX(pill) - lsz.width * 0.5, CGRectGetMidY(pill) - lsz.height * 0.5) withAttributes:lblAttrs];
+    }
+
+    // 3. Pivot crosshair
+    CGContextSaveGState(ctx);
+    [[UIColor whiteColor] setStroke];
+    CGContextSetLineWidth(ctx, 1.5);
+    CGContextStrokeEllipseInRect(ctx, CGRectMake(pivView.x - 5.0, pivView.y - 5.0, 10.0, 10.0));
+    CGContextMoveToPoint(ctx, pivView.x - 8.0, pivView.y);
+    CGContextAddLineToPoint(ctx, pivView.x + 8.0, pivView.y);
+    CGContextMoveToPoint(ctx, pivView.x, pivView.y - 8.0);
+    CGContextAddLineToPoint(ctx, pivView.x, pivView.y + 8.0);
+    CGContextStrokePath(ctx);
+    CGContextRestoreGState(ctx);
+
+    // 4. Live drag delta badge
+    if (_dragAxis >= 0 && _dragAxis <= 2) {
+        NSString *badge = [NSString stringWithFormat:@"%@ %+.1f°", axisLetters[_dragAxis], _ringDeltaDeg];
+        NSDictionary *bAttrs = @{
+            NSFontAttributeName: AMThemeFont(12.0, UIFontWeightBold),
+            NSForegroundColorAttributeName: [UIColor whiteColor]
+        };
+        CGSize bsz = [badge sizeWithAttributes:bAttrs];
+        CGRect br = CGRectMake(pivView.x - bsz.width * 0.5 - 8.0, pivView.y - 34.0, bsz.width + 16.0, bsz.height + 8.0);
+        UIBezierPath *bp = [UIBezierPath bezierPathWithRoundedRect:br cornerRadius:7.0];
+        [[UIColor colorWithRed:0.08 green:0.09 blue:0.14 alpha:0.92] setFill];
+        [bp fill];
+        [AMRot3DAxisColor(_dragAxis) setStroke];
+        bp.lineWidth = 1.2;
+        [bp stroke];
+        [badge drawAtPoint:CGPointMake(br.origin.x + 8.0, br.origin.y + 4.0) withAttributes:bAttrs];
+    }
+}
+
+@end
+
+// --- Jex-Style 3D Rotation Trackpad (1-Finger X/Y, 2-Finger Z) ---
+
+@interface AMRot3DTouchPadView : UIView
+@property (nonatomic, assign) BOOL pivotMode;
+@property (nonatomic, copy) void (^onDragDelta)(float dx, float dy, BOOL twoFingerZ, BOOL ended);
+@end
+
+@implementation AMRot3DTouchPadView {
+    CGPoint _lastCenter;
+    BOOL _wasTwoFinger;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = AMInputSurfaceColor();
+        self.layer.cornerRadius = 8.0;
+        self.layer.borderWidth = 1.0;
+        self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.09].CGColor;
+        self.multipleTouchEnabled = YES;
+    }
+    return self;
+}
+
+- (CGPoint)centroidForEvent:(UIEvent *)event fallback:(NSSet<UITouch *> *)touches count:(NSUInteger *)outCount {
+    NSSet<UITouch *> *all = [event touchesForView:self];
+    if (all.count == 0) all = touches;
+    CGFloat sx = 0.0, sy = 0.0;
+    NSUInteger n = 0;
+    for (UITouch *t in all) {
+        if (t.phase == UITouchPhaseEnded || t.phase == UITouchPhaseCancelled) continue;
+        CGPoint p = [t locationInView:self];
+        sx += p.x; sy += p.y; n++;
+    }
+    if (outCount) *outCount = n;
+    return (n > 0) ? CGPointMake(sx / (CGFloat)n, sy / (CGFloat)n) : CGPointZero;
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    NSUInteger n = 0;
+    _lastCenter = [self centroidForEvent:event fallback:touches count:&n];
+    _wasTwoFinger = (n >= 2);
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    NSUInteger n = 0;
+    CGPoint c = [self centroidForEvent:event fallback:touches count:&n];
+    if (n == 0) return;
+    BOOL two = (n >= 2);
+    if (two != _wasTwoFinger) {
+        _wasTwoFinger = two;
+        _lastCenter = c;
+        return;
+    }
+    float dx = (float)(c.x - _lastCenter.x);
+    float dy = (float)(c.y - _lastCenter.y);
+    _lastCenter = c;
+    if (self.onDragDelta) self.onDragDelta(dx, dy, two, NO);
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    NSUInteger n = 0;
+    CGPoint c = [self centroidForEvent:event fallback:touches count:&n];
+    if (n > 0) {
+        _lastCenter = c;
+        _wasTwoFinger = (n >= 2);
+        return;
+    }
+    _wasTwoFinger = NO;
+    if (self.onDragDelta) self.onDragDelta(0.0f, 0.0f, NO, YES);
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)touches; (void)event;
+    _wasTwoFinger = NO;
+    if (self.onDragDelta) self.onDragDelta(0.0f, 0.0f, NO, YES);
+}
+
+- (void)drawRect:(CGRect)rect {
+    (void)rect;
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) return;
+    CGFloat w = self.bounds.size.width;
+    CGFloat h = self.bounds.size.height;
+    CGContextSaveGState(ctx);
+    [[UIColor colorWithWhite:1.0 alpha:0.06] setStroke];
+    CGContextSetLineWidth(ctx, 1.0);
+    CGContextMoveToPoint(ctx, w * 0.5, 8.0);
+    CGContextAddLineToPoint(ctx, w * 0.5, h - 8.0);
+    CGContextMoveToPoint(ctx, 8.0, h * 0.5);
+    CGContextAddLineToPoint(ctx, w - 8.0, h * 0.5);
+    CGContextStrokePath(ctx);
+    CGFloat r = fmin(w, h) * 0.34;
+    CGContextStrokeEllipseInRect(ctx, CGRectMake(w * 0.5 - r, h * 0.5 - r, r * 2.0, r * 2.0));
+    CGContextRestoreGState(ctx);
+}
+
+@end
+
+// --- Native Alight Motion / Jex Horizontal Axis Tick Ruler ---
+
+@interface AMRot3DTickRulerView : UIView
+@property (nonatomic, assign) float value;
+@property (nonatomic, assign) float sensitivity; // units per pt
+@property (nonatomic, strong) UIColor *accentColor;
+@property (nonatomic, copy) void (^onValueDelta)(float delta, BOOL ended);
+@end
+
+@implementation AMRot3DTickRulerView {
+    CGFloat _lastX;
+    float _tickPhase;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = AMInputSurfaceColor();
+        self.layer.cornerRadius = 7.0;
+        self.layer.borderWidth = 1.0;
+        self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.09].CGColor;
+        _sensitivity = 0.5f;
+        _accentColor = AMAccentGreenColor();
+    }
+    return self;
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)event;
+    UITouch *t = [touches anyObject];
+    if (t) _lastX = [t locationInView:self].x;
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)event;
+    UITouch *t = [touches anyObject];
+    if (!t) return;
+    CGFloat x = [t locationInView:self].x;
+    CGFloat dx = x - _lastX;
+    _lastX = x;
+    _tickPhase = fmodf(_tickPhase + (float)dx, 10.0f);
+    [self setNeedsDisplay];
+    if (self.onValueDelta) self.onValueDelta((float)dx * self.sensitivity, NO);
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)touches; (void)event;
+    if (self.onValueDelta) self.onValueDelta(0.0f, YES);
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)touches; (void)event;
+    if (self.onValueDelta) self.onValueDelta(0.0f, YES);
+}
+
+- (void)drawRect:(CGRect)rect {
+    (void)rect;
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) return;
+    CGFloat w = self.bounds.size.width;
+    CGFloat h = self.bounds.size.height;
+    CGFloat spacing = 10.0;
+    CGFloat phase = _tickPhase;
+    if (phase < 0.0) phase += spacing;
+
+    CGContextSaveGState(ctx);
+    int idx = 0;
+    for (CGFloat x = phase; x < w; x += spacing, ++idx) {
+        BOOL major = (idx % 5 == 0);
+        CGFloat th = major ? h * 0.48 : h * 0.26;
+        CGFloat distFrac = fabs(x - w * 0.5) / fmax(w * 0.5, 1.0);
+        CGFloat alpha = fmax(0.12, (1.0 - distFrac * 0.8) * (major ? 0.65 : 0.35));
+        [[UIColor colorWithWhite:1.0 alpha:alpha] setStroke];
+        CGContextSetLineWidth(ctx, major ? 1.5 : 1.0);
+        CGContextMoveToPoint(ctx, x, (h - th) * 0.5);
+        CGContextAddLineToPoint(ctx, x, (h + th) * 0.5);
+        CGContextStrokePath(ctx);
+    }
+    // Center needle
+    [(self.accentColor ?: AMAccentGreenColor()) setStroke];
+    CGContextSetLineWidth(ctx, 2.0);
+    CGContextMoveToPoint(ctx, w * 0.5, 4.0);
+    CGContextAddLineToPoint(ctx, w * 0.5, h - 4.0);
+    CGContextStrokePath(ctx);
+    CGContextRestoreGState(ctx);
+}
+
+@end
+
+// --- Per-Axis Easing Graph Editor for 3D Rotation (reuses AMPuppetGraphCanvasView!) ---
+
+@interface AMRot3DGraphPanelVC : UIViewController
+@property (nonatomic, assign) int slot;
+@property (nonatomic, assign) int trackIndex;
+@property (nonatomic, assign) NSInteger keyframeIndex;
+@property (nonatomic, assign) void *holder;
+@property (nonatomic, copy) void (^onDidModify)(void);
+@property (nonatomic, copy) void (^onRequestSeekMs)(int64_t targetMs);
+@end
+
+@implementation AMRot3DGraphPanelVC {
+    AMPuppetGraphCanvasView *_canvas;
+    UILabel *_titleLabel;
+    UILabel *_segmentLabel;
+    UIButton *_pasteBtn;
+    UISegmentedControl *_modeSeg;
+}
+
+- (NSMutableArray *)keyframesArray {
+    NSMutableDictionary *ld = [[AMRot3DStore shared] layerDictForSlot:self.slot create:NO elementId:0];
+    NSMutableDictionary *td = ld[@"tracks"][AMRot3DTrackKey(self.trackIndex)];
+    return [td[@"keyframes"] isKindOfClass:[NSMutableArray class]] ? td[@"keyframes"] : nil;
+}
+
+- (NSMutableDictionary *)currentKeyframeDict {
+    NSMutableArray *kfs = [self keyframesArray];
+    if (self.keyframeIndex >= 0 && self.keyframeIndex + 1 < (NSInteger)kfs.count) {
+        return kfs[self.keyframeIndex];
+    }
+    return nil;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = AMBgColor();
+
+    UIView *header = [[UIView alloc] init];
+    header.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:header];
+
+    UIButton *backBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    backBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImage *backImg = [UIImage imageNamed:@"ic_back"];
+    if (!backImg) {
+        if (@available(iOS 13.0, *)) backImg = [UIImage systemImageNamed:@"chevron.left"];
+    }
+    if (backImg) [backBtn setImage:[backImg imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+    backBtn.tintColor = [UIColor whiteColor];
+    [backBtn addTarget:self action:@selector(onTapBack) forControlEvents:UIControlEventTouchUpInside];
+    [header addSubview:backBtn];
+
+    _titleLabel = [[UILabel alloc] init];
+    _titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _titleLabel.font = AMThemeFont(12.5, UIFontWeightBold);
+    _titleLabel.textColor = [UIColor whiteColor];
+    [header addSubview:_titleLabel];
+
+    UIButton *prevSeg = [self makePill:@"◀" action:@selector(onPrevSegment)];
+    _segmentLabel = [[UILabel alloc] init];
+    _segmentLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _segmentLabel.font = AMThemeFont(10.5, UIFontWeightSemibold);
+    _segmentLabel.textColor = AMRot3DAxisColor(self.trackIndex);
+    UIButton *nextSeg = [self makePill:@"▶" action:@selector(onNextSegment)];
+    UIButton *copyBtn = [self makePill:@"Copy" action:@selector(onCopyCurve)];
+    _pasteBtn = [self makePill:@"Paste" action:@selector(onPasteCurve)];
+
+    UIStackView *rightBar = [[UIStackView alloc] initWithArrangedSubviews:@[prevSeg, _segmentLabel, nextSeg, copyBtn, _pasteBtn]];
+    rightBar.translatesAutoresizingMaskIntoConstraints = NO;
+    rightBar.axis = UILayoutConstraintAxisHorizontal;
+    rightBar.spacing = 4.0;
+    rightBar.alignment = UIStackViewAlignmentCenter;
+    [header addSubview:rightBar];
+
+    _canvas = [[AMPuppetGraphCanvasView alloc] init];
+    _canvas.translatesAutoresizingMaskIntoConstraints = NO;
+    __weak __typeof__(self) weakSelf = self;
+    _canvas.onCurveChanged = ^(BOOL ended) {
+        [weakSelf commitCanvasToKeyframeSave:ended];
+    };
+    [self.view addSubview:_canvas];
+
+    _modeSeg = [[UISegmentedControl alloc] initWithItems:@[@"Cubic", @"Step", @"Elastic", @"Bounce"]];
+    _modeSeg.translatesAutoresizingMaskIntoConstraints = NO;
+    _modeSeg.backgroundColor = AMSurfaceColor();
+    if (@available(iOS 13.0, *)) _modeSeg.selectedSegmentTintColor = AMRot3DAxisColor(self.trackIndex);
+    [_modeSeg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.82 alpha:1.0],
+                                       NSFontAttributeName: AMThemeFont(10.0, UIFontWeightSemibold)} forState:UIControlStateNormal];
+    [_modeSeg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithRed:0.06 green:0.08 blue:0.12 alpha:1.0],
+                                       NSFontAttributeName: AMThemeFont(10.0, UIFontWeightBold)} forState:UIControlStateSelected];
+    [_modeSeg addTarget:self action:@selector(onModeChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.view addSubview:_modeSeg];
+
+    UIStackView *presets = [[UIStackView alloc] initWithArrangedSubviews:@[
+        [self makePreset:@"Linear" tag:0],
+        [self makePreset:@"Ease In" tag:1],
+        [self makePreset:@"Ease Out" tag:2],
+        [self makePreset:@"Ease I/O" tag:3],
+        [self makePreset:@"Snap" tag:4],
+        [self makePreset:@"Overshoot" tag:5]
+    ]];
+    presets.translatesAutoresizingMaskIntoConstraints = NO;
+    presets.axis = UILayoutConstraintAxisVertical;
+    presets.distribution = UIStackViewDistributionFillEqually;
+    presets.spacing = 4.0;
+    [self.view addSubview:presets];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [header.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:6.0],
+        [header.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:10.0],
+        [header.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-10.0],
+        [header.heightAnchor constraintEqualToConstant:28.0],
+
+        [backBtn.leadingAnchor constraintEqualToAnchor:header.leadingAnchor],
+        [backBtn.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+        [backBtn.widthAnchor constraintEqualToConstant:28.0],
+        [backBtn.heightAnchor constraintEqualToConstant:28.0],
+
+        [_titleLabel.leadingAnchor constraintEqualToAnchor:backBtn.trailingAnchor constant:6.0],
+        [_titleLabel.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+
+        [rightBar.trailingAnchor constraintEqualToAnchor:header.trailingAnchor],
+        [rightBar.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
+
+        [_modeSeg.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:6.0],
+        [_modeSeg.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:10.0],
+        [_modeSeg.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-10.0],
+        [_modeSeg.heightAnchor constraintEqualToConstant:24.0],
+
+        [_canvas.topAnchor constraintEqualToAnchor:_modeSeg.bottomAnchor constant:6.0],
+        [_canvas.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:10.0],
+        [_canvas.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-8.0],
+        [_canvas.trailingAnchor constraintEqualToAnchor:presets.leadingAnchor constant:-8.0],
+
+        [presets.topAnchor constraintEqualToAnchor:_modeSeg.bottomAnchor constant:6.0],
+        [presets.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-10.0],
+        [presets.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-8.0],
+        [presets.widthAnchor constraintEqualToConstant:82.0],
+    ]];
+
+    [self loadCurrentSegment];
+}
+
+- (UIButton *)makePill:(NSString *)title action:(SEL)sel {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.backgroundColor = AMSurfaceColor();
+    b.layer.cornerRadius = 5.0;
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.titleLabel.font = AMThemeFont(10.0, UIFontWeightSemibold);
+    b.contentEdgeInsets = UIEdgeInsetsMake(3.0, 6.0, 3.0, 6.0);
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (UIButton *)makePreset:(NSString *)title tag:(NSInteger)tag {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.tag = tag;
+    b.backgroundColor = AMSurfaceColor();
+    b.layer.cornerRadius = 5.0;
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor colorWithWhite:0.90 alpha:1.0] forState:UIControlStateNormal];
+    b.titleLabel.font = AMThemeFont(10.0, UIFontWeightSemibold);
+    [b addTarget:self action:@selector(onTapPreset:) forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)loadCurrentSegment {
+    NSMutableArray *kfs = [self keyframesArray];
+    if (kfs.count < 2) { [self onTapBack]; return; }
+    if (self.keyframeIndex < 0) self.keyframeIndex = 0;
+    if (self.keyframeIndex >= (NSInteger)kfs.count - 1) self.keyframeIndex = (NSInteger)kfs.count - 2;
+    NSMutableDictionary *kf = kfs[self.keyframeIndex];
+    _titleLabel.text = [NSString stringWithFormat:@"%@ Graph", AMRot3DTrackName(self.trackIndex)];
+    _segmentLabel.text = [NSString stringWithFormat:@"Seg %ld/%lu", (long)(self.keyframeIndex + 1), (unsigned long)(kfs.count - 1)];
+    _canvas.easingType = [kf[@"easingType"] intValue];
+    _canvas.p1x = kf[@"p1x"] ? [kf[@"p1x"] floatValue] : 0.42f;
+    _canvas.p1y = kf[@"p1y"] ? [kf[@"p1y"] floatValue] : 0.0f;
+    _canvas.p2x = kf[@"p2x"] ? [kf[@"p2x"] floatValue] : 0.58f;
+    _canvas.p2y = kf[@"p2y"] ? [kf[@"p2y"] floatValue] : 1.0f;
+    _canvas.stepCount = kf[@"stepCount"] ? [kf[@"stepCount"] floatValue] : 4.0f;
+    _modeSeg.selectedSegmentIndex = MIN(MAX(_canvas.easingType, 0), 3);
+    _pasteBtn.alpha = gAMPuppetHasCopiedCurve ? 1.0 : 0.4;
+    [_canvas setNeedsDisplay];
+}
+
+- (void)commitCanvasToKeyframeSave:(BOOL)save {
+    NSMutableDictionary *kf = [self currentKeyframeDict];
+    if (!kf) return;
+    kf[@"easingType"] = @(_canvas.easingType);
+    kf[@"p1x"] = @(_canvas.p1x);
+    kf[@"p1y"] = @(_canvas.p1y);
+    kf[@"p2x"] = @(_canvas.p2x);
+    kf[@"p2y"] = @(_canvas.p2y);
+    kf[@"stepCount"] = @(_canvas.stepCount);
+    if (save) {
+        [[AMRot3DStore shared] save];
+    } else {
+        [[AMRot3DStore shared] syncAllToRuntime];
+    }
+    AMRequestCoalescedPreviewRedraw();
+    if (self.onDidModify) self.onDidModify();
+}
+
+- (void)onModeChanged:(UISegmentedControl *)seg {
+    _canvas.easingType = (int)seg.selectedSegmentIndex;
+    [_canvas setNeedsDisplay];
+    [self commitCanvasToKeyframeSave:YES];
+}
+
+- (void)onTapPreset:(UIButton *)btn {
+    _canvas.easingType = 0;
+    _modeSeg.selectedSegmentIndex = 0;
+    switch (btn.tag) {
+        case 0: _canvas.p1x = 0.0f;  _canvas.p1y = 0.0f;  _canvas.p2x = 1.0f;  _canvas.p2y = 1.0f;  break; // Linear
+        case 1: _canvas.p1x = 0.42f; _canvas.p1y = 0.0f;  _canvas.p2x = 1.0f;  _canvas.p2y = 1.0f;  break; // Ease In
+        case 2: _canvas.p1x = 0.0f;  _canvas.p1y = 0.0f;  _canvas.p2x = 0.58f; _canvas.p2y = 1.0f;  break; // Ease Out
+        case 3: _canvas.p1x = 0.42f; _canvas.p1y = 0.0f;  _canvas.p2x = 0.58f; _canvas.p2y = 1.0f;  break; // Ease InOut
+        case 4: _canvas.p1x = 0.80f; _canvas.p1y = 0.0f;  _canvas.p2x = 0.15f; _canvas.p2y = 1.0f;  break; // Snap (AM favorite!)
+        case 5: _canvas.p1x = 0.34f; _canvas.p1y = 1.45f; _canvas.p2x = 0.64f; _canvas.p2y = 1.0f;  break; // Overshoot
+        default: break;
+    }
+    [_canvas setNeedsDisplay];
+    [self commitCanvasToKeyframeSave:YES];
+}
+
+- (void)onPrevSegment {
+    if (self.keyframeIndex > 0) {
+        self.keyframeIndex--;
+        [self loadCurrentSegment];
+        NSMutableDictionary *kf = [self currentKeyframeDict];
+        if (kf && self.onRequestSeekMs) self.onRequestSeekMs([kf[@"t"] longLongValue]);
+    }
+}
+
+- (void)onNextSegment {
+    NSMutableArray *kfs = [self keyframesArray];
+    if (self.keyframeIndex + 2 < (NSInteger)kfs.count) {
+        self.keyframeIndex++;
+        [self loadCurrentSegment];
+        NSMutableDictionary *kf = [self currentKeyframeDict];
+        if (kf && self.onRequestSeekMs) self.onRequestSeekMs([kf[@"t"] longLongValue]);
+    }
+}
+
+- (void)onCopyCurve {
+    gAMPuppetCopiedEasingType = _canvas.easingType;
+    gAMPuppetCopiedP1X = _canvas.p1x; gAMPuppetCopiedP1Y = _canvas.p1y;
+    gAMPuppetCopiedP2X = _canvas.p2x; gAMPuppetCopiedP2Y = _canvas.p2y;
+    gAMPuppetCopiedStepCount = _canvas.stepCount;
+    gAMPuppetHasCopiedCurve = YES;
+    _pasteBtn.alpha = 1.0;
+}
+
+- (void)onPasteCurve {
+    if (!gAMPuppetHasCopiedCurve) return;
+    _canvas.easingType = gAMPuppetCopiedEasingType;
+    _canvas.p1x = gAMPuppetCopiedP1X; _canvas.p1y = gAMPuppetCopiedP1Y;
+    _canvas.p2x = gAMPuppetCopiedP2X; _canvas.p2y = gAMPuppetCopiedP2Y;
+    _canvas.stepCount = gAMPuppetCopiedStepCount;
+    _modeSeg.selectedSegmentIndex = MIN(MAX(_canvas.easingType, 0), 3);
+    [_canvas setNeedsDisplay];
+    [self commitCanvasToKeyframeSave:YES];
+}
+
+- (void)onTapBack {
+    [self.navigationController popViewControllerAnimated:YES];
+}
+
+@end
+
+// --- Native Alight Motion 3D Rotation Panel VC (Jex Motion 3D Rotation Port) ---
+
+@interface AMRot3DPanelVC : UIViewController <AMRot3DCanvasOverlayDelegate>
+@property (nonatomic, assign) void *holder;
+@property (nonatomic, assign) uint64_t elementId;
+@end
+
+@implementation AMRot3DPanelVC {
+    int _slot;
+    int64_t _startTimeMs;
+    int64_t _endTimeMs;
+    int _activeTab;       // 0=RotX, 1=RotY, 2=RotZ, 3=Pivot, 4=Lens
+    int _pivotSubAxis;    // 0=PivotX(track3), 1=PivotY(track4), 2=PivotZ(track5)
+    BOOL _pushingGraph;
+
+    AMRot3DCanvasOverlayView *_canvasOverlay;
+    NSTimer *_syncTimer;
+    int64_t _lastPolledTimeMs;
+
+    // Left keyframe rail (CompactSideToolVC style)
+    UIButton *_keyframeBtn;
+    UIButton *_prevKfBtn;
+    UIButton *_nextKfBtn;
+    UIButton *_graphBtn;
+
+    // Top chips + tools
+    UIButton *_tabBtns[5]; // X, Y, Z, Pivot, Lens
+    UIButton *_gizmoBtn;
+    UIButton *_resetBtn;
+
+    // Left pad
+    AMRot3DTouchPadView *_touchPad;
+    UILabel *_padReadout;
+    UILabel *_padHint;
+
+    // Right controls: Axis Ruler container vs Lens container
+    UIView *_axisContainer;
+    UIButton *_axisValueBtn;
+    AMRot3DTickRulerView *_tickRuler;
+    UISegmentedControl *_pivotSeg;
+    UIStackView *_snapRow;
+
+    UIView *_lensContainer;
+    UISlider *_fovSlider;
+    UILabel *_fovLbl;
+    UISlider *_zDepthSlider;
+    UILabel *_zDepthLbl;
+    UISlider *_bendSlider;
+    UILabel *_bendLbl;
+    UISlider *_lightSlider;
+    UILabel *_lightLbl;
+    UISegmentedControl *_backfaceSeg;
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [_syncTimer invalidate];
+    [_canvasOverlay removeFromSuperview];
+    gAMRot3DPanelVisible = NO;
+    gAMRot3DActiveElementId = 0;
+    if (_holder) {
+        AMSwiftRelease(_holder, AMMainBinarySlide());
+        _holder = NULL;
+    }
+}
+
+- (int)activeTrackIndex {
+    if (_activeTab <= 2) return _activeTab;
+    if (_activeTab == 3) return 3 + _pivotSubAxis;
+    return 0;
+}
+
+- (NSMutableDictionary *)layerDict {
+    return [[AMRot3DStore shared] layerDictForSlot:_slot create:YES elementId:self.elementId];
+}
+
+- (NSMutableDictionary *)trackDictForIndex:(int)track {
+    NSMutableDictionary *ld = [self layerDict];
+    if (![ld[@"tracks"] isKindOfClass:[NSMutableDictionary class]]) {
+        ld[@"tracks"] = [NSMutableDictionary dictionary];
+    }
+    NSString *k = AMRot3DTrackKey(track);
+    NSMutableDictionary *td = ld[@"tracks"][k];
+    if (![td isKindOfClass:[NSMutableDictionary class]]) {
+        td = [NSMutableDictionary dictionaryWithDictionary:@{
+            @"v": @(AMRot3DDefaultForTrack(track)),
+            @"keyframes": [NSMutableArray array]
+        }];
+        ld[@"tracks"][k] = td;
+    }
+    if (![td[@"keyframes"] isKindOfClass:[NSMutableArray class]]) {
+        td[@"keyframes"] = td[@"keyframes"] ? [td[@"keyframes"] mutableCopy] : [NSMutableArray array];
+    }
+    return td;
+}
+
+- (int64_t)currentTimeMs {
+    if (_holder) {
+        int64_t t = AMReadHolderCurrentTime(_holder, AMMainBinarySlide());
+        gAMRot3DEditorCurrentTimeMs = t;
+        return t;
+    }
+    return gAMRot3DEditorCurrentTimeMs;
+}
+
+- (float)evalTrack:(int)track atMs:(int64_t)tMs {
+    AMRot3DSlotRuntime rt;
+    os_unfair_lock_lock(&gAMRot3DRuntimeLock);
+    rt = gAMRot3DSlots[_slot];
+    os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
+    if (rt.active && track >= 0 && track < kAMRot3DTrackCount) {
+        return AMRot3DEvalTrackAtMs(&rt.tracks[track], tMs);
+    }
+    return AMRot3DDefaultForTrack(track);
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = AMBgColor();
+    _activeTab = 0;
+    _pivotSubAxis = 2; // Pivot Z highlighted quickly when opening Pivot tab
+    _lastPolledTimeMs = -1;
+
+    AMInstallPuppetMetalHook();
+    if (_holder) {
+        AMSwiftRetain(_holder, AMMainBinarySlide());
+        _slot = AMRot3DSyncOrAttachEffect(_holder, self.elementId, YES, &_startTimeMs, &_endTimeMs);
+        _lastPolledTimeMs = AMReadHolderCurrentTime(_holder, AMMainBinarySlide());
+        gAMRot3DEditorCurrentTimeMs = _lastPolledTimeMs;
+    }
+    if (_slot < 1) {
+        _slot = [[AMRot3DStore shared] slotForElementId:self.elementId];
+        if (_slot < 1) _slot = 1;
+        [[AMRot3DStore shared] bindSlot:_slot toElementId:self.elementId startTimeMs:_startTimeMs endTimeMs:_endTimeMs];
+    }
+
+    [self buildUI];
+    [self refreshControls];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onTransformUpdated:)
+                                                 name:kAMRot3DTransformUpdatedNotification
+                                               object:nil];
+    AMForceImmediatePreviewRedraw();
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    _pushingGraph = NO;
+    gAMRot3DPanelVisible = YES;
+    gAMRot3DActiveElementId = self.elementId;
+    gAMRot3DActiveTrackIndex = [self activeTrackIndex];
+    [self attachCanvasOverlayIfNeeded];
+    [self startSyncTimer];
+    [self refreshControls];
+    AMForceImmediatePreviewRedraw();
+    AMPuppetRedrawAllKeyframeViews();
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    [self attachCanvasOverlayIfNeeded];
+    AMForceImmediatePreviewRedraw();
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    if (!_pushingGraph) {
+        [_syncTimer invalidate];
+        _syncTimer = nil;
+        [_canvasOverlay removeFromSuperview];
+        _canvasOverlay = nil;
+        gAMRot3DPanelVisible = NO;
+        gAMRot3DActiveElementId = 0;
+        AMForceImmediatePreviewRedraw();
+        AMPuppetRedrawAllKeyframeViews();
+    }
+}
+
+- (void)attachCanvasOverlayIfNeeded {
+    UIView *pv = AMPuppetFindProjectPreviewView(self.view);
+    if (!pv) return;
+    BOOL showG = ([self layerDict][@"showGizmo"] == nil) ? YES : [[self layerDict][@"showGizmo"] boolValue];
+    if (_canvasOverlay && _canvasOverlay.superview == pv) {
+        _canvasOverlay.frame = pv.bounds;
+        _canvasOverlay.slot = _slot;
+        _canvasOverlay.activeAxis = (_activeTab <= 2) ? _activeTab : 0;
+        _canvasOverlay.showGizmo = showG;
+        _canvasOverlay.currentTimeMs = [self currentTimeMs];
+        [_canvasOverlay setNeedsDisplay];
+        return;
+    }
+    [_canvasOverlay removeFromSuperview];
+    _canvasOverlay = [[AMRot3DCanvasOverlayView alloc] initWithFrame:pv.bounds];
+    _canvasOverlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _canvasOverlay.delegate = self;
+    _canvasOverlay.previewView = pv;
+    _canvasOverlay.slot = _slot;
+    _canvasOverlay.activeAxis = (_activeTab <= 2) ? _activeTab : 0;
+    _canvasOverlay.showGizmo = showG;
+    _canvasOverlay.currentTimeMs = [self currentTimeMs];
+    [pv addSubview:_canvasOverlay];
+    [_canvasOverlay setNeedsDisplay];
+}
+
+- (void)startSyncTimer {
+    [_syncTimer invalidate];
+    _syncTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 30.0 target:self selector:@selector(onSyncTick) userInfo:nil repeats:YES];
+}
+
+- (void)onSyncTick {
+    if (!_holder) return;
+    uint64_t *selIds = NULL;
+    NSUInteger selCount = 0;
+    BOOL stillSelected = NO;
+    if (AMReadHolderSelectedIds(_holder, AMMainBinarySlide(), &selIds, &selCount)) {
+        if (selCount == 1 && selIds[0] == self.elementId) stillSelected = YES;
+    }
+    if (selIds) free(selIds);
+    if (!stillSelected) {
+        [self.navigationController popViewControllerAnimated:NO];
+        return;
+    }
+    int64_t t = [self currentTimeMs];
+    if (_canvasOverlay) {
+        _canvasOverlay.currentTimeMs = t;
+        if (t != _lastPolledTimeMs) [_canvasOverlay setNeedsDisplay];
+    }
+    if (t != _lastPolledTimeMs) {
+        _lastPolledTimeMs = t;
+        [self refreshControls];
+    }
+}
+
+- (void)onTransformUpdated:(NSNotification *)note {
+    if ([note.object intValue] == _slot && _canvasOverlay) {
+        [_canvasOverlay setNeedsDisplay];
+    }
+}
+
+- (UIButton *)makeRailBtn:(NSString *)asset sf:(NSString *)sf action:(SEL)sel {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImage *img = asset ? [UIImage imageNamed:asset] : nil;
+    if (!img && sf) {
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:15.0 weight:UIImageSymbolWeightMedium];
+            img = [UIImage systemImageNamed:sf withConfiguration:cfg];
+        }
+    }
+    if (img) [b setImage:[img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+    b.tintColor = [UIColor whiteColor];
+    [b.widthAnchor constraintEqualToConstant:36.0].active = YES;
+    [b.heightAnchor constraintEqualToConstant:32.0].active = YES;
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (UIButton *)makeSmallPill:(NSString *)title sf:(NSString *)sf tag:(NSInteger)tag action:(SEL)sel {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    b.tag = tag;
+    b.backgroundColor = AMSurfaceColor();
+    b.layer.cornerRadius = 6.0;
+    b.tintColor = [UIColor whiteColor];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.titleLabel.font = AMThemeFont(10.5, UIFontWeightSemibold);
+    if (title.length > 0) [b setTitle:title forState:UIControlStateNormal];
+    if (sf.length > 0) {
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:11.5 weight:UIImageSymbolWeightMedium];
+            [b setImage:[UIImage systemImageNamed:sf withConfiguration:cfg] forState:UIControlStateNormal];
+        }
+    }
+    b.contentEdgeInsets = UIEdgeInsetsMake(4.0, 7.0, 4.0, 7.0);
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)buildUI {
+    UIView *rail = [[UIView alloc] init];
+    rail.translatesAutoresizingMaskIntoConstraints = NO;
+    rail.backgroundColor = AMInputSurfaceColor();
+    [self.view addSubview:rail];
+
+    UIButton *backBtn = [self makeRailBtn:@"ic_back" sf:@"chevron.left" action:@selector(onTapBack)];
+    _keyframeBtn = [self makeRailBtn:@"ic_add keyframe" sf:nil action:@selector(onTapToggleKeyframe)];
+    if (![_keyframeBtn imageForState:UIControlStateNormal]) {
+        [_keyframeBtn setImage:AMPuppetDiamondIcon(NO) forState:UIControlStateNormal];
+    }
+    _prevKfBtn = [self makeRailBtn:nil sf:@"chevron.left.to.line" action:@selector(onTapPrevKeyframe)];
+    _nextKfBtn = [self makeRailBtn:nil sf:@"chevron.right.to.line" action:@selector(onTapNextKeyframe)];
+    _graphBtn = [self makeRailBtn:@"ic_easing curve" sf:@"point.topleft.down.curvedto.point.bottomright.up" action:@selector(onTapGraph)];
+
+    UIStackView *kfNav = [[UIStackView alloc] initWithArrangedSubviews:@[_prevKfBtn, _nextKfBtn]];
+    kfNav.axis = UILayoutConstraintAxisHorizontal;
+    kfNav.distribution = UIStackViewDistributionFillEqually;
+    [_prevKfBtn.widthAnchor constraintEqualToConstant:22.0].active = YES;
+    [_nextKfBtn.widthAnchor constraintEqualToConstant:22.0].active = YES;
+
+    UIStackView *railStack = [[UIStackView alloc] initWithArrangedSubviews:@[backBtn, _keyframeBtn, kfNav, _graphBtn]];
+    railStack.translatesAutoresizingMaskIntoConstraints = NO;
+    railStack.axis = UILayoutConstraintAxisVertical;
+    railStack.distribution = UIStackViewDistributionEqualSpacing;
+    railStack.alignment = UIStackViewAlignmentCenter;
+    [rail addSubview:railStack];
+
+    UIView *content = [[UIView alloc] init];
+    content.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:content];
+
+    // Row 1: Axis tabs (X / Y / Z / Pivot / Lens) + Gizmo & Reset buttons
+    NSMutableArray *tabViews = [NSMutableArray array];
+    NSArray<NSString *> *tabNames = @[@"X", @"Y", @"Z", @"Pivot", @"Lens"];
+    for (int i = 0; i < 5; ++i) {
+        _tabBtns[i] = [self makeSmallPill:tabNames[i] sf:nil tag:i action:@selector(onSelectTab:)];
+        [tabViews addObject:_tabBtns[i]];
+    }
+    UIStackView *tabStack = [[UIStackView alloc] initWithArrangedSubviews:tabViews];
+    tabStack.translatesAutoresizingMaskIntoConstraints = NO;
+    tabStack.axis = UILayoutConstraintAxisHorizontal;
+    tabStack.spacing = 4.0;
+    tabStack.distribution = UIStackViewDistributionFillProportionally;
+    [content addSubview:tabStack];
+
+    _gizmoBtn = [self makeSmallPill:nil sf:@"cube" tag:0 action:@selector(onToggleGizmo)];
+    _resetBtn = [self makeSmallPill:nil sf:@"arrow.counterclockwise" tag:0 action:@selector(onResetActive)];
+    UIStackView *toolRow = [[UIStackView alloc] initWithArrangedSubviews:@[_gizmoBtn, _resetBtn]];
+    toolRow.translatesAutoresizingMaskIntoConstraints = NO;
+    toolRow.axis = UILayoutConstraintAxisHorizontal;
+    toolRow.spacing = 4.0;
+    [content addSubview:toolRow];
+
+    // Row 2 Left: Jex 3D Rotation Trackpad (1-finger X/Y, 2-finger Z)
+    _touchPad = [[AMRot3DTouchPadView alloc] init];
+    _touchPad.translatesAutoresizingMaskIntoConstraints = NO;
+    __weak __typeof__(self) weakSelf = self;
+    _touchPad.onDragDelta = ^(float dx, float dy, BOOL twoZ, BOOL ended) {
+        [weakSelf handleTrackpadDx:dx dy:dy twoFingerZ:twoZ ended:ended];
+    };
+    [content addSubview:_touchPad];
+
+    _padReadout = [[UILabel alloc] init];
+    _padReadout.translatesAutoresizingMaskIntoConstraints = NO;
+    _padReadout.font = AMThemeFont(11.0, UIFontWeightBold);
+    _padReadout.textColor = [UIColor whiteColor];
+    _padReadout.textAlignment = NSTextAlignmentCenter;
+    [_touchPad addSubview:_padReadout];
+
+    _padHint = [[UILabel alloc] init];
+    _padHint.translatesAutoresizingMaskIntoConstraints = NO;
+    _padHint.font = AMThemeFont(9.5, UIFontWeightRegular);
+    _padHint.textColor = [UIColor colorWithWhite:0.62 alpha:1.0];
+    _padHint.textAlignment = NSTextAlignmentCenter;
+    _padHint.numberOfLines = 2;
+    [_touchPad addSubview:_padHint];
+
+    // Row 2 Right (Mode A): Independent Axis Tick Ruler + Numeric Entry + Snap Pills
+    _axisContainer = [[UIView alloc] init];
+    _axisContainer.translatesAutoresizingMaskIntoConstraints = NO;
+    _axisContainer.backgroundColor = AMSurfaceColor();
+    _axisContainer.layer.cornerRadius = 8.0;
+    [content addSubview:_axisContainer];
+
+    _axisValueBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    _axisValueBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    _axisValueBtn.backgroundColor = AMInputSurfaceColor();
+    _axisValueBtn.layer.cornerRadius = 6.0;
+    _axisValueBtn.titleLabel.font = AMThemeFont(13.0, UIFontWeightBold);
+    [_axisValueBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [_axisValueBtn addTarget:self action:@selector(onTapNumericEntry) forControlEvents:UIControlEventTouchUpInside];
+    [_axisContainer addSubview:_axisValueBtn];
+
+    _pivotSeg = [[UISegmentedControl alloc] initWithItems:@[@"Anchor X", @"Anchor Y", @"Anchor Z"]];
+    _pivotSeg.translatesAutoresizingMaskIntoConstraints = NO;
+    _pivotSeg.selectedSegmentIndex = _pivotSubAxis;
+    _pivotSeg.backgroundColor = AMInputSurfaceColor();
+    if (@available(iOS 13.0, *)) _pivotSeg.selectedSegmentTintColor = AMAccentGreenColor();
+    [_pivotSeg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.82 alpha:1.0],
+                                        NSFontAttributeName: AMThemeFont(9.5, UIFontWeightSemibold)} forState:UIControlStateNormal];
+    [_pivotSeg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithRed:0.06 green:0.08 blue:0.12 alpha:1.0],
+                                        NSFontAttributeName: AMThemeFont(9.5, UIFontWeightBold)} forState:UIControlStateSelected];
+    [_pivotSeg addTarget:self action:@selector(onPivotAxisChanged:) forControlEvents:UIControlEventValueChanged];
+    _pivotSeg.hidden = YES;
+    [_axisContainer addSubview:_pivotSeg];
+
+    _tickRuler = [[AMRot3DTickRulerView alloc] init];
+    _tickRuler.translatesAutoresizingMaskIntoConstraints = NO;
+    _tickRuler.onValueDelta = ^(float delta, BOOL ended) {
+        [weakSelf handleRulerDelta:delta ended:ended];
+    };
+    [_axisContainer addSubview:_tickRuler];
+
+    _snapRow = [[UIStackView alloc] initWithArrangedSubviews:@[
+        [self makeSmallPill:@"-90°" sf:nil tag:-90 action:@selector(onTapSnapAngle:)],
+        [self makeSmallPill:@"0°"   sf:nil tag:0   action:@selector(onTapSnapAngle:)],
+        [self makeSmallPill:@"+45°" sf:nil tag:45  action:@selector(onTapSnapAngle:)],
+        [self makeSmallPill:@"+90°" sf:nil tag:90  action:@selector(onTapSnapAngle:)]
+    ]];
+    _snapRow.translatesAutoresizingMaskIntoConstraints = NO;
+    _snapRow.axis = UILayoutConstraintAxisHorizontal;
+    _snapRow.distribution = UIStackViewDistributionFillEqually;
+    _snapRow.spacing = 4.0;
+    [_axisContainer addSubview:_snapRow];
+
+    // Row 2 Right (Mode B): Lens / Bend / Lighting / Backface Controls (scrollable compact stack)
+    _lensContainer = [[UIView alloc] init];
+    _lensContainer.translatesAutoresizingMaskIntoConstraints = NO;
+    _lensContainer.backgroundColor = AMSurfaceColor();
+    _lensContainer.layer.cornerRadius = 8.0;
+    _lensContainer.hidden = YES;
+    [content addSubview:_lensContainer];
+
+    UIScrollView *lensScroll = [[UIScrollView alloc] init];
+    lensScroll.translatesAutoresizingMaskIntoConstraints = NO;
+    lensScroll.showsVerticalScrollIndicator = NO;
+    [_lensContainer addSubview:lensScroll];
+
+    UIStackView *lensStack = [[UIStackView alloc] init];
+    lensStack.translatesAutoresizingMaskIntoConstraints = NO;
+    lensStack.axis = UILayoutConstraintAxisVertical;
+    lensStack.spacing = 4.0;
+    [lensScroll addSubview:lensStack];
+
+    NSDictionary *ld = [self layerDict];
+    [self addSliderRowTo:lensStack label:&_fovLbl slider:&_fovSlider min:20.0f max:120.0f val:(ld[@"fov"] ? [ld[@"fov"] floatValue] : 60.0f) tag:0];
+    [self addSliderRowTo:lensStack label:&_zDepthLbl slider:&_zDepthSlider min:-300.0f max:300.0f val:[ld[@"zOffset"] floatValue] tag:1];
+    [self addSliderRowTo:lensStack label:&_bendLbl slider:&_bendSlider min:-180.0f max:180.0f val:[ld[@"bend"] floatValue] tag:2];
+    [self addSliderRowTo:lensStack label:&_lightLbl slider:&_lightSlider min:0.0f max:1.0f val:[ld[@"lighting"] floatValue] tag:3];
+
+    _backfaceSeg = [[UISegmentedControl alloc] initWithItems:@[@"Both", @"Hide Back", @"Dim Back"]];
+    _backfaceSeg.selectedSegmentIndex = [ld[@"backfaceMode"] integerValue];
+    _backfaceSeg.backgroundColor = AMInputSurfaceColor();
+    if (@available(iOS 13.0, *)) _backfaceSeg.selectedSegmentTintColor = AMAccentGreenColor();
+    [_backfaceSeg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.82 alpha:1.0],
+                                           NSFontAttributeName: AMThemeFont(9.5, UIFontWeightSemibold)} forState:UIControlStateNormal];
+    [_backfaceSeg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithRed:0.06 green:0.08 blue:0.12 alpha:1.0],
+                                           NSFontAttributeName: AMThemeFont(9.5, UIFontWeightBold)} forState:UIControlStateSelected];
+    [_backfaceSeg addTarget:self action:@selector(onBackfaceChanged:) forControlEvents:UIControlEventValueChanged];
+    [_backfaceSeg.heightAnchor constraintEqualToConstant:24.0].active = YES;
+    [lensStack addArrangedSubview:_backfaceSeg];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [rail.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [rail.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [rail.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [rail.widthAnchor constraintEqualToConstant:46.0],
+
+        [railStack.topAnchor constraintEqualToAnchor:rail.topAnchor constant:10.0],
+        [railStack.bottomAnchor constraintEqualToAnchor:rail.safeAreaLayoutGuide.bottomAnchor constant:-10.0],
+        [railStack.centerXAnchor constraintEqualToAnchor:rail.centerXAnchor],
+
+        [content.leadingAnchor constraintEqualToAnchor:rail.trailingAnchor constant:8.0],
+        [content.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-8.0],
+        [content.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:8.0],
+        [content.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-6.0],
+
+        [toolRow.topAnchor constraintEqualToAnchor:content.topAnchor],
+        [toolRow.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+        [toolRow.heightAnchor constraintEqualToConstant:28.0],
+
+        [tabStack.topAnchor constraintEqualToAnchor:content.topAnchor],
+        [tabStack.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+        [tabStack.trailingAnchor constraintEqualToAnchor:toolRow.leadingAnchor constant:-6.0],
+        [tabStack.heightAnchor constraintEqualToConstant:28.0],
+
+        [_touchPad.topAnchor constraintEqualToAnchor:toolRow.bottomAnchor constant:8.0],
+        [_touchPad.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+        [_touchPad.bottomAnchor constraintEqualToAnchor:content.bottomAnchor],
+        [_touchPad.widthAnchor constraintEqualToAnchor:content.widthAnchor multiplier:0.44],
+
+        [_padReadout.topAnchor constraintEqualToAnchor:_touchPad.topAnchor constant:8.0],
+        [_padReadout.leadingAnchor constraintEqualToAnchor:_touchPad.leadingAnchor constant:4.0],
+        [_padReadout.trailingAnchor constraintEqualToAnchor:_touchPad.trailingAnchor constant:-4.0],
+
+        [_padHint.bottomAnchor constraintEqualToAnchor:_touchPad.bottomAnchor constant:-8.0],
+        [_padHint.leadingAnchor constraintEqualToAnchor:_touchPad.leadingAnchor constant:6.0],
+        [_padHint.trailingAnchor constraintEqualToAnchor:_touchPad.trailingAnchor constant:-6.0],
+
+        [_axisContainer.topAnchor constraintEqualToAnchor:toolRow.bottomAnchor constant:8.0],
+        [_axisContainer.leadingAnchor constraintEqualToAnchor:_touchPad.trailingAnchor constant:8.0],
+        [_axisContainer.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+        [_axisContainer.bottomAnchor constraintEqualToAnchor:content.bottomAnchor],
+
+        [_axisValueBtn.topAnchor constraintEqualToAnchor:_axisContainer.topAnchor constant:8.0],
+        [_axisValueBtn.leadingAnchor constraintEqualToAnchor:_axisContainer.leadingAnchor constant:8.0],
+        [_axisValueBtn.trailingAnchor constraintEqualToAnchor:_axisContainer.trailingAnchor constant:-8.0],
+        [_axisValueBtn.heightAnchor constraintEqualToConstant:28.0],
+
+        [_pivotSeg.topAnchor constraintEqualToAnchor:_axisValueBtn.bottomAnchor constant:6.0],
+        [_pivotSeg.leadingAnchor constraintEqualToAnchor:_axisContainer.leadingAnchor constant:8.0],
+        [_pivotSeg.trailingAnchor constraintEqualToAnchor:_axisContainer.trailingAnchor constant:-8.0],
+        [_pivotSeg.heightAnchor constraintEqualToConstant:22.0],
+
+        [_tickRuler.leadingAnchor constraintEqualToAnchor:_axisContainer.leadingAnchor constant:8.0],
+        [_tickRuler.trailingAnchor constraintEqualToAnchor:_axisContainer.trailingAnchor constant:-8.0],
+        [_tickRuler.centerYAnchor constraintEqualToAnchor:_axisContainer.centerYAnchor constant:6.0],
+        [_tickRuler.heightAnchor constraintEqualToConstant:36.0],
+
+        [_snapRow.leadingAnchor constraintEqualToAnchor:_axisContainer.leadingAnchor constant:8.0],
+        [_snapRow.trailingAnchor constraintEqualToAnchor:_axisContainer.trailingAnchor constant:-8.0],
+        [_snapRow.bottomAnchor constraintEqualToAnchor:_axisContainer.bottomAnchor constant:-8.0],
+        [_snapRow.heightAnchor constraintEqualToConstant:24.0],
+
+        [_lensContainer.topAnchor constraintEqualToAnchor:_axisContainer.topAnchor],
+        [_lensContainer.leadingAnchor constraintEqualToAnchor:_axisContainer.leadingAnchor],
+        [_lensContainer.trailingAnchor constraintEqualToAnchor:_axisContainer.trailingAnchor],
+        [_lensContainer.bottomAnchor constraintEqualToAnchor:_axisContainer.bottomAnchor],
+
+        [lensScroll.topAnchor constraintEqualToAnchor:_lensContainer.topAnchor constant:6.0],
+        [lensScroll.leadingAnchor constraintEqualToAnchor:_lensContainer.leadingAnchor constant:8.0],
+        [lensScroll.trailingAnchor constraintEqualToAnchor:_lensContainer.trailingAnchor constant:-8.0],
+        [lensScroll.bottomAnchor constraintEqualToAnchor:_lensContainer.bottomAnchor constant:-6.0],
+
+        [lensStack.topAnchor constraintEqualToAnchor:lensScroll.topAnchor],
+        [lensStack.bottomAnchor constraintEqualToAnchor:lensScroll.bottomAnchor],
+        [lensStack.leadingAnchor constraintEqualToAnchor:lensScroll.leadingAnchor],
+        [lensStack.trailingAnchor constraintEqualToAnchor:lensScroll.trailingAnchor],
+        [lensStack.widthAnchor constraintEqualToAnchor:lensScroll.widthAnchor],
+    ]];
+}
+
+- (void)addSliderRowTo:(UIStackView *)stack label:(UILabel *__strong *)outLbl slider:(UISlider *__strong *)outSlider min:(float)mn max:(float)mx val:(float)v tag:(NSInteger)tag {
+    UILabel *lbl = [[UILabel alloc] init];
+    lbl.font = AMThemeFont(10.0, UIFontWeightSemibold);
+    lbl.textColor = [UIColor colorWithWhite:0.86 alpha:1.0];
+    [stack addArrangedSubview:lbl];
+
+    UISlider *sl = [[UISlider alloc] init];
+    sl.tag = tag;
+    sl.minimumValue = mn;
+    sl.maximumValue = mx;
+    sl.value = v;
+    sl.minimumTrackTintColor = AMAccentGreenColor();
+    sl.maximumTrackTintColor = AMInputSurfaceColor();
+    [sl addTarget:self action:@selector(onLensSliderChanged:) forControlEvents:UIControlEventValueChanged];
+    [sl addTarget:self action:@selector(onLensSliderEnded:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+    [stack addArrangedSubview:sl];
+
+    if (outLbl) *outLbl = lbl;
+    if (outSlider) *outSlider = sl;
+}
+
+- (NSInteger)keyframeIndexAtTimeMs:(int64_t)tMs forTrack:(int)track {
+    NSArray *kfs = [self trackDictForIndex:track][@"keyframes"];
+    for (NSUInteger i = 0; i < kfs.count; ++i) {
+        if (llabs([kfs[i][@"t"] longLongValue] - tMs) <= 20) return (NSInteger)i;
+    }
+    return -1;
+}
+
+- (void)upsertKeyframeOnTrack:(int)track timeMs:(int64_t)tMs value:(float)val {
+    NSMutableDictionary *td = [self trackDictForIndex:track];
+    NSMutableArray *kfs = td[@"keyframes"];
+    NSInteger existing = [self keyframeIndexAtTimeMs:tMs forTrack:track];
+    if (existing >= 0) {
+        kfs[existing][@"v"] = @(val);
+    } else if (kfs.count < kAMRot3DMaxKeyframesPerTrack) {
+        [kfs addObject:[NSMutableDictionary dictionaryWithDictionary:@{
+            @"t": @(tMs), @"v": @(val), @"easingType": @(0),
+            @"p1x": @(0.42), @"p1y": @(0.0), @"p2x": @(0.58), @"p2y": @(1.0), @"stepCount": @(4.0)
+        }]];
+        [kfs sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            return [a[@"t"] compare:b[@"t"]];
+        }];
+    }
+}
+
+static void AMRot3DFastUpdateTrackInRuntime(int slot, int track, float val, int64_t timeMs) {
+    if (slot < 1 || slot > kAMRot3DMaxSlots || track < 0 || track >= kAMRot3DTrackCount) return;
+    os_unfair_lock_lock(&gAMRot3DRuntimeLock);
+    AMRot3DSlotRuntime *rt = &gAMRot3DSlots[slot];
+    if (rt->active) {
+        AMRot3DTrackC *tc = &rt->tracks[track];
+        tc->currentValue = val;
+        if (tc->keyframeCount > 0) {
+            int match = -1;
+            for (int k = 0; k < tc->keyframeCount; ++k) {
+                if (llabs(tc->keyframes[k].timeMs - timeMs) <= 20) { match = k; break; }
+            }
+            if (match >= 0) {
+                tc->keyframes[match].value = val;
+            } else if (tc->keyframeCount < kAMRot3DMaxKeyframesPerTrack) {
+                int ins = tc->keyframeCount;
+                while (ins > 0 && tc->keyframes[ins - 1].timeMs > timeMs) {
+                    tc->keyframes[ins] = tc->keyframes[ins - 1];
+                    ins--;
+                }
+                AMRot3DKeyframeC kf = { timeMs, val, 0, 0.42f, 0.0f, 0.58f, 1.0f, 4.0f };
+                tc->keyframes[ins] = kf;
+                tc->keyframeCount++;
+            }
+        }
+    }
+    os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
+}
+
+- (void)setTrack:(int)track value:(float)val ended:(BOOL)ended {
+    NSMutableDictionary *td = [self trackDictForIndex:track];
+    int64_t tMs = [self currentTimeMs];
+    td[@"v"] = @(val);
+    if (((NSArray *)td[@"keyframes"]).count > 0) {
+        [self upsertKeyframeOnTrack:track timeMs:tMs value:val];
+    }
+    if (ended) {
+        [[AMRot3DStore shared] save];
+        AMPuppetRedrawAllKeyframeViews();
+        [self refreshControls];
+        AMRequestCoalescedPreviewRedraw();
+    } else {
+        AMRot3DFastUpdateTrackInRuntime(_slot, track, val, tMs);
+        [self updateReadoutLabelsOnly];
+        if (_canvasOverlay) {
+            _canvasOverlay.currentTimeMs = tMs;
+            [_canvasOverlay setNeedsDisplay];
+        }
+        AMRequestCoalescedPreviewRedraw();
+    }
+}
+
+- (void)updateReadoutLabelsOnly {
+    int64_t tMs = [self currentTimeMs];
+    float rx = [self evalTrack:0 atMs:tMs];
+    float ry = [self evalTrack:1 atMs:tMs];
+    float rz = [self evalTrack:2 atMs:tMs];
+    float px = [self evalTrack:3 atMs:tMs];
+    float py = [self evalTrack:4 atMs:tMs];
+    float pz = [self evalTrack:5 atMs:tMs];
+
+    if (_activeTab == 3) {
+        _padReadout.text = [NSString stringWithFormat:@"P %.0f%%  %.0f%%  Z %.0f", px * 100.0f, py * 100.0f, pz];
+    } else {
+        _padReadout.text = [NSString stringWithFormat:@"X %.1f°  Y %.1f°  Z %.1f°", rx, ry, rz];
+    }
+
+    int tr = [self activeTrackIndex];
+    float cur = [self evalTrack:tr atMs:tMs];
+    if (tr <= 2) {
+        [_axisValueBtn setTitle:[NSString stringWithFormat:@"%@: %.1f°  ✎", AMRot3DTrackName(tr), cur] forState:UIControlStateNormal];
+    } else if (tr <= 4) {
+        [_axisValueBtn setTitle:[NSString stringWithFormat:@"%@: %.1f%%  ✎", AMRot3DTrackName(tr), cur * 100.0f] forState:UIControlStateNormal];
+    } else {
+        [_axisValueBtn setTitle:[NSString stringWithFormat:@"Anchor Z: %.1f  ✎", cur] forState:UIControlStateNormal];
+    }
+}
+
+- (void)refreshControls {
+    int tr = [self activeTrackIndex];
+    gAMRot3DActiveTrackIndex = tr;
+    int64_t tMs = [self currentTimeMs];
+    NSDictionary *ld = [self layerDict];
+
+    for (int i = 0; i < 5; ++i) {
+        BOOL sel = (i == _activeTab);
+        UIColor *accent = (i <= 2) ? AMRot3DAxisColor(i) : AMAccentGreenColor();
+        _tabBtns[i].backgroundColor = sel ? accent : AMSurfaceColor();
+        [_tabBtns[i] setTitleColor:(sel ? [UIColor colorWithRed:0.06 green:0.08 blue:0.12 alpha:1.0] : [UIColor whiteColor])
+                          forState:UIControlStateNormal];
+        _tabBtns[i].titleLabel.font = AMThemeFont(10.5, sel ? UIFontWeightBold : UIFontWeightSemibold);
+    }
+
+    BOOL showG = (ld[@"showGizmo"] == nil) ? YES : [ld[@"showGizmo"] boolValue];
+    _gizmoBtn.backgroundColor = showG ? [AMAccentGreenColor() colorWithAlphaComponent:0.25] : AMSurfaceColor();
+    _gizmoBtn.layer.borderWidth = showG ? 1.0 : 0.0;
+    _gizmoBtn.layer.borderColor = AMAccentGreenColor().CGColor;
+
+    BOOL isLens = (_activeTab == 4);
+    BOOL isPivot = (_activeTab == 3);
+    _axisContainer.hidden = isLens;
+    _lensContainer.hidden = !isLens;
+    _pivotSeg.hidden = !isPivot;
+    _snapRow.hidden = isPivot;
+    _touchPad.pivotMode = isPivot;
+
+    _tickRuler.accentColor = (tr <= 2) ? AMRot3DAxisColor(tr) : AMAccentGreenColor();
+    _tickRuler.sensitivity = (tr <= 2) ? 0.45f : ((tr <= 4) ? 0.0025f : 1.5f);
+    [_tickRuler setNeedsDisplay];
+
+    _padHint.text = isPivot
+        ? @"1 finger: Anchor X/Y\n2 fingers: Anchor Z"
+        : @"1 finger: Pitch X / Yaw Y\n2 fingers: Roll Z";
+
+    _fovLbl.text = [NSString stringWithFormat:@"Perspective FOV: %.0f°", _fovSlider.value];
+    _zDepthLbl.text = [NSString stringWithFormat:@"Depth Z: %.0f", _zDepthSlider.value];
+    _bendLbl.text = [NSString stringWithFormat:@"3D Curve Bend: %.0f°", _bendSlider.value];
+    _lightLbl.text = [NSString stringWithFormat:@"3D Shading Light: %.0f%%", _lightSlider.value * 100.0f];
+
+    [self updateReadoutLabelsOnly];
+
+    // Keyframe rail state for active track
+    NSArray *kfs = [self trackDictForIndex:tr][@"keyframes"];
+    NSInteger onKf = [self keyframeIndexAtTimeMs:tMs forTrack:tr];
+    if (onKf >= 0) {
+        UIImage *remImg = [UIImage imageNamed:@"ic_remove keyframe"] ?: AMPuppetDiamondIcon(YES);
+        [_keyframeBtn setImage:[remImg imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+        _keyframeBtn.tintColor = (tr <= 2) ? AMRot3DAxisColor(tr) : AMAccentGreenColor();
+    } else {
+        UIImage *addImg = [UIImage imageNamed:@"ic_add keyframe"] ?: AMPuppetDiamondIcon(NO);
+        [_keyframeBtn setImage:[addImg imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+        _keyframeBtn.tintColor = [UIColor whiteColor];
+    }
+
+    BOOL hasPrev = NO, hasNext = NO;
+    for (NSDictionary *kf in kfs) {
+        int64_t kt = [kf[@"t"] longLongValue];
+        if (kt < tMs - 20) hasPrev = YES;
+        if (kt > tMs + 20) hasNext = YES;
+    }
+    _prevKfBtn.enabled = hasPrev; _prevKfBtn.alpha = hasPrev ? 1.0 : 0.35;
+    _nextKfBtn.enabled = hasNext; _nextKfBtn.alpha = hasNext ? 1.0 : 0.35;
+
+    BOOL canGraph = (kfs.count >= 2);
+    _graphBtn.enabled = canGraph;
+    _graphBtn.alpha = canGraph ? 1.0 : 0.35;
+    _graphBtn.tintColor = canGraph ? AMAccentGreenColor() : [UIColor whiteColor];
+
+    if (_canvasOverlay) {
+        _canvasOverlay.activeAxis = (_activeTab <= 2) ? _activeTab : 0;
+        _canvasOverlay.showGizmo = showG;
+        _canvasOverlay.currentTimeMs = tMs;
+        [_canvasOverlay setNeedsDisplay];
+    }
+}
+
+// --- Trackpad & Ruler & Canvas Overlay Callbacks ---
+
+- (void)handleTrackpadDx:(float)dx dy:(float)dy twoFingerZ:(BOOL)twoZ ended:(BOOL)ended {
+    int64_t tMs = [self currentTimeMs];
+    if (_activeTab == 3) {
+        if (twoZ) {
+            float pz = [self evalTrack:5 atMs:tMs] - dy * 1.6f;
+            pz = fminf(fmaxf(pz, -500.0f), 500.0f);
+            [self setTrack:5 value:pz ended:ended];
+        } else {
+            float px = fminf(fmaxf([self evalTrack:3 atMs:tMs] + dx * 0.003f, -0.5f), 1.5f);
+            float py = fminf(fmaxf([self evalTrack:4 atMs:tMs] - dy * 0.003f, -0.5f), 1.5f);
+            [self setTrack:3 value:px ended:NO];
+            [self setTrack:4 value:py ended:ended];
+        }
+        return;
+    }
+    // Exact Jex Layer3DPad sensitivity = 0.4 deg/pt: 1 finger -> X/Y, 2 fingers -> Z
+    if (twoZ) {
+        float rz = [self evalTrack:2 atMs:tMs] - dy * 0.4f;
+        [self setTrack:2 value:rz ended:ended];
+    } else {
+        float rx = [self evalTrack:0 atMs:tMs] + dy * 0.4f;
+        float ry = [self evalTrack:1 atMs:tMs] - dx * 0.4f;
+        [self setTrack:0 value:rx ended:NO];
+        [self setTrack:1 value:ry ended:ended];
+    }
+}
+
+- (void)handleRulerDelta:(float)delta ended:(BOOL)ended {
+    int tr = [self activeTrackIndex];
+    float cur = [self evalTrack:tr atMs:[self currentTimeMs]];
+    float next = cur + delta;
+    if (tr == 3 || tr == 4) next = fminf(fmaxf(next, -0.5f), 1.5f);
+    if (tr == 5) next = fminf(fmaxf(next, -500.0f), 500.0f);
+    [self setTrack:tr value:next ended:ended];
+}
+
+- (void)rot3DCanvasDidSelectAxis:(int)axis {
+    if (axis >= 0 && axis <= 2) {
+        _activeTab = axis;
+        [self refreshControls];
+    }
+}
+
+- (void)rot3DCanvasDidUpdateEulerX:(float)rx y:(float)ry z:(float)rz ended:(BOOL)ended {
+    [self setTrack:0 value:rx ended:NO];
+    [self setTrack:1 value:ry ended:NO];
+    [self setTrack:2 value:rz ended:ended];
+}
+
+- (void)rot3DCanvasDidTapViewCubePreset {
+    int64_t tMs = [self currentTimeMs];
+    float rx = [self evalTrack:0 atMs:tMs];
+    float ry = [self evalTrack:1 atMs:tMs];
+    if (fabsf(rx) < 5.0f && fabsf(ry) < 5.0f) {
+        [self rot3DCanvasDidUpdateEulerX:-20.0f y:35.0f z:0.0f ended:YES];
+    } else if (fabsf(ry - 35.0f) < 10.0f) {
+        [self rot3DCanvasDidUpdateEulerX:0.0f y:-45.0f z:0.0f ended:YES];
+    } else {
+        [self rot3DCanvasDidUpdateEulerX:0.0f y:0.0f z:0.0f ended:YES];
+    }
+}
+
+// --- Actions ---
+
+- (void)onSelectTab:(UIButton *)btn {
+    _activeTab = (int)btn.tag;
+    [self refreshControls];
+    AMPuppetRedrawAllKeyframeViews();
+}
+
+- (void)onPivotAxisChanged:(UISegmentedControl *)seg {
+    _pivotSubAxis = (int)seg.selectedSegmentIndex;
+    [self refreshControls];
+    AMPuppetRedrawAllKeyframeViews();
+}
+
+- (void)onToggleGizmo {
+    NSMutableDictionary *ld = [self layerDict];
+    BOOL cur = (ld[@"showGizmo"] == nil) ? YES : [ld[@"showGizmo"] boolValue];
+    ld[@"showGizmo"] = @(!cur);
+    [[AMRot3DStore shared] save];
+    [self refreshControls];
+}
+
+- (void)onResetActive {
+    if (_activeTab == 4) {
+        NSMutableDictionary *ld = [self layerDict];
+        ld[@"fov"] = @(60.0); ld[@"zOffset"] = @(0.0); ld[@"bend"] = @(0.0);
+        ld[@"lighting"] = @(0.0); ld[@"backfaceMode"] = @(0);
+        _fovSlider.value = 60.0f; _zDepthSlider.value = 0.0f; _bendSlider.value = 0.0f;
+        _lightSlider.value = 0.0f; _backfaceSeg.selectedSegmentIndex = 0;
+        [[AMRot3DStore shared] save];
+        [self refreshControls];
+        AMForceImmediatePreviewRedraw();
+        return;
+    }
+    int tr = [self activeTrackIndex];
+    [self setTrack:tr value:AMRot3DDefaultForTrack(tr) ended:YES];
+}
+
+- (void)onTapSnapAngle:(UIButton *)btn {
+    if (_activeTab > 2) return;
+    [self setTrack:_activeTab value:(float)btn.tag ended:YES];
+}
+
+- (void)onTapNumericEntry {
+    int tr = [self activeTrackIndex];
+    float cur = [self evalTrack:tr atMs:[self currentTimeMs]];
+    float disp = (tr == 3 || tr == 4) ? (cur * 100.0f) : cur;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:AMRot3DTrackName(tr)
+                                                                message:@"Enter exact value"
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+        tf.text = [NSString stringWithFormat:@"%.1f", disp];
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    __weak __typeof__(self) weakSelf = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Apply" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        (void)a;
+        NSString *txt = ac.textFields.firstObject.text;
+        if (txt.length == 0) return;
+        float v = [txt floatValue];
+        if (!isfinite(v)) return;
+        if (tr == 3 || tr == 4) v = fminf(fmaxf(v / 100.0f, -0.5f), 1.5f);
+        else if (tr == 5) v = fminf(fmaxf(v, -500.0f), 500.0f);
+        [weakSelf setTrack:tr value:v ended:YES];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)onLensSliderChanged:(UISlider *)sl {
+    NSMutableDictionary *ld = [self layerDict];
+    os_unfair_lock_lock(&gAMRot3DRuntimeLock);
+    AMRot3DSlotRuntime *rt = &gAMRot3DSlots[_slot];
+    if (sl.tag == 0) { ld[@"fov"] = @(sl.value); rt->fov = sl.value; }
+    else if (sl.tag == 1) { ld[@"zOffset"] = @(sl.value); rt->zOffset = sl.value; }
+    else if (sl.tag == 2) { ld[@"bend"] = @(sl.value); rt->bend = sl.value; }
+    else if (sl.tag == 3) { ld[@"lighting"] = @(sl.value); rt->lighting = sl.value; }
+    os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
+    [self refreshControls];
+    AMRequestCoalescedPreviewRedraw();
+}
+
+- (void)onLensSliderEnded:(UISlider *)sl {
+    (void)sl;
+    [[AMRot3DStore shared] save];
+}
+
+- (void)onBackfaceChanged:(UISegmentedControl *)seg {
+    [self layerDict][@"backfaceMode"] = @(seg.selectedSegmentIndex);
+    [[AMRot3DStore shared] save];
+    AMForceImmediatePreviewRedraw();
+}
+
+- (void)onTapToggleKeyframe {
+    int tr = [self activeTrackIndex];
+    int64_t tMs = [self currentTimeMs];
+    NSMutableDictionary *td = [self trackDictForIndex:tr];
+    NSMutableArray *kfs = td[@"keyframes"];
+    NSInteger existing = [self keyframeIndexAtTimeMs:tMs forTrack:tr];
+    if (existing >= 0) {
+        [kfs removeObjectAtIndex:(NSUInteger)existing];
+    } else {
+        float cur = [self evalTrack:tr atMs:tMs];
+        [self upsertKeyframeOnTrack:tr timeMs:tMs value:cur];
+    }
+    [[AMRot3DStore shared] save];
+    [self refreshControls];
+    AMForceImmediatePreviewRedraw();
+    AMPuppetRedrawAllKeyframeViews();
+    UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [h impactOccurred];
+}
+
+- (void)onTapPrevKeyframe {
+    int tr = [self activeTrackIndex];
+    int64_t tMs = [self currentTimeMs];
+    int64_t best = -1;
+    for (NSDictionary *kf in [self trackDictForIndex:tr][@"keyframes"]) {
+        int64_t kt = [kf[@"t"] longLongValue];
+        if (kt < tMs - 20 && kt > best) best = kt;
+    }
+    if (best >= 0) {
+        AMPuppetSeekHolderToTimeMs(_holder, best);
+        _lastPolledTimeMs = best;
+        [self refreshControls];
+    }
+}
+
+- (void)onTapNextKeyframe {
+    int tr = [self activeTrackIndex];
+    int64_t tMs = [self currentTimeMs];
+    int64_t best = INT64_MAX;
+    for (NSDictionary *kf in [self trackDictForIndex:tr][@"keyframes"]) {
+        int64_t kt = [kf[@"t"] longLongValue];
+        if (kt > tMs + 20 && kt < best) best = kt;
+    }
+    if (best < INT64_MAX) {
+        AMPuppetSeekHolderToTimeMs(_holder, best);
+        _lastPolledTimeMs = best;
+        [self refreshControls];
+    }
+}
+
+- (void)onTapGraph {
+    int tr = [self activeTrackIndex];
+    NSArray *kfs = [self trackDictForIndex:tr][@"keyframes"];
+    if (kfs.count < 2) return;
+    int64_t tMs = [self currentTimeMs];
+    NSInteger segIdx = 0;
+    for (NSInteger i = 0; i + 1 < (NSInteger)kfs.count; ++i) {
+        int64_t t0 = [kfs[i][@"t"] longLongValue];
+        int64_t t1 = [kfs[i + 1][@"t"] longLongValue];
+        if (tMs >= t0 && tMs <= t1) { segIdx = i; break; }
+        if (tMs > t1) segIdx = i;
+    }
+    AMRot3DGraphPanelVC *gvc = [[AMRot3DGraphPanelVC alloc] init];
+    gvc.slot = _slot;
+    gvc.trackIndex = tr;
+    gvc.keyframeIndex = segIdx;
+    gvc.holder = _holder;
+    __weak __typeof__(self) weakSelf = self;
+    gvc.onDidModify = ^{ [weakSelf refreshControls]; };
+    gvc.onRequestSeekMs = ^(int64_t targetMs) {
+        AMPuppetSeekHolderToTimeMs(weakSelf.holder, targetMs);
+        [weakSelf refreshControls];
+    };
+    _pushingGraph = YES;
+    [self.navigationController pushViewController:gvc animated:YES];
+}
+
+- (void)onTapBack {
+    [self.navigationController popViewControllerAnimated:YES];
+}
+
+@end
+
+// --- Native EditingPanelVC Hooks (Adds exact Alight Motion 'Puppet', '3D Rotate' & 'Auto Beats' Cards!) ---
 
 static IMP gOrigEditingPanelNumItems = NULL;
 static IMP gOrigEditingPanelCellForItem = NULL;
@@ -14459,7 +17323,7 @@ static NSInteger AMHook_editingPanelNumItems(id self, SEL _cmd, UICollectionView
     NSInteger orig = gOrigEditingPanelNumItems
         ? ((NSInteger (*)(id, SEL, UICollectionView *, NSInteger))gOrigEditingPanelNumItems)(self, _cmd, cv, section)
         : 0;
-    if (orig >= 4) return orig + 1;
+    if (orig >= 4) return orig + 2; // Puppet + 3D Rotate
     if (AMIsEditingPanelShowingAudioLayer(self, orig)) return orig + 1;
     return orig;
 }
@@ -14474,7 +17338,7 @@ static CGSize AMHook_editingPanelSizeForItem(id self, SEL _cmd, UICollectionView
         }
         return CGSizeMake(80.0, 64.0);
     }
-    NSInteger total = orig + 1;
+    NSInteger total = isAudio ? (orig + 1) : (orig + 2);
     NSInteger rows = (total >= 4) ? 2 : 1;
     NSInteger cols = total;
     if (rows == 2) {
@@ -14502,8 +17366,9 @@ static CGSize AMHook_editingPanelSizeForItem(id self, SEL _cmd, UICollectionView
 static UICollectionViewCell *AMHook_editingPanelCellForItem(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
     NSInteger orig = AMEditingPanelOrigCount(self, cv, indexPath.section);
     BOOL isPuppet = (orig >= 4 && indexPath.row == orig);
-    BOOL isAutoBeats = (!isPuppet && orig < 4 && indexPath.row == orig && AMIsEditingPanelShowingAudioLayer(self, orig));
-    if (isPuppet || isAutoBeats) {
+    BOOL isRot3D = (orig >= 4 && indexPath.row == orig + 1);
+    BOOL isAutoBeats = (!isPuppet && !isRot3D && orig < 4 && indexPath.row == orig && AMIsEditingPanelShowingAudioLayer(self, orig));
+    if (isPuppet || isRot3D || isAutoBeats) {
         UICollectionViewCell *cell = [cv dequeueReusableCellWithReuseIdentifier:@"EditingPanelCell" forIndexPath:indexPath];
         cell.layer.cornerRadius = 5.3;
         cell.layer.masksToBounds = YES;
@@ -14511,14 +17376,14 @@ static UICollectionViewCell *AMHook_editingPanelCellForItem(id self, SEL _cmd, U
         if ([cell respondsToSelector:labelSel]) {
             UILabel *lbl = ((UILabel *(*)(id, SEL))objc_msgSend)(cell, labelSel);
             if ([lbl isKindOfClass:[UILabel class]]) {
-                lbl.text = isAutoBeats ? @"Auto Beats" : @"Puppet";
+                lbl.text = isAutoBeats ? @"Auto Beats" : (isRot3D ? @"3D Rotate" : @"Puppet");
             }
         }
         SEL imgSel = NSSelectorFromString(@"imageView");
         if ([cell respondsToSelector:imgSel]) {
             UIImageView *iv = ((UIImageView *(*)(id, SEL))objc_msgSend)(cell, imgSel);
             if ([iv isKindOfClass:[UIImageView class]]) {
-                iv.image = isAutoBeats ? AMAutoBeatsTabIcon() : AMPuppetTabIcon();
+                iv.image = isAutoBeats ? AMAutoBeatsTabIcon() : (isRot3D ? AMRot3DTabIcon() : AMPuppetTabIcon());
                 iv.tintColor = [UIColor whiteColor];
                 iv.contentMode = UIViewContentModeScaleAspectFit;
             }
@@ -14541,8 +17406,9 @@ static UICollectionViewCell *AMHook_editingPanelCellForItem(id self, SEL _cmd, U
 static void AMHook_editingPanelDidSelectItem(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
     NSInteger orig = AMEditingPanelOrigCount(self, cv, indexPath.section);
     BOOL isPuppet = (orig >= 4 && indexPath.row == orig);
-    BOOL isAutoBeats = (!isPuppet && orig < 4 && indexPath.row == orig && AMIsEditingPanelShowingAudioLayer(self, orig));
-    if (isPuppet || isAutoBeats) {
+    BOOL isRot3D = (orig >= 4 && indexPath.row == orig + 1);
+    BOOL isAutoBeats = (!isPuppet && !isRot3D && orig < 4 && indexPath.row == orig && AMIsEditingPanelShowingAudioLayer(self, orig));
+    if (isPuppet || isRot3D || isAutoBeats) {
         [cv deselectItemAtIndexPath:indexPath animated:YES];
         intptr_t slide = AMMainBinarySlide();
         Ivar holderIvar = class_getInstanceVariable([self class], "holder");
@@ -14565,6 +17431,11 @@ static void AMHook_editingPanelDidSelectItem(id self, SEL _cmd, UICollectionView
                 abvc.holder = holder;
                 abvc.elementId = targetId;
                 [vc.navigationController pushViewController:abvc animated:YES];
+            } else if (isRot3D) {
+                AMRot3DPanelVC *rvc = [[AMRot3DPanelVC alloc] init];
+                rvc.holder = holder;
+                rvc.elementId = targetId;
+                [vc.navigationController pushViewController:rvc animated:YES];
             } else {
                 AMPuppetPanelVC *pvc = [[AMPuppetPanelVC alloc] init];
                 pvc.holder = holder;
@@ -14579,7 +17450,7 @@ static void AMHook_editingPanelDidSelectItem(id self, SEL _cmd, UICollectionView
     }
 }
 
-// --- Native Timeline KeyframeView Diamonds Hook ---
+// --- Native Timeline KeyframeView Diamonds Hook (Puppet + 3D Rotate) ---
 
 static IMP gOrigKeyframeViewDrawRect = NULL;
 
@@ -14599,11 +17470,11 @@ static void AMHook_keyframeViewDrawRect(id self, SEL _cmd, CGRect rect) {
     float offsetF = *(float *)(base + ivar_getOffset(ivOff));
     if (eid == 0) return;
 
-    // Collect puppet keyframe times for this elementId under lock
     int64_t startMs = 0, endMs = 0;
     int selPin = (gAMPuppetPanelVisible && eid == gAMPuppetActiveElementId) ? gAMPuppetActivePinIndex : -1;
-    int64_t kfTimes[256];
-    uint8_t kfIsSel[256];
+    int selRotTrack = (gAMRot3DPanelVisible && eid == gAMRot3DActiveElementId) ? gAMRot3DActiveTrackIndex : -1;
+    int64_t kfTimes[384];
+    uint8_t kfStyle[384]; // 0=unselected, 1=mint selected, 2=X red, 3=Y green, 4=Z blue
     int kfTotal = 0;
 
     os_unfair_lock_lock(&gAMPuppetRuntimeLock);
@@ -14615,13 +17486,36 @@ static void AMHook_keyframeViewDrawRect(id self, SEL _cmd, CGRect rect) {
         for (int p = 0; p < rt->pinCount; ++p) {
             for (int k = 0; k < rt->pins[p].keyframeCount && kfTotal < 256; ++k) {
                 kfTimes[kfTotal] = rt->pins[p].keyframes[k].timeMs;
-                kfIsSel[kfTotal] = (p == selPin) ? 1 : 0;
+                kfStyle[kfTotal] = (p == selPin) ? 1 : 0;
                 kfTotal++;
             }
         }
         break;
     }
     os_unfair_lock_unlock(&gAMPuppetRuntimeLock);
+
+    os_unfair_lock_lock(&gAMRot3DRuntimeLock);
+    for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
+        const AMRot3DSlotRuntime *rt = &gAMRot3DSlots[s];
+        if (!rt->active || rt->elementId != eid) continue;
+        if (endMs <= startMs) {
+            startMs = rt->startTimeMs;
+            endMs = rt->endTimeMs;
+        }
+        for (int tr = 0; tr < kAMRot3DTrackCount; ++tr) {
+            for (int k = 0; k < rt->tracks[tr].keyframeCount && kfTotal < 384; ++k) {
+                kfTimes[kfTotal] = rt->tracks[tr].keyframes[k].timeMs;
+                if (tr == selRotTrack) {
+                    kfStyle[kfTotal] = (tr <= 2) ? (uint8_t)(2 + tr) : 1;
+                } else {
+                    kfStyle[kfTotal] = 0;
+                }
+                kfTotal++;
+            }
+        }
+        break;
+    }
+    os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
 
     if (kfTotal <= 0 || endMs <= startMs) return;
     CGContextRef ctx = UIGraphicsGetCurrentContext();
@@ -14638,7 +17532,8 @@ static void AMHook_keyframeViewDrawRect(id self, SEL _cmd, CGRect rect) {
         CGFloat x = (CGFloat)(tNorm * scaleF + offsetF) * w;
         if (x < -8.0 || x > w + 8.0) continue;
 
-        CGFloat r = kfIsSel[i] ? 5.2 : 4.2;
+        uint8_t st = kfStyle[i];
+        CGFloat r = (st > 0) ? 5.2 : 4.2;
         UIBezierPath *d = [UIBezierPath bezierPath];
         [d moveToPoint:CGPointMake(x, cy - r)];
         [d addLineToPoint:CGPointMake(x + r, cy)];
@@ -14646,8 +17541,9 @@ static void AMHook_keyframeViewDrawRect(id self, SEL _cmd, CGRect rect) {
         [d addLineToPoint:CGPointMake(x - r, cy)];
         [d closePath];
 
-        if (kfIsSel[i]) {
-            [AMAccentGreenColor() setFill];
+        if (st > 0) {
+            UIColor *fillCol = (st >= 2 && st <= 4) ? AMRot3DAxisColor(st - 2) : AMAccentGreenColor();
+            [fillCol setFill];
             [d fill];
             [[UIColor whiteColor] setStroke];
             d.lineWidth = 1.2;
@@ -15115,8 +18011,9 @@ static void AlightMotionModsInit(void) {
                     (IMP)AMHook_layerParentingDidSelectRow,
                     &gOrigLayerParentingDidSelectRow);
 
-    // Module 7: Puppet Tool (EditingPanelVC native card, Timeline KeyframeView diamonds, Metal uniform hook)
+    // Module 7 & 10: Puppet Tool + Jex 3D Rotation (EditingPanelVC native cards, Timeline KeyframeView diamonds, Metal uniform hook)
     [AMPuppetStore shared];
+    [AMRot3DStore shared];
     dispatch_async(dispatch_get_main_queue(), ^{
         AMInstallPuppetMetalHook();
     });
