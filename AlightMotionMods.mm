@@ -352,8 +352,11 @@ static void AMResolveCompositorOffsets(Class compClass) {
     });
 }
 
+static void AMRot3DScheduleLiveHierarchySync(void);
+
 static void AMHook_startVideoCompositionRequest(id self, SEL _cmd, id request) {
     __atomic_add_fetch(&gAMCompositorStartCount, 1, __ATOMIC_RELAXED);
+    AMRot3DScheduleLiveHierarchySync();
     AMResolveCompositorOffsets(object_getClass(self));
     if (gCompImplOffset >= 0 && gDynaResOffset >= 0 && gAccumValOffset >= 0 && gCompositorMetalClass != Nil) {
         void *compImplPtr = *(void **)((uint8_t *)(__bridge void *)self + gCompImplOffset);
@@ -14676,16 +14679,16 @@ static float AMRot3DComputeCameraDist(float fovDeg, const float layerToScreen[16
             float avgScale = 0.5f * (col0 + col1);
             if (!isfinite(avgScale) || avgScale < 0.15f) avgScale = 0.15f;
             float zoomComp = 1.0f / sqrtf(avgScale);
-            if (zoomComp < 0.85f) zoomComp = 0.85f;
-            if (zoomComp > 2.40f) zoomComp = 2.40f;
-            // Flatten double-perspective distortion when Alight Motion Camera is active (AE 50mm-85mm feel)
-            float camDist = baseDist * 1.45f * zoomComp;
-            if (camDist < 2.15f) camDist = 2.15f;
+            if (zoomComp < 1.0f) zoomComp = 1.0f;
+            if (zoomComp > 2.60f) zoomComp = 2.60f;
+            // Flatten double-perspective distortion when Alight Motion Camera is active (AE 75mm-105mm feel)
+            float camDist = baseDist * 1.85f * zoomComp;
+            if (camDist < 2.65f) camDist = 2.65f;
             return camDist;
         }
     } else if (hasActiveCamera) {
-        float camDist = baseDist * 1.45f;
-        if (camDist < 2.15f) camDist = 2.15f;
+        float camDist = baseDist * 1.85f;
+        if (camDist < 2.65f) camDist = 2.65f;
         return camDist;
     }
     return baseDist;
@@ -14886,6 +14889,8 @@ static NSString *AMRot3DBuildSlotXML(int slot) {
         @"        <float id=\"bendRad\" value=\"0.0\" />\n"
         @"        <float id=\"lightingAmt\" value=\"0.0\" />\n"
         @"        <float id=\"backfaceMode\" value=\"0.0\" />\n"
+        @"        <float id=\"offX\" value=\"0.0\" />\n"
+        @"        <float id=\"offY\" value=\"0.0\" />\n"
         @"    </params>\n"
         @"    <shader type=\"fragment\" precision=\"high\"><![CDATA[\n"
         @"        void main() {\n"
@@ -14898,7 +14903,7 @@ static NSString *AMRot3DBuildSlotXML(int slot) {
         @"            vec2 invAspect = vec2(1.0 / max(aspect.x, 0.0001), 1.0);\n"
         @"            vec2 uv = (acLayerNorm - vec2(pivotX, pivotY)) * aspect;\n"
         @"            float cd = max(camDist, 0.15);\n"
-        @"            vec3 roP = vec3(0.0, 0.0, cd - zOffset);\n"
+        @"            vec3 roP = vec3(-offX, -offY, cd - zOffset);\n"
         @"            vec3 rdW = vec3(uv.x, uv.y, -cd);\n"
         @"            vec3 roL = vec3(\n"
         @"                r00 * roP.x + r01 * roP.y + r02 * roP.z,\n"
@@ -14996,7 +15001,7 @@ static NSArray<NSURL *> *AMEnsureRot3DSlotXMLs(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSString *dir = AMRot3DSlotsDir();
-        NSString *verFile = [dir stringByAppendingPathComponent:@".rot3d_xml_v2"];
+        NSString *verFile = [dir stringByAppendingPathComponent:@".rot3d_xml_v3"];
         BOOL needsWrite = ![[NSFileManager defaultManager] fileExistsAtPath:verFile];
         NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:kAMRot3DMaxShaderSlots];
         for (int s = 1; s <= kAMRot3DMaxShaderSlots; ++s) {
@@ -15008,7 +15013,7 @@ static NSArray<NSURL *> *AMEnsureRot3DSlotXMLs(void) {
             [urls addObject:[NSURL fileURLWithPath:p]];
         }
         if (needsWrite) {
-            [@"2" writeToFile:verFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [@"3" writeToFile:verFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }
         cached = [urls copy];
     });
@@ -15097,10 +15102,17 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
         BOOL anyActive = (localHasRot || fabsf(pz) >= 0.0005f || fabsf(zOff) >= 0.0005f ||
                           fabsf(bendRad) >= 0.005f || lightAmt >= 0.001f);
 
-        float R[16];
-        AMRot3DMat4Angles(R, rx, ry, rz);
+        float asp = (tr->layerSize[1] > 1.0f) ? (tr->layerSize[0] / tr->layerSize[1]) : 1.0f;
+        float P0[3] = { px * asp, py, pz };
+        float P0_plane[3] = { px * asp, py, 0.0f };
 
-        // Compose After Effects 3D parent / Null object hierarchy (child -> parent Null -> grandparent Null)
+        // Exact 3D affine composition v_world = M * v_local + t across Child -> Null 2 -> Null 1 -> ...
+        float M[16];
+        AMRot3DMat4Angles(M, rx, ry, rz);
+        float tx = P0[0] - (M[0] * P0[0] + M[4] * P0[1] + M[8]  * P0[2]);
+        float ty = P0[1] - (M[1] * P0[0] + M[5] * P0[1] + M[9]  * P0[2]);
+        float tz = P0[2] - (M[2] * P0[0] + M[6] * P0[1] + M[10] * P0[2]) + zOff;
+
         uint64_t curAnc = AMRot3DFindParentIdLocked(rt->elementId);
         uint64_t visited[8];
         int depth = 0;
@@ -15128,22 +15140,25 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
                                   fabsf(aBend) >= 0.005f || aLight >= 0.001f);
                 if (ancActive) {
                     anyActive = YES;
-                    if (ancHasRot) {
-                        float Ranc[16], Rmul[16];
-                        AMRot3DMat4Angles(Ranc, aRx, aRy, aRz);
-                        AMRot3DMat4Mul(Rmul, Ranc, R);
-                        memcpy(R, Rmul, sizeof(R));
-                    }
-                    zOff += aZOff;
-                    pz += aPz;
-                    // Map Null's screen-space 3D pivot into child layer-norm coordinates so all children orbit rigidly around the Null!
-                    if (ancRt->isNull || !localHasRot) {
-                        CGPoint nullPivInChild = AMPuppetMulRowMat4(CGPointMake(aPx, aPy), tr->screenToLayer);
-                        if (isfinite(nullPivInChild.x) && isfinite(nullPivInChild.y)) {
-                            px = (float)nullPivInChild.x;
-                            py = (float)nullPivInChild.y;
-                        }
-                    }
+                    CGPoint nullPivInChild = AMPuppetMulRowMat4(CGPointMake(aPx, aPy), tr->screenToLayer);
+                    float Pk[3] = {
+                        isfinite(nullPivInChild.x) ? ((float)nullPivInChild.x * asp) : (0.5f * asp),
+                        isfinite(nullPivInChild.y) ? (float)nullPivInChild.y : 0.5f,
+                        aPz
+                    };
+                    float Ranc[16];
+                    AMRot3DMat4Angles(Ranc, aRx, aRy, aRz);
+                    float Rmul[16];
+                    AMRot3DMat4Mul(Rmul, Ranc, M);
+                    memcpy(M, Rmul, sizeof(M));
+
+                    float rtx = Ranc[0] * tx + Ranc[4] * ty + Ranc[8]  * tz;
+                    float rty = Ranc[1] * tx + Ranc[5] * ty + Ranc[9]  * tz;
+                    float rtz = Ranc[2] * tx + Ranc[6] * ty + Ranc[10] * tz;
+                    tx = rtx + (Pk[0] - (Ranc[0] * Pk[0] + Ranc[4] * Pk[1] + Ranc[8]  * Pk[2]));
+                    ty = rty + (Pk[1] - (Ranc[1] * Pk[0] + Ranc[5] * Pk[1] + Ranc[9]  * Pk[2]));
+                    tz = rtz + (Pk[2] - (Ranc[2] * Pk[0] + Ranc[6] * Pk[1] + Ranc[10] * Pk[2])) + aZOff;
+
                     if (fabsf(bendRad) < 0.005f && fabsf(aBend) >= 0.005f) bendRad = aBend;
                     if (lightAmt < 0.001f && aLight >= 0.001f) lightAmt = aLight;
                     if (bfMode < 0.5f && ancRt->backfaceMode > 0) bfMode = (float)ancRt->backfaceMode;
@@ -15158,20 +15173,25 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
         if (!anyActive) {
             outBuf[magicIdx + 2] = 0.0f;
         } else {
+            float Dx = (M[0] * P0_plane[0] + M[4] * P0_plane[1]) + tx - P0_plane[0];
+            float Dy = (M[1] * P0_plane[0] + M[5] * P0_plane[1]) + ty - P0_plane[1];
+            float Dz = (M[2] * P0_plane[0] + M[6] * P0_plane[1]) + tz;
             float camDist = AMRot3DComputeCameraDist(fov, tr->layerToScreen, gAMRot3DHasActiveCamera);
-            // Upload R^T rows (= columns of column-major R)
+            // Upload M^T rows (= columns of column-major M)
             outBuf[magicIdx + 2]  = 1.0f;
-            outBuf[magicIdx + 3]  = R[0];  outBuf[magicIdx + 4]  = R[1];  outBuf[magicIdx + 5]  = R[2];
-            outBuf[magicIdx + 6]  = R[4];  outBuf[magicIdx + 7]  = R[5];  outBuf[magicIdx + 8]  = R[6];
-            outBuf[magicIdx + 9]  = R[8];  outBuf[magicIdx + 10] = R[9];  outBuf[magicIdx + 11] = R[10];
+            outBuf[magicIdx + 3]  = M[0];  outBuf[magicIdx + 4]  = M[1];  outBuf[magicIdx + 5]  = M[2];
+            outBuf[magicIdx + 6]  = M[4];  outBuf[magicIdx + 7]  = M[5];  outBuf[magicIdx + 8]  = M[6];
+            outBuf[magicIdx + 9]  = M[8];  outBuf[magicIdx + 10] = M[9];  outBuf[magicIdx + 11] = M[10];
             outBuf[magicIdx + 12] = px;
             outBuf[magicIdx + 13] = py;
-            outBuf[magicIdx + 14] = pz;
+            outBuf[magicIdx + 14] = 0.0f; // pivotZ already folded into (Dx, Dy, Dz)
             outBuf[magicIdx + 15] = camDist;
-            outBuf[magicIdx + 16] = zOff;
+            outBuf[magicIdx + 16] = Dz;
             outBuf[magicIdx + 17] = bendRad;
             outBuf[magicIdx + 18] = lightAmt;
             outBuf[magicIdx + 19] = bfMode;
+            outBuf[magicIdx + 20] = Dx;
+            outBuf[magicIdx + 21] = Dy;
         }
     } else {
         outBuf[magicIdx + 2] = 0.0f;
@@ -15828,6 +15848,33 @@ static int AMRot3DSyncOrAttachEffect(void *holder, uint64_t elementId, BOOL atta
     return slot;
 }
 
+static BOOL gAMRot3DLiveSyncQueued = NO;
+static uint64_t gAMRot3DLastSyncNs = 0;
+
+static void *AMRot3DFindActiveHolderOnMain(void) {
+    UIView *pv = AMPuppetFindProjectPreviewView(nil);
+    if (!pv) return NULL;
+    Ivar iv = class_getInstanceVariable([pv class], "holder");
+    return iv ? *(void **)((uint8_t *)(__bridge void *)pv + ivar_getOffset(iv)) : NULL;
+}
+
+static void AMRot3DScheduleLiveHierarchySync(void) {
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (gAMRot3DLiveSyncQueued || (now - gAMRot3DLastSyncNs < 300000000ULL)) return;
+    gAMRot3DLiveSyncQueued = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gAMRot3DLiveSyncQueued = NO;
+        gAMRot3DLastSyncNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        void *holder = AMRot3DFindActiveHolderOnMain();
+        if (!holder) return;
+        BOOL prevCam = gAMRot3DHasActiveCamera;
+        AMRot3DRefreshHierarchyFromHolder(holder, 0, NULL);
+        if (prevCam != gAMRot3DHasActiveCamera) {
+            AMForceImmediatePreviewRedraw();
+        }
+    });
+}
+
 static void AMRot3DSyncAfterParentingChange(void *holder) {
     if (!holder) return;
     AMRot3DRefreshHierarchyFromHolder(holder, 0, NULL);
@@ -15996,7 +16043,7 @@ static UIImage *AMRot3DTabIcon(void) {
     return YES;
 }
 
-- (void)evalCurrentState:(const AMRot3DSlotRuntime *)rt euler:(float[3])euler pivot:(float[3])pivot {
+- (void)evalCurrentState:(const AMRot3DSlotRuntime *)rt euler:(float[3])euler pivot:(float[3])pivot worldMat:(float[16])outMat {
     int64_t tMs = self.currentTimeMs;
     euler[0] = AMRot3DEvalTrackAtMs(&rt->tracks[0], tMs);
     euler[1] = AMRot3DEvalTrackAtMs(&rt->tracks[1], tMs);
@@ -16004,6 +16051,35 @@ static UIImage *AMRot3DTabIcon(void) {
     pivot[0] = AMRot3DEvalTrackAtMs(&rt->tracks[3], tMs);
     pivot[1] = AMRot3DEvalTrackAtMs(&rt->tracks[4], tMs);
     pivot[2] = AMRot3DEvalTrackAtMs(&rt->tracks[5], tMs) / 500.0f;
+    if (outMat) {
+        AMRot3DMat4Angles(outMat, euler[0], euler[1], euler[2]);
+        os_unfair_lock_lock(&gAMRot3DRuntimeLock);
+        uint64_t curAnc = AMRot3DFindParentIdLocked(rt->elementId);
+        uint64_t visited[8];
+        int depth = 0;
+        while (curAnc != 0 && depth < 8) {
+            BOOL seen = (curAnc == rt->elementId);
+            for (int v = 0; v < depth; ++v) {
+                if (visited[v] == curAnc) { seen = YES; break; }
+            }
+            if (seen) break;
+            visited[depth++] = curAnc;
+            const AMRot3DSlotRuntime *ancRt = AMRot3DFindSlotByElementIdLocked(curAnc);
+            if (ancRt) {
+                float aRx = AMRot3DEvalTrackAtMs(&ancRt->tracks[0], tMs);
+                float aRy = AMRot3DEvalTrackAtMs(&ancRt->tracks[1], tMs);
+                float aRz = AMRot3DEvalTrackAtMs(&ancRt->tracks[2], tMs);
+                if (fabsf(aRx) >= 0.001f || fabsf(aRy) >= 0.001f || fabsf(aRz) >= 0.001f) {
+                    float Ranc[16], Rmul[16];
+                    AMRot3DMat4Angles(Ranc, aRx, aRy, aRz);
+                    AMRot3DMat4Mul(Rmul, Ranc, outMat);
+                    memcpy(outMat, Rmul, sizeof(Rmul));
+                }
+            }
+            curAnc = AMRot3DFindParentIdLocked(curAnc);
+        }
+        os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
+    }
 }
 
 - (int)hitTestRingAtPoint:(CGPoint)pt outRingSign:(float *)outSign outPivot:(CGPoint *)outPivot {
@@ -16012,8 +16088,7 @@ static UIImage *AMRot3DTabIcon(void) {
     if (![self getSnapshot:&snap runtime:&rt] || !rt.active || !self.showGizmo) return -1;
 
     float euler[3], piv[3], R[16];
-    [self evalCurrentState:&rt euler:euler pivot:piv];
-    AMRot3DMat4Angles(R, euler[0], euler[1], euler[2]);
+    [self evalCurrentState:&rt euler:euler pivot:piv worldMat:R];
     float asp = (snap.layerSize[1] > 1.0f) ? (snap.layerSize[0] / snap.layerSize[1]) : 1.0f;
     float fov = (rt.fov >= 12.0f && rt.fov <= 95.0f) ? rt.fov : kAMRot3DDefaultFov;
     float cd = AMRot3DComputeCameraDist(fov, snap.valid ? snap.layerToScreen : NULL, gAMRot3DHasActiveCamera);
@@ -16062,8 +16137,7 @@ static UIImage *AMRot3DTabIcon(void) {
     AMRot3DSlotRuntime rt;
     if (![self getSnapshot:&snap runtime:&rt] || !rt.active) return NO;
     float euler[3], piv[3], R[16];
-    [self evalCurrentState:&rt euler:euler pivot:piv];
-    AMRot3DMat4Angles(R, euler[0], euler[1], euler[2]);
+    [self evalCurrentState:&rt euler:euler pivot:piv worldMat:R];
     float asp = (snap.layerSize[1] > 1.0f) ? (snap.layerSize[0] / snap.layerSize[1]) : 1.0f;
     float fov = (rt.fov >= 12.0f && rt.fov <= 95.0f) ? rt.fov : kAMRot3DDefaultFov;
     float cd = AMRot3DComputeCameraDist(fov, snap.valid ? snap.layerToScreen : NULL, gAMRot3DHasActiveCamera);
@@ -16123,7 +16197,7 @@ static UIImage *AMRot3DTabIcon(void) {
     AMRot3DSlotRuntime rt;
     [self getSnapshot:NULL runtime:&rt];
     float piv[3];
-    [self evalCurrentState:&rt euler:_startEuler pivot:piv];
+    [self evalCurrentState:&rt euler:_startEuler pivot:piv worldMat:NULL];
     memcpy(_lastEuler, _startEuler, sizeof(_lastEuler));
     if (axis >= 0) {
         _dragAxis = axis;
@@ -16287,8 +16361,7 @@ static UIImage *AMRot3DTabIcon(void) {
     if (![self getSnapshot:&snap runtime:&rt] || !rt.active) return;
 
     float euler[3], piv[3], R[16];
-    [self evalCurrentState:&rt euler:euler pivot:piv];
-    AMRot3DMat4Angles(R, euler[0], euler[1], euler[2]);
+    [self evalCurrentState:&rt euler:euler pivot:piv worldMat:R];
 
     // Always draw miniature Jex 3D ViewCube in top-right of preview
     [self drawViewCubeInContext:ctx rotationMatrix:R];
