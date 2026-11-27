@@ -716,11 +716,21 @@ static void AMHandleUserLinkFromVC(UIViewController *vc, NSURL *u, BOOL directBy
     }
 }
 
+static const void *kAMSettingsBackupBtnKey = &kAMSettingsBackupBtnKey;
+static void AMPresentBackupVaultFromVC(UIViewController *vc);
+
 @interface AMSettingsLinkHandler : NSObject
 + (void)onTapOpenLink:(UIButton *)btn;
++ (void)onTapOpenBackupVault:(UIButton *)btn;
 @end
 
 @implementation AMSettingsLinkHandler
+
++ (void)onTapOpenBackupVault:(UIButton *)btn {
+    UIViewController *vc = objc_getAssociatedObject(btn, kAMSettingsBackupBtnKey);
+    if (!vc) return;
+    AMPresentBackupVaultFromVC(vc);
+}
 
 + (void)onTapOpenLink:(UIButton *)btn {
     UIViewController *vc = objc_getAssociatedObject(btn, kAMSettingsLinkBtnKey);
@@ -781,7 +791,7 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     CGFloat w = tv.bounds.size.width > 0 ? tv.bounds.size.width : 280.0;
     UIView *existingHdr = tv.tableHeaderView;
     CGFloat existingH = existingHdr ? existingHdr.frame.size.height : 0.0;
-    CGFloat pillContainerH = 50.0;
+    CGFloat pillContainerH = 100.0;
 
     UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, existingH + pillContainerH)];
     header.backgroundColor = [UIColor clearColor];
@@ -817,6 +827,31 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     icon.tintColor = AMSettingsTextColor();
     [pill addSubview:icon];
 
+    UIButton *backupPill = [UIButton buttonWithType:UIButtonTypeSystem];
+    backupPill.translatesAutoresizingMaskIntoConstraints = NO;
+    backupPill.backgroundColor = AMSettingsPillColor();
+    backupPill.layer.cornerRadius = 14.0;
+    backupPill.clipsToBounds = YES;
+    [header addSubview:backupPill];
+
+    UILabel *backupLbl = [[UILabel alloc] init];
+    backupLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    backupLbl.text = @"Save & Backup Vault";
+    backupLbl.font = AMThemeFont(14.0, UIFontWeightMedium);
+    backupLbl.textColor = AMSettingsTextColor();
+    backupLbl.userInteractionEnabled = NO;
+    [backupPill addSubview:backupLbl];
+
+    UIImageView *backupIcon = [[UIImageView alloc] init];
+    backupIcon.translatesAutoresizingMaskIntoConstraints = NO;
+    backupIcon.userInteractionEnabled = NO;
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:13.0 weight:UIImageSymbolWeightMedium];
+        backupIcon.image = [UIImage systemImageNamed:@"externaldrive.badge.checkmark" withConfiguration:cfg];
+    }
+    backupIcon.tintColor = AMSettingsTextColor();
+    [backupPill addSubview:backupIcon];
+
     [NSLayoutConstraint activateConstraints:@[
         [pill.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16.0],
         [pill.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16.0],
@@ -828,12 +863,28 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
 
         [icon.trailingAnchor constraintEqualToAnchor:pill.trailingAnchor constant:-15.0],
         [icon.centerYAnchor constraintEqualToAnchor:pill.centerYAnchor],
+
+        [backupPill.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16.0],
+        [backupPill.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16.0],
+        [backupPill.topAnchor constraintEqualToAnchor:pill.bottomAnchor constant:8.0],
+        [backupPill.heightAnchor constraintEqualToConstant:42.0],
+
+        [backupLbl.leadingAnchor constraintEqualToAnchor:backupPill.leadingAnchor constant:16.0],
+        [backupLbl.centerYAnchor constraintEqualToAnchor:backupPill.centerYAnchor],
+
+        [backupIcon.trailingAnchor constraintEqualToAnchor:backupPill.trailingAnchor constant:-15.0],
+        [backupIcon.centerYAnchor constraintEqualToAnchor:backupPill.centerYAnchor],
     ]];
 
     objc_setAssociatedObject(pill, kAMSettingsLinkBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
     [pill addTarget:[AMSettingsLinkHandler class]
              action:@selector(onTapOpenLink:)
    forControlEvents:UIControlEventTouchUpInside];
+
+    objc_setAssociatedObject(backupPill, kAMSettingsBackupBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
+    [backupPill addTarget:[AMSettingsLinkHandler class]
+                   action:@selector(onTapOpenBackupVault:)
+         forControlEvents:UIControlEventTouchUpInside];
 
     tv.tableHeaderView = header;
     objc_setAssociatedObject(vc, kAMSettingsLinkBtnKey, pill, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -3125,6 +3176,7 @@ static void AMHook_effectCategoryViewWillAppear(id self, SEL _cmd, BOOL animated
 static BOOL gAMSearchModalOpen = NO;
 static BOOL gAMFoldersModalOpen = NO;
 static BOOL gAMImportModalOpen = NO;
+static BOOL gAMBackupModalOpen = NO;
 
 static UIWindow *AMKeyWindow(void) {
     UIApplication *app = [UIApplication sharedApplication];
@@ -3169,6 +3221,7 @@ static BOOL AMVCTreeContainsEditor(UIViewController *vc, NSInteger depth) {
         [clsName containsString:@"AMAssignFolderVC"] ||
         [clsName containsString:@"AMProjectMultiPickerVC"] ||
         [clsName containsString:@"AMOriginalProjectsImporterVC"] ||
+        [clsName containsString:@"AMBackupVaultVC"] ||
         [clsName containsString:@"Loading"] ||
         [clsName containsString:@"Splash"] ||
         [clsName containsString:@"Launch"]) {
@@ -3212,7 +3265,7 @@ static BOOL AMHomepageModalCovering(UIWindow *win, UIViewController *mainVC) {
 
 static BOOL AMIsOnHomepage(UIWindow *win) {
     if (!win || !win.rootViewController) return NO;
-    if (gAMIntroActive || gAMSearchModalOpen || gAMFoldersModalOpen || gAMImportModalOpen) return NO;
+    if (gAMIntroActive || gAMSearchModalOpen || gAMFoldersModalOpen || gAMImportModalOpen || gAMBackupModalOpen) return NO;
     UIViewController *root = win.rootViewController;
     if ([root isKindOfClass:[UINavigationController class]]) {
         UINavigationController *nav = (UINavigationController *)root;
@@ -3469,7 +3522,7 @@ static NSArray<NSDictionary *> *AMLoadUserProjectsFromDisk(void) {
 
     NSSet<NSString *> *skipTopDirs = [NSSet setWithArray:@[
         @"Caches", @"Preferences", @"Cookies", @"SplashBoard", @"Saved Application State",
-        @"HTTPStorages", @"WebKit", @"CustomEffects", @"ProjectFolders", @"Firebase",
+        @"HTTPStorages", @"WebKit", @"CustomEffects", @"ProjectFolders", @"RockMotionBackup", @"Firebase",
         @"Google", @"Amplitude", @"Logs", @"Crashlytics", @"com.apple.nsurlsessiond", @"Inbox"
     ]];
 
@@ -6023,7 +6076,7 @@ static NSArray<NSDictionary *> *AMScanProjectsInDirectory(NSString *rootDir, NSS
 
     NSSet<NSString *> *skipTopDirs = [NSSet setWithArray:@[
         @"Caches", @"Preferences", @"Cookies", @"SplashBoard", @"Saved Application State",
-        @"HTTPStorages", @"WebKit", @"CustomEffects", @"ProjectFolders", @"Firebase",
+        @"HTTPStorages", @"WebKit", @"CustomEffects", @"ProjectFolders", @"RockMotionBackup", @"Firebase",
         @"Google", @"Amplitude", @"Logs", @"Crashlytics", @"com.apple.nsurlsessiond", @"Inbox"
     ]];
 
@@ -6848,12 +6901,1483 @@ static void AMQueueSequentialAmprojImports(NSArray<NSURL *> *urls) {
 @end
 
 // ============================================================================
-// Unified Homepage Overlay Manager (Search, Import, + Folder, Inline Folders, Assign)
+// Module 8: Blacklist-Proof Save & Backup Vault (Projects, Fonts, Effects, Prefs)
+// ============================================================================
+
+static NSString *const kAMBackupExternalBookmarkKey = @"AMBackupExternalFolderBookmark";
+static NSString *const kAMBackupExternalNameKey     = @"AMBackupExternalFolderName";
+static NSString *const kAMBackupAutoSaveEnabledKey  = @"AMBackupAutoSaveOnExitEnabled";
+static NSString *const kAMBackupLocalMirrorKey      = @"AMBackupLocalFilesMirrorEnabled";
+static NSString *const kAMBackupLastSavedAtKey      = @"AMBackupLastSavedTimestamp";
+static NSString *const kAMBackupLastSummaryKey      = @"AMBackupLastSavedSummary";
+
+static NSString *AMBackupFormatBytes(uint64_t bytes) {
+    if (bytes < 1024ULL) return [NSString stringWithFormat:@"%llu B", bytes];
+    if (bytes < 1024ULL * 1024ULL) return [NSString stringWithFormat:@"%.1f KB", (double)bytes / 1024.0];
+    if (bytes < 1024ULL * 1024ULL * 1024ULL) return [NSString stringWithFormat:@"%.1f MB", (double)bytes / (1024.0 * 1024.0)];
+    return [NSString stringWithFormat:@"%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0)];
+}
+
+static NSSet<NSString *> *AMBackupSkippedLibraryTopDirs(void) {
+    static NSSet<NSString *> *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s = [NSSet setWithArray:@[
+            @"Caches", @"Preferences", @"Cookies", @"SplashBoard",
+            @"Saved Application State", @"HTTPStorages", @"WebKit",
+            @"Logs", @"com.apple.nsurlsessiond", @"Firebase",
+            @"Google", @"Amplitude", @"Crashlytics"
+        ]];
+    });
+    return s;
+}
+
+static NSSet<NSString *> *AMBackupSkippedDocumentsTopDirs(void) {
+    static NSSet<NSString *> *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s = [NSSet setWithArray:@[
+            @"RockMotionBackup", @"Inbox", @".Trash"
+        ]];
+    });
+    return s;
+}
+
+static NSSet<NSString *> *AMBackupInternalPrefKeys(void) {
+    static NSSet<NSString *> *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s = [NSSet setWithArray:@[
+            kAMBackupExternalBookmarkKey,
+            kAMBackupExternalNameKey,
+            kAMBackupLastSavedAtKey,
+            kAMBackupLastSummaryKey
+        ]];
+    });
+    return s;
+}
+
+static BOOL AMBackupIsFontFile(NSString *relPath) {
+    NSString *ext = relPath.pathExtension.lowercaseString ?: @"";
+    return ([ext isEqualToString:@"ttf"] ||
+            [ext isEqualToString:@"otf"] ||
+            [ext isEqualToString:@"ttc"] ||
+            [ext isEqualToString:@"woff"] ||
+            [ext isEqualToString:@"woff2"]);
+}
+
+static NSDictionary<NSString *, NSString *> *AMBackupReadAllXattrs(NSString *filePath) {
+    const char *p = filePath.UTF8String;
+    if (!p) return nil;
+    ssize_t listSz = listxattr(p, NULL, 0, 0);
+    if (listSz <= 0 || listSz > 65536) return nil;
+    NSMutableData *nameBuf = [NSMutableData dataWithLength:(NSUInteger)listSz];
+    ssize_t got = listxattr(p, (char *)nameBuf.mutableBytes, (size_t)listSz, 0);
+    if (got <= 0) return nil;
+
+    NSMutableDictionary<NSString *, NSString *> *out = [NSMutableDictionary dictionary];
+    const char *cursor = (const char *)nameBuf.bytes;
+    const char *end = cursor + got;
+    while (cursor < end) {
+        size_t len = strnlen(cursor, (size_t)(end - cursor));
+        if (len == 0) {
+            cursor++;
+            continue;
+        }
+        NSString *attrName = [[NSString alloc] initWithBytes:cursor length:len encoding:NSUTF8StringEncoding];
+        if (attrName.length > 0 &&
+            ![attrName hasPrefix:@"com.apple.quarantine"] &&
+            ![attrName hasPrefix:@"com.apple.provenance"] &&
+            ![attrName hasPrefix:@"com.apple.macl"]) {
+            ssize_t vsz = getxattr(p, cursor, NULL, 0, 0, 0);
+            if (vsz > 0 && vsz <= 131072) {
+                NSMutableData *vbuf = [NSMutableData dataWithLength:(NSUInteger)vsz];
+                if (getxattr(p, cursor, vbuf.mutableBytes, (size_t)vsz, 0, 0) > 0) {
+                    out[attrName] = [vbuf base64EncodedStringWithOptions:0];
+                }
+            }
+        }
+        cursor += len + 1;
+    }
+    return out.count > 0 ? out : nil;
+}
+
+static void AMBackupApplyXattrs(NSString *filePath, NSDictionary<NSString *, NSString *> *xattrs) {
+    if (filePath.length == 0 || xattrs.count == 0) return;
+    const char *p = filePath.UTF8String;
+    if (!p) return;
+    for (NSString *attrName in xattrs) {
+        NSString *b64 = xattrs[attrName];
+        if (![attrName isKindOfClass:[NSString class]] || ![b64 isKindOfClass:[NSString class]]) continue;
+        NSData *raw = [[NSData alloc] initWithBase64EncodedString:b64 options:0];
+        if (raw.length > 0) {
+            setxattr(p, attrName.UTF8String, raw.bytes, raw.length, 0, 0);
+        }
+    }
+}
+
+static void AMBackupRegisterFontIfPossible(NSString *fontPath) {
+    typedef bool (*am_ct_reg_fn)(CFURLRef, uint32_t, CFErrorRef *);
+    static am_ct_reg_fn sRegFn = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        sRegFn = (am_ct_reg_fn)dlsym(RTLD_DEFAULT, "CTFontManagerRegisterFontsForURL");
+    });
+    if (!sRegFn || fontPath.length == 0) return;
+    NSURL *u = [NSURL fileURLWithPath:fontPath];
+    CFErrorRef err = NULL;
+    sRegFn((__bridge CFURLRef)u, 1 /* kCTFontManagerScopeProcess */, &err);
+    if (err) CFRelease(err);
+}
+
+static BOOL AMBackupFileUnchanged(NSFileManager *fm, NSString *srcPath, NSString *dstPath) {
+    if (![fm fileExistsAtPath:dstPath]) return NO;
+    NSDictionary *sa = [fm attributesOfItemAtPath:srcPath error:nil];
+    NSDictionary *da = [fm attributesOfItemAtPath:dstPath error:nil];
+    if (!sa || !da) return NO;
+    unsigned long long ssz = [sa[NSFileSize] unsignedLongLongValue];
+    unsigned long long dsz = [da[NSFileSize] unsignedLongLongValue];
+    if (ssz != dsz) return NO;
+    NSDate *sm = sa[NSFileModificationDate];
+    NSDate *dm = da[NSFileModificationDate];
+    if (sm && dm && fabs([sm timeIntervalSinceDate:dm]) <= 2.0) {
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL AMBackupCopyFilePreserveMeta(NSFileManager *fm, NSString *srcPath, NSString *dstPath, NSError **outErr) {
+    NSString *dstParent = [dstPath stringByDeletingLastPathComponent];
+    if (dstParent.length > 0 && ![fm fileExistsAtPath:dstParent]) {
+        [fm createDirectoryAtPath:dstParent withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    if (AMBackupFileUnchanged(fm, srcPath, dstPath)) {
+        return YES;
+    }
+    if ([fm fileExistsAtPath:dstPath]) {
+        [fm removeItemAtPath:dstPath error:nil];
+    }
+    NSError *cpErr = nil;
+    if (![fm copyItemAtPath:srcPath toPath:dstPath error:&cpErr]) {
+        if (outErr) *outErr = cpErr;
+        return NO;
+    }
+    NSDictionary *sa = [fm attributesOfItemAtPath:srcPath error:nil];
+    NSDate *sm = sa[NSFileModificationDate];
+    if (sm) {
+        [fm setAttributes:@{NSFileModificationDate: sm} ofItemAtPath:dstPath error:nil];
+    }
+    return YES;
+}
+
+@interface AMBackupManager : NSObject
+@property (nonatomic, strong) dispatch_queue_t ioQueue;
+@property (nonatomic, assign) BOOL isBusy;
+@property (nonatomic, assign) NSTimeInterval lastAutoSaveEpoch;
++ (instancetype)shared;
+- (void)startAutoSaveObservers;
+- (BOOL)isAutoSaveEnabled;
+- (void)setAutoSaveEnabled:(BOOL)enabled;
+- (BOOL)isLocalMirrorEnabled;
+- (void)setLocalMirrorEnabled:(BOOL)enabled;
+- (BOOL)hasLinkedExternalFolder;
+- (NSString *)linkedExternalFolderName;
+- (BOOL)linkExternalFolderURL:(NSURL *)folderURL error:(NSError **)outError;
+- (void)unlinkExternalFolder;
+- (NSString *)localMirrorDirectory;
+- (NSDate * _Nullable)lastSavedDate;
+- (NSString *)lastSavedSummary;
+- (NSDictionary *)collectLiveInventory;
+- (NSDictionary * _Nullable)inspectBackupAtPickedURL:(NSURL *)pickedURL resolvedRootPath:(NSString * _Nullable * _Nullable)outRootPath;
+- (void)performBackupWithProgress:(void (^ _Nullable)(float progress, NSString *status))progressBlock
+                       completion:(void (^ _Nullable)(BOOL ok, NSString *message))completion;
+- (void)performRestoreFromPickedURL:(NSURL *)pickedURL
+                        replaceMode:(BOOL)replaceMode
+                           progress:(void (^ _Nullable)(float progress, NSString *status))progressBlock
+                         completion:(void (^ _Nullable)(BOOL ok, NSString *message))completion;
+@end
+
+@implementation AMBackupManager
+
++ (instancetype)shared {
+    static AMBackupManager *inst = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        inst = [[AMBackupManager alloc] init];
+    });
+    return inst;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _ioQueue = dispatch_queue_create("com.rockmotion.backup.io", DISPATCH_QUEUE_SERIAL);
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        if ([ud objectForKey:kAMBackupAutoSaveEnabledKey] == nil) {
+            [ud setBool:YES forKey:kAMBackupAutoSaveEnabledKey];
+        }
+        if ([ud objectForKey:kAMBackupLocalMirrorKey] == nil) {
+            [ud setBool:YES forKey:kAMBackupLocalMirrorKey];
+        }
+        [ud synchronize];
+    }
+    return self;
+}
+
+- (void)startAutoSaveObservers {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(onAppDidEnterBackground)
+                                                     name:UIApplicationDidEnterBackgroundNotification
+                                                   object:nil];
+    });
+}
+
+- (void)onAppDidEnterBackground {
+    if (![self isAutoSaveEnabled]) return;
+    if (![self hasLinkedExternalFolder] && ![self isLocalMirrorEnabled]) return;
+    if (self.isBusy) return;
+
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (self.lastAutoSaveEpoch > 0 && (now - self.lastAutoSaveEpoch) < 180.0) {
+        return; // Throttle automatic background syncs to once every 3 minutes
+    }
+    self.lastAutoSaveEpoch = now;
+
+    UIApplication *app = [UIApplication sharedApplication];
+    __block UIBackgroundTaskIdentifier bgTask = UIBackgroundTaskInvalid;
+    bgTask = [app beginBackgroundTaskWithName:@"RockMotionAutoBackup" expirationHandler:^{
+        if (bgTask != UIBackgroundTaskInvalid) {
+            [app endBackgroundTask:bgTask];
+            bgTask = UIBackgroundTaskInvalid;
+        }
+    }];
+
+    [self performBackupWithProgress:nil completion:^(BOOL ok, NSString *message) {
+        (void)ok;
+        (void)message;
+        if (bgTask != UIBackgroundTaskInvalid) {
+            [app endBackgroundTask:bgTask];
+            bgTask = UIBackgroundTaskInvalid;
+        }
+    }];
+}
+
+- (BOOL)isAutoSaveEnabled {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kAMBackupAutoSaveEnabledKey];
+}
+
+- (void)setAutoSaveEnabled:(BOOL)enabled {
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kAMBackupAutoSaveEnabledKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (BOOL)isLocalMirrorEnabled {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:kAMBackupLocalMirrorKey];
+}
+
+- (void)setLocalMirrorEnabled:(BOOL)enabled {
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kAMBackupLocalMirrorKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (BOOL)hasLinkedExternalFolder {
+    return [[NSUserDefaults standardUserDefaults] dataForKey:kAMBackupExternalBookmarkKey].length > 0;
+}
+
+- (NSString *)linkedExternalFolderName {
+    return [[NSUserDefaults standardUserDefaults] stringForKey:kAMBackupExternalNameKey] ?: @"";
+}
+
+- (BOOL)linkExternalFolderURL:(NSURL *)folderURL error:(NSError **)outError {
+    if (!folderURL) return NO;
+    BOOL scoped = [folderURL startAccessingSecurityScopedResource];
+    NSError *err = nil;
+    NSData *bookmark = [folderURL bookmarkDataWithOptions:0
+                           includingResourceValuesForKeys:nil
+                                            relativeToURL:nil
+                                                    error:&err];
+    NSString *displayName = folderURL.lastPathComponent ?: @"External Folder";
+    if (scoped) [folderURL stopAccessingSecurityScopedResource];
+    if (!bookmark) {
+        if (outError) *outError = err;
+        return NO;
+    }
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setObject:bookmark forKey:kAMBackupExternalBookmarkKey];
+    [ud setObject:displayName forKey:kAMBackupExternalNameKey];
+    [ud synchronize];
+    return YES;
+}
+
+- (void)unlinkExternalFolder {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud removeObjectForKey:kAMBackupExternalBookmarkKey];
+    [ud removeObjectForKey:kAMBackupExternalNameKey];
+    [ud synchronize];
+}
+
+- (NSURL * _Nullable)resolveExternalFolderURL {
+    NSData *bm = [[NSUserDefaults standardUserDefaults] dataForKey:kAMBackupExternalBookmarkKey];
+    if (bm.length == 0) return nil;
+    BOOL isStale = NO;
+    NSError *err = nil;
+    NSURL *url = [NSURL URLByResolvingBookmarkData:bm options:0 relativeToURL:nil bookmarkDataIsStale:&isStale error:&err];
+    if (!url) return nil;
+    if (isStale) {
+        BOOL scoped = [url startAccessingSecurityScopedResource];
+        NSData *fresh = [url bookmarkDataWithOptions:0 includingResourceValuesForKeys:nil relativeToURL:nil error:nil];
+        if (scoped) [url stopAccessingSecurityScopedResource];
+        if (fresh.length > 0) {
+            [[NSUserDefaults standardUserDefaults] setObject:fresh forKey:kAMBackupExternalBookmarkKey];
+            [[NSUserDefaults standardUserDefaults] synchronize];
+        }
+    }
+    return url;
+}
+
+- (NSString *)localMirrorDirectory {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: @"";
+    return [docs stringByAppendingPathComponent:@"RockMotionBackup"];
+}
+
+- (NSDate * _Nullable)lastSavedDate {
+    double ts = [[NSUserDefaults standardUserDefaults] doubleForKey:kAMBackupLastSavedAtKey];
+    return ts > 0.0 ? [NSDate dateWithTimeIntervalSince1970:ts] : nil;
+}
+
+- (NSString *)lastSavedSummary {
+    return [[NSUserDefaults standardUserDefaults] stringForKey:kAMBackupLastSummaryKey] ?: @"";
+}
+
+// Collects all files to back up as array of @{@"src": fullPath, @"rel": @"Library/..." or @"Documents/..."}
+- (NSArray<NSDictionary<NSString *, id> *> *)collectSourceFileEntriesWithStats:(NSMutableDictionary *)outStats {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *libDir = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject ?: @"";
+    NSString *docsDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: @"";
+
+    NSMutableArray<NSDictionary<NSString *, id> *> *entries = [NSMutableArray array];
+    NSInteger projectCount = 0;
+    NSInteger mediaCount = 0;
+    NSInteger fontCount = 0;
+    NSInteger effectCount = 0;
+    uint64_t totalBytes = 0;
+
+    // 1. Library/ (excluding transient caches/OS/SDK dirs)
+    NSSet<NSString *> *skipLib = AMBackupSkippedLibraryTopDirs();
+    if (libDir.length > 0) {
+        NSDirectoryEnumerator<NSString *> *en = [fm enumeratorAtPath:libDir];
+        NSString *rel = nil;
+        while ((rel = [en nextObject]) != nil) {
+            NSString *firstComp = rel.pathComponents.firstObject ?: @"";
+            if ([skipLib containsObject:firstComp]) {
+                [en skipDescendants];
+                continue;
+            }
+            if ([rel.lastPathComponent isEqualToString:@".DS_Store"]) continue;
+            NSString *full = [libDir stringByAppendingPathComponent:rel];
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+            NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
+            unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
+            totalBytes += sz;
+
+            NSString *ext = rel.pathExtension.lowercaseString ?: @"";
+            if ([firstComp isEqualToString:@"media"]) {
+                mediaCount++;
+            } else if (AMBackupIsFontFile(rel)) {
+                fontCount++;
+            } else if ([ext isEqualToString:@"xml"] && ![rel containsString:@"/"]) {
+                projectCount++;
+            }
+
+            [entries addObject:@{
+                @"src": full,
+                @"rel": [@"Library" stringByAppendingPathComponent:rel],
+                @"size": @(sz)
+            }];
+        }
+
+        // 1b. Explicitly include Library/Caches/projectThumbnails/
+        NSString *thumbsDir = [libDir stringByAppendingPathComponent:@"Caches/projectThumbnails"];
+        if ([fm fileExistsAtPath:thumbsDir]) {
+            NSDirectoryEnumerator<NSString *> *ten = [fm enumeratorAtPath:thumbsDir];
+            NSString *trel = nil;
+            while ((trel = [ten nextObject]) != nil) {
+                if ([trel.lastPathComponent isEqualToString:@".DS_Store"]) continue;
+                NSString *full = [thumbsDir stringByAppendingPathComponent:trel];
+                BOOL isDir = NO;
+                if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+                NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
+                unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
+                totalBytes += sz;
+                [entries addObject:@{
+                    @"src": full,
+                    @"rel": [@"Library/Caches/projectThumbnails" stringByAppendingPathComponent:trel],
+                    @"size": @(sz)
+                }];
+            }
+        }
+    }
+
+    // 2. Documents/ (excluding RockMotionBackup & Inbox)
+    NSSet<NSString *> *skipDocs = AMBackupSkippedDocumentsTopDirs();
+    if (docsDir.length > 0) {
+        NSDirectoryEnumerator<NSString *> *en = [fm enumeratorAtPath:docsDir];
+        NSString *rel = nil;
+        while ((rel = [en nextObject]) != nil) {
+            NSString *firstComp = rel.pathComponents.firstObject ?: @"";
+            if ([skipDocs containsObject:firstComp]) {
+                [en skipDescendants];
+                continue;
+            }
+            if ([rel.lastPathComponent isEqualToString:@".DS_Store"]) continue;
+            NSString *full = [docsDir stringByAppendingPathComponent:rel];
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+            NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
+            unsigned long long sz = [attrs[NSFileSize] unsignedLongLongValue];
+            totalBytes += sz;
+
+            NSString *ext = rel.pathExtension.lowercaseString ?: @"";
+            if ([firstComp isEqualToString:@"CustomEffects"] && [ext isEqualToString:@"xml"]) {
+                effectCount++;
+            } else if (AMBackupIsFontFile(rel)) {
+                fontCount++;
+            }
+
+            [entries addObject:@{
+                @"src": full,
+                @"rel": [@"Documents" stringByAppendingPathComponent:rel],
+                @"size": @(sz)
+            }];
+        }
+    }
+
+    if (outStats) {
+        outStats[@"projects"] = @(projectCount);
+        outStats[@"media"] = @(mediaCount);
+        outStats[@"fonts"] = @(fontCount);
+        outStats[@"customEffects"] = @(effectCount);
+        outStats[@"totalFiles"] = @(entries.count);
+        outStats[@"totalBytes"] = @(totalBytes);
+    }
+    return entries;
+}
+
+- (NSDictionary *)collectLiveInventory {
+    NSMutableDictionary *stats = [NSMutableDictionary dictionary];
+    [self collectSourceFileEntriesWithStats:stats];
+    return stats;
+}
+
+- (NSString *)targetBackupRootInsideDirectory:(NSString *)pickedPath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *name = pickedPath.lastPathComponent ?: @"";
+    if ([name isEqualToString:@"RockMotionSave"] ||
+        [name isEqualToString:@"RockMotionBackup"] ||
+        [fm fileExistsAtPath:[pickedPath stringByAppendingPathComponent:@"manifest.json"]]) {
+        return pickedPath;
+    }
+    return [pickedPath stringByAppendingPathComponent:@"RockMotionSave"];
+}
+
+- (BOOL)writeBackupSnapshotToRoot:(NSString *)backupRoot
+                          entries:(NSArray<NSDictionary<NSString *, id> *> *)entries
+                            stats:(NSDictionary *)stats
+                    progressBase:(float)progressBase
+                    progressSpan:(float)progressSpan
+                         progress:(void (^ _Nullable)(float progress, NSString *status))progressBlock
+                            error:(NSError **)outError {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *dirErr = nil;
+    if (![fm createDirectoryAtPath:backupRoot withIntermediateDirectories:YES attributes:nil error:&dirErr]) {
+        if (outError) *outError = dirErr;
+        return NO;
+    }
+
+    NSMutableSet<NSString *> *liveRelSet = [NSMutableSet setWithCapacity:entries.count];
+    NSMutableDictionary<NSString *, NSDictionary<NSString *, NSString *> *> *xattrsMap = [NSMutableDictionary dictionary];
+
+    NSUInteger total = entries.count;
+    for (NSUInteger i = 0; i < total; i++) {
+        NSDictionary *item = entries[i];
+        NSString *src = item[@"src"];
+        NSString *rel = item[@"rel"];
+        [liveRelSet addObject:rel];
+
+        NSString *dst = [backupRoot stringByAppendingPathComponent:rel];
+        NSError *cpErr = nil;
+        if (!AMBackupCopyFilePreserveMeta(fm, src, dst, &cpErr)) {
+            if (outError && !*outError) *outError = cpErr;
+        }
+
+        // Capture extended attributes (especially com.alightcreative.motion.sceneinfo)
+        NSDictionary<NSString *, NSString *> *xa = AMBackupReadAllXattrs(src);
+        if (xa.count > 0) {
+            xattrsMap[rel] = xa;
+        }
+
+        if (progressBlock && (i % 8 == 0 || i + 1 == total)) {
+            float frac = total > 0 ? ((float)(i + 1) / (float)total) : 1.0f;
+            float p = progressBase + progressSpan * (0.85f * frac);
+            NSString *msg = [NSString stringWithFormat:@"Saving files (%lu / %lu)...", (unsigned long)(i + 1), (unsigned long)total];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                progressBlock(p, msg);
+            });
+        }
+    }
+
+    // Prune stale files from Library/ and Documents/ inside backupRoot that no longer exist
+    for (NSString *sub in @[@"Library", @"Documents"]) {
+        NSString *subDir = [backupRoot stringByAppendingPathComponent:sub];
+        if (![fm fileExistsAtPath:subDir]) continue;
+        NSMutableArray<NSString *> *stalePaths = [NSMutableArray array];
+        NSDirectoryEnumerator<NSString *> *en = [fm enumeratorAtPath:subDir];
+        NSString *rel = nil;
+        while ((rel = [en nextObject]) != nil) {
+            NSString *full = [subDir stringByAppendingPathComponent:rel];
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+            NSString *fullRel = [sub stringByAppendingPathComponent:rel];
+            if (![liveRelSet containsObject:fullRel]) {
+                [stalePaths addObject:full];
+            }
+        }
+        for (NSString *sp in stalePaths) {
+            [fm removeItemAtPath:sp error:nil];
+        }
+    }
+
+    // Save portable preferences.plist (remappable to any new Bundle ID on restore)
+    NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.alightcreative.motion";
+    NSDictionary *domain = [[NSUserDefaults standardUserDefaults] persistentDomainForName:bundleId];
+    if (domain.count == 0) {
+        NSString *libDir = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject ?: @"";
+        NSString *prefPath = [libDir stringByAppendingPathComponent:[NSString stringWithFormat:@"Preferences/%@.plist", bundleId]];
+        domain = [NSDictionary dictionaryWithContentsOfFile:prefPath];
+    }
+    if (domain.count > 0) {
+        NSMutableDictionary *cleanPrefs = [NSMutableDictionary dictionary];
+        NSSet<NSString *> *skipKeys = AMBackupInternalPrefKeys();
+        for (NSString *k in domain) {
+            if ([skipKeys containsObject:k]) continue;
+            cleanPrefs[k] = domain[k];
+        }
+        NSData *plistData = [NSPropertyListSerialization dataWithPropertyList:cleanPrefs
+                                                                       format:NSPropertyListBinaryFormat_v1_0
+                                                                      options:0
+                                                                        error:nil];
+        if (plistData.length > 0) {
+            [plistData writeToFile:[backupRoot stringByAppendingPathComponent:@"preferences.plist"] atomically:YES];
+        }
+    }
+
+    // Write manifest.json with inventory + full xattr map
+    NSString *appVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"6.2.60";
+    NSString *appBuild = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"869";
+    NSDictionary *manifest = @{
+        @"formatVersion": @1,
+        @"createdAt": @((long long)[[NSDate date] timeIntervalSince1970]),
+        @"appVersion": appVer,
+        @"appBuild": appBuild,
+        @"sourceBundleId": bundleId,
+        @"counts": stats ?: @{},
+        @"xattrs": xattrsMap
+    };
+    NSData *mdata = [NSJSONSerialization dataWithJSONObject:manifest options:NSJSONWritingPrettyPrinted error:nil];
+    if (mdata.length > 0) {
+        [mdata writeToFile:[backupRoot stringByAppendingPathComponent:@"manifest.json"] atomically:YES];
+    }
+
+    if (progressBlock) {
+        float endP = progressBase + progressSpan;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            progressBlock(endP, @"Finalizing snapshot...");
+        });
+    }
+    return YES;
+}
+
+- (void)performBackupWithProgress:(void (^ _Nullable)(float progress, NSString *status))progressBlock
+                       completion:(void (^ _Nullable)(BOOL ok, NSString *message))completion {
+    if (self.isBusy) {
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(NO, @"Backup or restore already in progress.");
+            });
+        }
+        return;
+    }
+    self.isBusy = YES;
+
+    dispatch_async(self.ioQueue, ^{
+        @autoreleasepool {
+            if (progressBlock) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    progressBlock(0.05f, @"Scanning projects, fonts & effects...");
+                });
+            }
+
+            NSMutableDictionary *stats = [NSMutableDictionary dictionary];
+            NSArray<NSDictionary<NSString *, id> *> *entries = [self collectSourceFileEntriesWithStats:stats];
+
+            BOOL doExternal = [self hasLinkedExternalFolder];
+            BOOL doLocal = [self isLocalMirrorEnabled];
+
+            if (!doExternal && !doLocal) {
+                self.isBusy = NO;
+                if (completion) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        completion(NO, @"Link an external Save Folder or enable Local Files Mirror first.");
+                    });
+                }
+                return;
+            }
+
+            BOOL anyOk = NO;
+            NSMutableArray<NSString *> *savedTargets = [NSMutableArray array];
+            NSMutableArray<NSString *> *errors = [NSMutableArray array];
+
+            if (doExternal) {
+                NSURL *extURL = [self resolveExternalFolderURL];
+                if (extURL) {
+                    BOOL scoped = [extURL startAccessingSecurityScopedResource];
+                    NSString *targetRoot = [self targetBackupRootInsideDirectory:extURL.path];
+                    NSError *err = nil;
+                    float span = doLocal ? 0.45f : 0.90f;
+                    BOOL ok = [self writeBackupSnapshotToRoot:targetRoot
+                                                      entries:entries
+                                                        stats:stats
+                                                 progressBase:0.08f
+                                                 progressSpan:span
+                                                     progress:progressBlock
+                                                        error:&err];
+                    if (scoped) [extURL stopAccessingSecurityScopedResource];
+                    if (ok) {
+                        anyOk = YES;
+                        [savedTargets addObject:[NSString stringWithFormat:@"External (%@)", [self linkedExternalFolderName]]];
+                    } else {
+                        [errors addObject:err.localizedDescription ?: @"External folder write failed"];
+                    }
+                } else {
+                    [errors addObject:@"External folder bookmark expired — please re-link it"];
+                }
+            }
+
+            if (doLocal) {
+                NSString *localRoot = [self localMirrorDirectory];
+                NSError *err = nil;
+                float base = doExternal ? 0.55f : 0.08f;
+                float span = doExternal ? 0.42f : 0.90f;
+                BOOL ok = [self writeBackupSnapshotToRoot:localRoot
+                                                  entries:entries
+                                                    stats:stats
+                                             progressBase:base
+                                             progressSpan:span
+                                                 progress:progressBlock
+                                                    error:&err];
+                if (ok) {
+                    anyOk = YES;
+                    [savedTargets addObject:@"Files Mirror (RockMotionBackup)"];
+                } else {
+                    [errors addObject:err.localizedDescription ?: @"Local mirror write failed"];
+                }
+            }
+
+            NSString *summary = [NSString stringWithFormat:@"%@ projects • %@ effects • %@ fonts • %@",
+                                 stats[@"projects"] ?: @0,
+                                 stats[@"customEffects"] ?: @0,
+                                 stats[@"fonts"] ?: @0,
+                                 AMBackupFormatBytes([stats[@"totalBytes"] unsignedLongLongValue])];
+
+            if (anyOk) {
+                NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+                [ud setDouble:[[NSDate date] timeIntervalSince1970] forKey:kAMBackupLastSavedAtKey];
+                [ud setObject:summary forKey:kAMBackupLastSummaryKey];
+                [ud synchronize];
+            }
+
+            NSString *finalMsg = nil;
+            if (anyOk && errors.count == 0) {
+                finalMsg = [NSString stringWithFormat:@"Saved to %@.\n%@", [savedTargets componentsJoinedByString:@" + "], summary];
+            } else if (anyOk) {
+                finalMsg = [NSString stringWithFormat:@"Saved to %@ (warning: %@).\n%@",
+                            [savedTargets componentsJoinedByString:@" + "],
+                            [errors componentsJoinedByString:@"; "],
+                            summary];
+            } else {
+                finalMsg = [NSString stringWithFormat:@"Backup failed: %@", [errors componentsJoinedByString:@"; "]];
+            }
+
+            self.isBusy = NO;
+            if (completion) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completion(anyOk, finalMsg);
+                });
+            }
+        }
+    });
+}
+
+- (NSDictionary * _Nullable)inspectBackupAtPickedURL:(NSURL *)pickedURL resolvedRootPath:(NSString * _Nullable * _Nullable)outRootPath {
+    if (!pickedURL) return nil;
+    BOOL scoped = [pickedURL startAccessingSecurityScopedResource];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    NSString *base = pickedURL.path ?: @"";
+    NSArray<NSString *> *candidates = @[
+        base,
+        [base stringByAppendingPathComponent:@"RockMotionSave"],
+        [base stringByAppendingPathComponent:@"RockMotionBackup"]
+    ];
+
+    NSString *resolved = nil;
+    NSDictionary *manifest = nil;
+
+    for (NSString *cand in candidates) {
+        NSString *mpath = [cand stringByAppendingPathComponent:@"manifest.json"];
+        if ([fm fileExistsAtPath:mpath]) {
+            NSData *d = [NSData dataWithContentsOfFile:mpath];
+            id obj = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+            if ([obj isKindOfClass:[NSDictionary class]]) {
+                resolved = cand;
+                manifest = (NSDictionary *)obj;
+                break;
+            }
+        }
+    }
+
+    // Fallback: allow raw backup folder containing Library/ or Documents/ without manifest.json
+    if (!resolved) {
+        for (NSString *cand in candidates) {
+            if ([fm fileExistsAtPath:[cand stringByAppendingPathComponent:@"Library"]] ||
+                [fm fileExistsAtPath:[cand stringByAppendingPathComponent:@"Documents"]]) {
+                resolved = cand;
+                manifest = @{@"formatVersion": @1, @"rawFallback": @YES};
+                break;
+            }
+        }
+    }
+
+    if (scoped) [pickedURL stopAccessingSecurityScopedResource];
+    if (outRootPath) *outRootPath = resolved;
+    return manifest;
+}
+
+- (void)performRestoreFromPickedURL:(NSURL *)pickedURL
+                        replaceMode:(BOOL)replaceMode
+                           progress:(void (^ _Nullable)(float progress, NSString *status))progressBlock
+                         completion:(void (^ _Nullable)(BOOL ok, NSString *message))completion {
+    if (self.isBusy) {
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(NO, @"Backup or restore already in progress.");
+            });
+        }
+        return;
+    }
+    self.isBusy = YES;
+
+    dispatch_async(self.ioQueue, ^{
+        @autoreleasepool {
+            BOOL scoped = [pickedURL startAccessingSecurityScopedResource];
+            NSFileManager *fm = [NSFileManager defaultManager];
+
+            NSString *resolvedRoot = nil;
+            NSDictionary *manifest = [self inspectBackupAtPickedURL:pickedURL resolvedRootPath:&resolvedRoot];
+            if (!manifest || resolvedRoot.length == 0) {
+                if (scoped) [pickedURL stopAccessingSecurityScopedResource];
+                self.isBusy = NO;
+                if (completion) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        completion(NO, @"No Rock Motion backup found in the selected folder (missing manifest.json / Library / Documents).");
+                    });
+                }
+                return;
+            }
+
+            if (progressBlock) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    progressBlock(0.05f, @"Reading backup snapshot...");
+                });
+            }
+
+            NSString *libDir = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject ?: @"";
+            NSString *docsDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: @"";
+
+            // Collect all files to restore
+            NSMutableArray<NSDictionary<NSString *, NSString *> *> *restoreList = [NSMutableArray array];
+            for (NSString *sub in @[@"Library", @"Documents"]) {
+                NSString *srcSub = [resolvedRoot stringByAppendingPathComponent:sub];
+                NSString *dstBase = [sub isEqualToString:@"Library"] ? libDir : docsDir;
+                if (![fm fileExistsAtPath:srcSub] || dstBase.length == 0) continue;
+
+                NSDirectoryEnumerator<NSString *> *en = [fm enumeratorAtPath:srcSub];
+                NSString *rel = nil;
+                while ((rel = [en nextObject]) != nil) {
+                    if ([rel.lastPathComponent isEqualToString:@".DS_Store"]) continue;
+                    NSString *firstComp = rel.pathComponents.firstObject ?: @"";
+                    if ([sub isEqualToString:@"Documents"] && [firstComp isEqualToString:@"RockMotionBackup"]) {
+                        [en skipDescendants];
+                        continue;
+                    }
+                    NSString *fullSrc = [srcSub stringByAppendingPathComponent:rel];
+                    BOOL isDir = NO;
+                    if (![fm fileExistsAtPath:fullSrc isDirectory:&isDir] || isDir) continue;
+                    NSString *fullDst = [dstBase stringByAppendingPathComponent:rel];
+                    NSString *manifestRel = [sub stringByAppendingPathComponent:rel];
+                    [restoreList addObject:@{
+                        @"src": fullSrc,
+                        @"dst": fullDst,
+                        @"rel": manifestRel
+                    }];
+                }
+            }
+
+            NSDictionary *xattrsMap = [manifest[@"xattrs"] isKindOfClass:[NSDictionary class]] ? manifest[@"xattrs"] : @{};
+            NSUInteger total = restoreList.count;
+            NSUInteger restoredCount = 0;
+            NSUInteger fontsRegistered = 0;
+
+            for (NSUInteger i = 0; i < total; i++) {
+                NSDictionary<NSString *, NSString *> *item = restoreList[i];
+                NSString *src = item[@"src"];
+                NSString *dst = item[@"dst"];
+                NSString *rel = item[@"rel"];
+
+                if (!replaceMode && [fm fileExistsAtPath:dst] && AMBackupFileUnchanged(fm, src, dst)) {
+                    // Still ensure xattrs are intact
+                    NSDictionary *xa = xattrsMap[rel];
+                    if ([xa isKindOfClass:[NSDictionary class]]) {
+                        AMBackupApplyXattrs(dst, xa);
+                    }
+                    restoredCount++;
+                } else {
+                    NSString *parent = [dst stringByDeletingLastPathComponent];
+                    if (parent.length > 0 && ![fm fileExistsAtPath:parent]) {
+                        [fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:nil];
+                    }
+                    if ([fm fileExistsAtPath:dst]) {
+                        [fm removeItemAtPath:dst error:nil];
+                    }
+                    if ([fm copyItemAtPath:src toPath:dst error:nil]) {
+                        restoredCount++;
+                        NSDictionary *sa = [fm attributesOfItemAtPath:src error:nil];
+                        NSDate *sm = sa[NSFileModificationDate];
+                        if (sm) {
+                            [fm setAttributes:@{NSFileModificationDate: sm} ofItemAtPath:dst error:nil];
+                        }
+                        NSDictionary *xa = xattrsMap[rel];
+                        if ([xa isKindOfClass:[NSDictionary class]]) {
+                            AMBackupApplyXattrs(dst, xa);
+                        }
+                        if (AMBackupIsFontFile(rel)) {
+                            AMBackupRegisterFontIfPossible(dst);
+                            fontsRegistered++;
+                        }
+                    }
+                }
+
+                if (progressBlock && (i % 8 == 0 || i + 1 == total)) {
+                    float frac = total > 0 ? ((float)(i + 1) / (float)total) : 1.0f;
+                    NSString *msg = [NSString stringWithFormat:@"Restoring files (%lu / %lu)...", (unsigned long)(i + 1), (unsigned long)total];
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        progressBlock(0.08f + 0.84f * frac, msg);
+                    });
+                }
+            }
+
+            // Restore preferences.plist into CURRENT bundle identifier (survives bundle ID / cert change!)
+            NSString *prefsSrc = [resolvedRoot stringByAppendingPathComponent:@"preferences.plist"];
+            BOOL prefsRestored = NO;
+            if ([fm fileExistsAtPath:prefsSrc]) {
+                NSData *pdata = [NSData dataWithContentsOfFile:prefsSrc];
+                id pobj = pdata ? [NSPropertyListSerialization propertyListWithData:pdata options:NSPropertyListImmutable format:NULL error:nil] : nil;
+                if ([pobj isKindOfClass:[NSDictionary class]]) {
+                    NSString *curBundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.alightcreative.motion";
+                    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+                    NSMutableDictionary *merged = [[ud persistentDomainForName:curBundleId] mutableCopy] ?: [NSMutableDictionary dictionary];
+                    NSSet<NSString *> *skipKeys = AMBackupInternalPrefKeys();
+                    NSDictionary *incoming = (NSDictionary *)pobj;
+                    for (NSString *k in incoming) {
+                        if ([skipKeys containsObject:k]) continue;
+                        merged[k] = incoming[k];
+                    }
+                    [ud setPersistentDomain:merged forName:curBundleId];
+                    [ud synchronize];
+                    prefsRestored = YES;
+                }
+            }
+
+            if (scoped) [pickedURL stopAccessingSecurityScopedResource];
+
+            // Reload in-memory mod stores right away (via runtime lookup to avoid declaration-order coupling)
+            Class puppetCls = NSClassFromString(@"AMPuppetStore");
+            if (puppetCls && [puppetCls respondsToSelector:@selector(shared)]) {
+                id pstore = ((id (*)(id, SEL))objc_msgSend)(puppetCls, @selector(shared));
+                SEL loadSel = NSSelectorFromString(@"loadFromDisk");
+                SEL syncSel = NSSelectorFromString(@"syncAllToRuntime");
+                if (pstore && [pstore respondsToSelector:loadSel]) {
+                    ((void (*)(id, SEL))objc_msgSend)(pstore, loadSel);
+                }
+                if (pstore && [pstore respondsToSelector:syncSel]) {
+                    ((void (*)(id, SEL))objc_msgSend)(pstore, syncSel);
+                }
+            }
+
+            if (progressBlock) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    progressBlock(1.0f, @"Restore complete!");
+                });
+            }
+
+            NSString *msg = [NSString stringWithFormat:@"Restored %lu files%@%@. Relaunch Alight Motion so all projects, fonts, and effects reload cleanly.",
+                             (unsigned long)restoredCount,
+                             fontsRegistered > 0 ? [NSString stringWithFormat:@" (%lu fonts)", (unsigned long)fontsRegistered] : @"",
+                             prefsRestored ? @" + app settings" : @""];
+
+            self.isBusy = NO;
+            if (completion) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completion(YES, msg);
+                });
+            }
+        }
+    });
+}
+
+@end
+
+// --- Native Light-Theme Save & Backup Vault Sheet ---
+
+@interface AMBackupVaultVC : UIViewController <UIDocumentPickerDelegate>
+@property (nonatomic, copy, nullable) void (^onDismissCallback)(void);
+@property (nonatomic, strong) UIScrollView *scrollView;
+@property (nonatomic, strong) UILabel *inventoryLabel;
+@property (nonatomic, strong) UILabel *lastSavedLabel;
+@property (nonatomic, strong) UILabel *folderStatusLabel;
+@property (nonatomic, strong) UIButton *saveNowButton;
+@property (nonatomic, strong) UIButton *restoreButton;
+@property (nonatomic, strong) UIButton *linkFolderButton;
+@property (nonatomic, strong) UIButton *unlinkFolderButton;
+@property (nonatomic, strong) UISwitch *autoSaveSwitch;
+@property (nonatomic, strong) UISwitch *localMirrorSwitch;
+@property (nonatomic, strong) UIProgressView *progressBar;
+@property (nonatomic, strong) UILabel *progressLabel;
+@property (nonatomic, assign) BOOL pickingForRestore;
+@end
+
+@implementation AMBackupVaultVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    if (@available(iOS 13.0, *)) {
+        self.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
+    }
+
+    UIColor *bgColor = [UIColor colorWithRed:0.965 green:0.969 blue:0.984 alpha:1.0];
+    UIColor *navy = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+    UIColor *muted = [UIColor colorWithRed:0.45 green:0.47 blue:0.55 alpha:1.0];
+    UIColor *border = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08];
+
+    self.view.backgroundColor = bgColor;
+    self.title = @"Save & Backup Vault";
+
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Close"
+                                                                             style:UIBarButtonItemStylePlain
+                                                                            target:self
+                                                                            action:@selector(onClose)];
+    self.navigationItem.leftBarButtonItem.tintColor = navy;
+
+    self.scrollView = [[UIScrollView alloc] init];
+    self.scrollView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.scrollView.alwaysBounceVertical = YES;
+    [self.view addSubview:self.scrollView];
+
+    UIStackView *stack = [[UIStackView alloc] init];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 12.0;
+    [self.scrollView addSubview:stack];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.scrollView.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [self.scrollView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.scrollView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.scrollView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+
+        [stack.topAnchor constraintEqualToAnchor:self.scrollView.contentLayoutGuide.topAnchor constant:14.0],
+        [stack.leadingAnchor constraintEqualToAnchor:self.scrollView.frameLayoutGuide.leadingAnchor constant:16.0],
+        [stack.trailingAnchor constraintEqualToAnchor:self.scrollView.frameLayoutGuide.trailingAnchor constant:-16.0],
+        [stack.bottomAnchor constraintEqualToAnchor:self.scrollView.contentLayoutGuide.bottomAnchor constant:-28.0],
+    ]];
+
+    // Card 1: Status & Inventory
+    UIView *statusCard = [self makeCardWithBorder:border];
+    UIStackView *statusStack = [self makeCardStackInside:statusCard];
+
+    UILabel *hdr = [[UILabel alloc] init];
+    hdr.text = @"Blacklist-Proof App Save";
+    hdr.font = AMThemeFont(15.5, UIFontWeightBold);
+    hdr.textColor = navy;
+    [statusStack addArrangedSubview:hdr];
+
+    UILabel *sub = [[UILabel alloc] init];
+    sub.text = @"Backs up all projects, media, thumbnails, imported fonts, custom effects, categories, folders, puppet pins, and settings so you can restore after re-sideloading with any new certificate.";
+    sub.font = AMThemeFont(12.2, UIFontWeightRegular);
+    sub.textColor = muted;
+    sub.numberOfLines = 0;
+    [statusStack addArrangedSubview:sub];
+
+    self.inventoryLabel = [[UILabel alloc] init];
+    self.inventoryLabel.font = AMThemeFont(12.5, UIFontWeightSemibold);
+    self.inventoryLabel.textColor = navy;
+    self.inventoryLabel.numberOfLines = 0;
+    self.inventoryLabel.text = @"Scanning local data...";
+    [statusStack addArrangedSubview:self.inventoryLabel];
+
+    self.lastSavedLabel = [[UILabel alloc] init];
+    self.lastSavedLabel.font = AMThemeFont(12.0, UIFontWeightMedium);
+    self.lastSavedLabel.textColor = muted;
+    self.lastSavedLabel.numberOfLines = 0;
+    [statusStack addArrangedSubview:self.lastSavedLabel];
+
+    self.progressBar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+    self.progressBar.tintColor = AMAccentGreenColor();
+    self.progressBar.hidden = YES;
+    [statusStack addArrangedSubview:self.progressBar];
+
+    self.progressLabel = [[UILabel alloc] init];
+    self.progressLabel.font = AMThemeFont(11.5, UIFontWeightMedium);
+    self.progressLabel.textColor = muted;
+    self.progressLabel.hidden = YES;
+    [statusStack addArrangedSubview:self.progressLabel];
+
+    [stack addArrangedSubview:statusCard];
+
+    // Primary Actions Row
+    self.saveNowButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.saveNowButton.backgroundColor = navy;
+    self.saveNowButton.tintColor = [UIColor whiteColor];
+    [self.saveNowButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.saveNowButton.titleLabel.font = AMThemeFont(14.5, UIFontWeightBold);
+    self.saveNowButton.layer.cornerRadius = 14.0;
+    [self.saveNowButton setTitle:@" Save Backup Now" forState:UIControlStateNormal];
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.0 weight:UIImageSymbolWeightSemibold];
+        [self.saveNowButton setImage:[UIImage systemImageNamed:@"arrow.up.doc.fill" withConfiguration:cfg] forState:UIControlStateNormal];
+    }
+    [self.saveNowButton.heightAnchor constraintEqualToConstant:48.0].active = YES;
+    [self.saveNowButton addTarget:self action:@selector(onTapSaveNow) forControlEvents:UIControlEventTouchUpInside];
+    [stack addArrangedSubview:self.saveNowButton];
+
+    self.restoreButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.restoreButton.backgroundColor = [UIColor whiteColor];
+    self.restoreButton.tintColor = navy;
+    [self.restoreButton setTitleColor:navy forState:UIControlStateNormal];
+    self.restoreButton.titleLabel.font = AMThemeFont(14.5, UIFontWeightBold);
+    self.restoreButton.layer.cornerRadius = 14.0;
+    self.restoreButton.layer.borderWidth = 1.0;
+    self.restoreButton.layer.borderColor = border.CGColor;
+    [self.restoreButton setTitle:@" Restore from Backup Folder" forState:UIControlStateNormal];
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.0 weight:UIImageSymbolWeightSemibold];
+        [self.restoreButton setImage:[UIImage systemImageNamed:@"arrow.down.doc" withConfiguration:cfg] forState:UIControlStateNormal];
+    }
+    [self.restoreButton.heightAnchor constraintEqualToConstant:48.0].active = YES;
+    [self.restoreButton addTarget:self action:@selector(onTapRestore) forControlEvents:UIControlEventTouchUpInside];
+    [stack addArrangedSubview:self.restoreButton];
+
+    // Card 2: External Save Folder
+    UIView *folderCard = [self makeCardWithBorder:border];
+    UIStackView *folderStack = [self makeCardStackInside:folderCard];
+
+    UILabel *fhdr = [[UILabel alloc] init];
+    fhdr.text = @"External Save Folder (Recommended)";
+    fhdr.font = AMThemeFont(14.0, UIFontWeightBold);
+    fhdr.textColor = navy;
+    [folderStack addArrangedSubview:fhdr];
+
+    self.folderStatusLabel = [[UILabel alloc] init];
+    self.folderStatusLabel.font = AMThemeFont(12.2, UIFontWeightRegular);
+    self.folderStatusLabel.textColor = muted;
+    self.folderStatusLabel.numberOfLines = 0;
+    [folderStack addArrangedSubview:self.folderStatusLabel];
+
+    UIStackView *fBtnRow = [[UIStackView alloc] init];
+    fBtnRow.axis = UILayoutConstraintAxisHorizontal;
+    fBtnRow.spacing = 8.0;
+    fBtnRow.distribution = UIStackViewDistributionFillProportionally;
+    [folderStack addArrangedSubview:fBtnRow];
+
+    self.linkFolderButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.linkFolderButton.backgroundColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08];
+    self.linkFolderButton.tintColor = navy;
+    [self.linkFolderButton setTitleColor:navy forState:UIControlStateNormal];
+    self.linkFolderButton.titleLabel.font = AMThemeFont(13.0, UIFontWeightSemibold);
+    self.linkFolderButton.layer.cornerRadius = 11.0;
+    [self.linkFolderButton setTitle:@" Link iCloud / On My iPhone Folder" forState:UIControlStateNormal];
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:13.0 weight:UIImageSymbolWeightSemibold];
+        [self.linkFolderButton setImage:[UIImage systemImageNamed:@"folder.badge.plus" withConfiguration:cfg] forState:UIControlStateNormal];
+    }
+    [self.linkFolderButton.heightAnchor constraintEqualToConstant:40.0].active = YES;
+    [self.linkFolderButton addTarget:self action:@selector(onTapLinkFolder) forControlEvents:UIControlEventTouchUpInside];
+    [fBtnRow addArrangedSubview:self.linkFolderButton];
+
+    self.unlinkFolderButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.unlinkFolderButton.backgroundColor = [UIColor colorWithRed:0.90 green:0.24 blue:0.24 alpha:0.10];
+    self.unlinkFolderButton.tintColor = [UIColor colorWithRed:0.80 green:0.18 blue:0.18 alpha:1.0];
+    [self.unlinkFolderButton setTitleColor:[UIColor colorWithRed:0.80 green:0.18 blue:0.18 alpha:1.0] forState:UIControlStateNormal];
+    self.unlinkFolderButton.titleLabel.font = AMThemeFont(13.0, UIFontWeightSemibold);
+    self.unlinkFolderButton.layer.cornerRadius = 11.0;
+    [self.unlinkFolderButton setTitle:@"Unlink" forState:UIControlStateNormal];
+    [self.unlinkFolderButton.widthAnchor constraintEqualToConstant:74.0].active = YES;
+    [self.unlinkFolderButton.heightAnchor constraintEqualToConstant:40.0].active = YES;
+    [self.unlinkFolderButton addTarget:self action:@selector(onTapUnlinkFolder) forControlEvents:UIControlEventTouchUpInside];
+    [fBtnRow addArrangedSubview:self.unlinkFolderButton];
+
+    [stack addArrangedSubview:folderCard];
+
+    // Card 3: Automatic Protection Toggles
+    UIView *optsCard = [self makeCardWithBorder:border];
+    UIStackView *optsStack = [self makeCardStackInside:optsCard];
+
+    UILabel *ohdr = [[UILabel alloc] init];
+    ohdr.text = @"Automatic Protection";
+    ohdr.font = AMThemeFont(14.0, UIFontWeightBold);
+    ohdr.textColor = navy;
+    [optsStack addArrangedSubview:ohdr];
+
+    self.autoSaveSwitch = [[UISwitch alloc] init];
+    self.autoSaveSwitch.onTintColor = AMAccentGreenColor();
+    [self.autoSaveSwitch addTarget:self action:@selector(onToggleAutoSave:) forControlEvents:UIControlEventValueChanged];
+    [optsStack addArrangedSubview:[self makeToggleRowWithTitle:@"Auto-Save on App Exit"
+                                                      subtitle:@"Incrementally updates your backup when leaving the app (throttled to every 3 min)."
+                                                     toggleCtl:self.autoSaveSwitch
+                                                          navy:navy
+                                                         muted:muted]];
+
+    self.localMirrorSwitch = [[UISwitch alloc] init];
+    self.localMirrorSwitch.onTintColor = AMAccentGreenColor();
+    [self.localMirrorSwitch addTarget:self action:@selector(onToggleLocalMirror:) forControlEvents:UIControlEventValueChanged];
+    [optsStack addArrangedSubview:[self makeToggleRowWithTitle:@"Files App Mirror (RockMotionBackup)"
+                                                      subtitle:@"Keeps a copy-on-write backup in Files -> On My iPhone -> Alight Motion so you can rescue data even if the app gets blacklisted before you back up."
+                                                     toggleCtl:self.localMirrorSwitch
+                                                          navy:navy
+                                                         muted:muted]];
+
+    [stack addArrangedSubview:optsCard];
+
+    [self refreshUIState];
+    [self refreshInventoryAsync];
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    if (self.isBeingDismissed || self.navigationController.isBeingDismissed) {
+        gAMBackupModalOpen = NO;
+        if (self.onDismissCallback) self.onDismissCallback();
+    }
+}
+
+- (UIView *)makeCardWithBorder:(UIColor *)border {
+    UIView *card = [[UIView alloc] init];
+    card.backgroundColor = [UIColor whiteColor];
+    card.layer.cornerRadius = 14.0;
+    card.layer.borderWidth = 1.0;
+    card.layer.borderColor = border.CGColor;
+    return card;
+}
+
+- (UIStackView *)makeCardStackInside:(UIView *)card {
+    UIStackView *st = [[UIStackView alloc] init];
+    st.translatesAutoresizingMaskIntoConstraints = NO;
+    st.axis = UILayoutConstraintAxisVertical;
+    st.spacing = 8.0;
+    [card addSubview:st];
+    [NSLayoutConstraint activateConstraints:@[
+        [st.topAnchor constraintEqualToAnchor:card.topAnchor constant:14.0],
+        [st.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14.0],
+        [st.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14.0],
+        [st.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-14.0],
+    ]];
+    return st;
+}
+
+- (UIView *)makeToggleRowWithTitle:(NSString *)title subtitle:(NSString *)subtitle toggleCtl:(UISwitch *)sw navy:(UIColor *)navy muted:(UIColor *)muted {
+    UIStackView *row = [[UIStackView alloc] init];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.alignment = UIStackViewAlignmentCenter;
+    row.spacing = 10.0;
+
+    UIStackView *textCol = [[UIStackView alloc] init];
+    textCol.axis = UILayoutConstraintAxisVertical;
+    textCol.spacing = 2.0;
+
+    UILabel *t = [[UILabel alloc] init];
+    t.text = title;
+    t.font = AMThemeFont(13.2, UIFontWeightSemibold);
+    t.textColor = navy;
+    [textCol addArrangedSubview:t];
+
+    UILabel *s = [[UILabel alloc] init];
+    s.text = subtitle;
+    s.font = AMThemeFont(11.5, UIFontWeightRegular);
+    s.textColor = muted;
+    s.numberOfLines = 0;
+    [textCol addArrangedSubview:s];
+
+    [row addArrangedSubview:textCol];
+    [row addArrangedSubview:sw];
+    return row;
+}
+
+- (void)refreshUIState {
+    AMBackupManager *mgr = [AMBackupManager shared];
+    self.autoSaveSwitch.on = [mgr isAutoSaveEnabled];
+    self.localMirrorSwitch.on = [mgr isLocalMirrorEnabled];
+
+    BOOL linked = [mgr hasLinkedExternalFolder];
+    if (linked) {
+        self.folderStatusLabel.text = [NSString stringWithFormat:@"Linked to \"%@\". Backups are saved inside \"%@/RockMotionSave\" outside the app container, so deleting a blacklisted app will NOT erase them.",
+                                       [mgr linkedExternalFolderName], [mgr linkedExternalFolderName]];
+        [self.linkFolderButton setTitle:@" Change Save Folder" forState:UIControlStateNormal];
+        self.unlinkFolderButton.hidden = NO;
+    } else {
+        self.folderStatusLabel.text = @"Not linked yet. Pick a folder in iCloud Drive or On My iPhone so your save survives certificate revokes & app deletion.";
+        [self.linkFolderButton setTitle:@" Link iCloud / On My iPhone Folder" forState:UIControlStateNormal];
+        self.unlinkFolderButton.hidden = YES;
+    }
+
+    NSDate *lastDate = [mgr lastSavedDate];
+    if (lastDate) {
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateStyle = NSDateFormatterMediumStyle;
+        df.timeStyle = NSDateFormatterShortStyle;
+        NSString *sum = [mgr lastSavedSummary];
+        self.lastSavedLabel.text = [NSString stringWithFormat:@"Last saved: %@%@",
+                                    [df stringFromDate:lastDate],
+                                    sum.length > 0 ? [NSString stringWithFormat:@" (%@)", sum] : @""];
+    } else {
+        self.lastSavedLabel.text = @"Last saved: Never";
+    }
+}
+
+- (void)refreshInventoryAsync {
+    __weak AMBackupVaultVC *weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSDictionary *stats = [[AMBackupManager shared] collectLiveInventory];
+        NSString *txt = [NSString stringWithFormat:@"On Device: %@ projects • %@ custom effects • %@ fonts • %@ media (%@)",
+                         stats[@"projects"] ?: @0,
+                         stats[@"customEffects"] ?: @0,
+                         stats[@"fonts"] ?: @0,
+                         stats[@"media"] ?: @0,
+                         AMBackupFormatBytes([stats[@"totalBytes"] unsignedLongLongValue])];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            weakSelf.inventoryLabel.text = txt;
+        });
+    });
+}
+
+- (void)setBusyUI:(BOOL)busy status:(NSString * _Nullable)status progress:(float)progress {
+    self.saveNowButton.enabled = !busy;
+    self.restoreButton.enabled = !busy;
+    self.linkFolderButton.enabled = !busy;
+    self.unlinkFolderButton.enabled = !busy;
+    self.saveNowButton.alpha = busy ? 0.55 : 1.0;
+    self.restoreButton.alpha = busy ? 0.55 : 1.0;
+    self.progressBar.hidden = !busy;
+    self.progressLabel.hidden = !busy;
+    if (busy) {
+        self.progressBar.progress = progress;
+        self.progressLabel.text = status ?: @"Working...";
+    }
+}
+
+- (void)onClose {
+    gAMBackupModalOpen = NO;
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)onToggleAutoSave:(UISwitch *)sw {
+    [[AMBackupManager shared] setAutoSaveEnabled:sw.isOn];
+}
+
+- (void)onToggleLocalMirror:(UISwitch *)sw {
+    [[AMBackupManager shared] setLocalMirrorEnabled:sw.isOn];
+}
+
+- (void)onTapLinkFolder {
+    self.pickingForRestore = NO;
+    [self presentFolderPicker];
+}
+
+- (void)onTapUnlinkFolder {
+    [[AMBackupManager shared] unlinkExternalFolder];
+    [self refreshUIState];
+}
+
+- (void)onTapRestore {
+    self.pickingForRestore = YES;
+    [self presentFolderPicker];
+}
+
+- (void)presentFolderPicker {
+    UIDocumentPickerViewController *picker = nil;
+    if (@available(iOS 14.0, *)) {
+        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeFolder]];
+    } else {
+        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.folder"] inMode:UIDocumentPickerModeOpen];
+    }
+    picker.delegate = self;
+    picker.allowsMultipleSelection = NO;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)onTapSaveNow {
+    __weak AMBackupVaultVC *weakSelf = self;
+    [self setBusyUI:YES status:@"Starting backup..." progress:0.02f];
+    [[AMBackupManager shared] performBackupWithProgress:^(float progress, NSString *status) {
+        [weakSelf setBusyUI:YES status:status progress:progress];
+    } completion:^(BOOL ok, NSString *message) {
+        [weakSelf setBusyUI:NO status:nil progress:0.0f];
+        [weakSelf refreshUIState];
+        [weakSelf refreshInventoryAsync];
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:(ok ? @"Backup Saved" : @"Backup Notice")
+                                                                    message:message
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [weakSelf presentViewController:ac animated:YES completion:nil];
+    }];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    (void)controller;
+    NSURL *picked = urls.firstObject;
+    if (!picked) return;
+
+    if (!self.pickingForRestore) {
+        NSError *err = nil;
+        if ([[AMBackupManager shared] linkExternalFolderURL:picked error:&err]) {
+            [self refreshUIState];
+            __weak AMBackupVaultVC *weakSelf = self;
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Save Folder Linked"
+                                                                        message:@"Your external folder is linked. Save your first backup now?"
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:nil]];
+            [ac addAction:[UIAlertAction actionWithTitle:@"Save Now" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+                (void)action;
+                [weakSelf onTapSaveNow];
+            }]];
+            [self presentViewController:ac animated:YES completion:nil];
+        } else {
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Could Not Link Folder"
+                                                                        message:(err.localizedDescription ?: @"Unable to create folder bookmark.")
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:ac animated:YES completion:nil];
+        }
+        return;
+    }
+
+    // Restore flow: inspect selected folder first
+    NSString *resolvedRoot = nil;
+    NSDictionary *manifest = [[AMBackupManager shared] inspectBackupAtPickedURL:picked resolvedRootPath:&resolvedRoot];
+    if (!manifest || resolvedRoot.length == 0) {
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"No Backup Found"
+                                                                    message:@"Select a folder containing RockMotionSave, RockMotionBackup, or manifest.json."
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:ac animated:YES completion:nil];
+        return;
+    }
+
+    NSDictionary *counts = [manifest[@"counts"] isKindOfClass:[NSDictionary class]] ? manifest[@"counts"] : @{};
+    NSString *dateStr = @"Unknown date";
+    if ([manifest[@"createdAt"] isKindOfClass:[NSNumber class]]) {
+        NSDate *d = [NSDate dateWithTimeIntervalSince1970:[manifest[@"createdAt"] doubleValue]];
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateStyle = NSDateFormatterMediumStyle;
+        df.timeStyle = NSDateFormatterShortStyle;
+        dateStr = [df stringFromDate:d];
+    }
+    NSString *info = [NSString stringWithFormat:@"Backup from %@\n%@ projects • %@ effects • %@ fonts • %@\n\nChoose how to restore:",
+                      dateStr,
+                      counts[@"projects"] ?: @"?",
+                      counts[@"customEffects"] ?: @"?",
+                      counts[@"fonts"] ?: @"?",
+                      counts[@"totalBytes"] ? AMBackupFormatBytes([counts[@"totalBytes"] unsignedLongLongValue]) : @"unknown size"];
+
+    __weak AMBackupVaultVC *weakSelf = self;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Restore Backup?"
+                                                                message:info
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Merge & Restore (Recommended)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        (void)action;
+        [weakSelf runRestoreFromURL:picked replaceMode:NO];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Overwrite Existing Files" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        (void)action;
+        [weakSelf runRestoreFromURL:picked replaceMode:YES];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)runRestoreFromURL:(NSURL *)picked replaceMode:(BOOL)replaceMode {
+    __weak AMBackupVaultVC *weakSelf = self;
+    [self setBusyUI:YES status:@"Starting restore..." progress:0.02f];
+    [[AMBackupManager shared] performRestoreFromPickedURL:picked
+                                              replaceMode:replaceMode
+                                                 progress:^(float progress, NSString *status) {
+        [weakSelf setBusyUI:YES status:status progress:progress];
+    } completion:^(BOOL ok, NSString *message) {
+        [weakSelf setBusyUI:NO status:nil progress:0.0f];
+        [weakSelf refreshUIState];
+        [weakSelf refreshInventoryAsync];
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:(ok ? @"Restore Complete" : @"Restore Failed")
+                                                                    message:message
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+        if (ok) {
+            [ac addAction:[UIAlertAction actionWithTitle:@"Later" style:UIAlertActionStyleCancel handler:nil]];
+            [ac addAction:[UIAlertAction actionWithTitle:@"Close App to Reload" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+                (void)action;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    exit(0);
+                });
+            }]];
+        } else {
+            [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        }
+        [weakSelf presentViewController:ac animated:YES completion:nil];
+    }];
+}
+
+@end
+
+static void AMPresentBackupVaultFromVC(UIViewController *vc) {
+    if (!vc) return;
+    gAMBackupModalOpen = YES;
+    AMBackupVaultVC *bvc = [[AMBackupVaultVC alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:bvc];
+    if (@available(iOS 13.0, *)) {
+        nav.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
+    }
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    [vc presentViewController:nav animated:YES completion:nil];
+}
+
+// ============================================================================
+// Unified Homepage Overlay Manager (Search, Import, Backup, + Folder, Inline Folders, Assign)
 // ============================================================================
 
 @interface AMHomepageSearchOverlayManager : NSObject
 @property (nonatomic, strong, nullable) UIButton *searchButton;
 @property (nonatomic, strong, nullable) UIButton *importProjectsButton;
+@property (nonatomic, strong, nullable) UIButton *backupButton;
 @property (nonatomic, strong, nullable) UIButton *foldersButton;
 @property (nonatomic, strong, nullable) UIButton *assignFolderButton;
 @property (nonatomic, strong, nullable) AMHomepageFoldersInlineView *inlineFoldersView;
@@ -6966,6 +8490,25 @@ static void AMQueueSequentialAmprojImports(NSArray<NSURL *> *urls) {
         self.importProjectsButton = ibtn;
     }
 
+    if (!self.backupButton) {
+        UIButton *bbtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        bbtn.accessibilityLabel = @"Save and Backup Vault";
+        bbtn.backgroundColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08];
+        bbtn.tintColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
+        bbtn.layer.cornerRadius = 17.0;
+        bbtn.layer.borderWidth = 0.5;
+        bbtn.layer.borderColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08].CGColor;
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.0 weight:UIImageSymbolWeightSemibold];
+            NSString *sym = [[AMBackupManager shared] hasLinkedExternalFolder] ? @"externaldrive.badge.checkmark" : @"externaldrive";
+            [bbtn setImage:[UIImage systemImageNamed:sym withConfiguration:cfg] forState:UIControlStateNormal];
+        } else {
+            [bbtn setTitle:@"S" forState:UIControlStateNormal];
+        }
+        [bbtn addTarget:self action:@selector(onTapBackupVault) forControlEvents:UIControlEventTouchUpInside];
+        self.backupButton = bbtn;
+    }
+
     if (!self.foldersButton) {
         UIButton *fbtn = [UIButton buttonWithType:UIButtonTypeSystem];
         fbtn.accessibilityLabel = @"Create Folder";
@@ -7016,7 +8559,7 @@ static void AMQueueSequentialAmprojImports(NSArray<NSURL *> *urls) {
         self.inlineFoldersView = [[AMHomepageFoldersInlineView alloc] initWithFrame:CGRectZero];
     }
 
-    for (UIView *v in @[self.inlineFoldersView, self.importProjectsButton, self.searchButton, self.foldersButton, self.assignFolderButton]) {
+    for (UIView *v in @[self.inlineFoldersView, self.backupButton, self.importProjectsButton, self.searchButton, self.foldersButton, self.assignFolderButton]) {
         if (v.superview != hostView) [hostView addSubview:v];
         [hostView bringSubviewToFront:v];
     }
@@ -7028,6 +8571,7 @@ static void AMQueueSequentialAmprojImports(NSArray<NSURL *> *urls) {
     if (!AMIsOnHomepage(win)) {
         self.searchButton.hidden = YES;
         self.importProjectsButton.hidden = YES;
+        self.backupButton.hidden = YES;
         self.foldersButton.hidden = YES;
         self.assignFolderButton.hidden = YES;
         self.inlineFoldersView.hidden = YES;
@@ -7058,6 +8602,7 @@ static void AMQueueSequentialAmprojImports(NSArray<NSURL *> *urls) {
     if (probe.isSelectionMode) {
         self.searchButton.hidden = YES;
         self.importProjectsButton.hidden = YES;
+        self.backupButton.hidden = YES;
         self.foldersButton.hidden = YES;
         self.inlineFoldersView.hidden = YES;
 
@@ -7084,6 +8629,10 @@ static void AMQueueSequentialAmprojImports(NSArray<NSURL *> *urls) {
     CGFloat ix = sx - 8.0 - size;
     self.importProjectsButton.frame = [hostView convertRect:CGRectMake(ix, sy, size, size) fromView:win];
     self.importProjectsButton.hidden = NO;
+
+    CGFloat bx = ix - 8.0 - size;
+    self.backupButton.frame = [hostView convertRect:CGRectMake(bx, sy, size, size) fromView:win];
+    self.backupButton.hidden = NO;
 
     if (probe.hasYourProjects) {
         CGFloat midY = CGRectGetMidY(probe.yourProjectsFrame);
@@ -7143,6 +8692,30 @@ static void AMQueueSequentialAmprojImports(NSArray<NSURL *> *urls) {
         (void)count;
         [weakSelf refreshProjectCacheIfNeeded:YES];
         [weakSelf.inlineFoldersView reloadForce:YES diskProjects:weakSelf.cachedDiskProjects ?: @[]];
+    };
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    if (@available(iOS 13.0, *)) {
+        nav.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
+    }
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    [top presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)onTapBackupVault {
+    UIViewController *top = AMTopMostViewController();
+    if (!top) return;
+    gAMBackupModalOpen = YES;
+    AMBackupVaultVC *vc = [[AMBackupVaultVC alloc] init];
+    __weak AMHomepageSearchOverlayManager *weakSelf = self;
+    vc.onDismissCallback = ^{
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.0 weight:UIImageSymbolWeightSemibold];
+            NSString *sym = [[AMBackupManager shared] hasLinkedExternalFolder] ? @"externaldrive.badge.checkmark" : @"externaldrive";
+            [weakSelf.backupButton setImage:[UIImage systemImageNamed:sym withConfiguration:cfg] forState:UIControlStateNormal];
+        }
+        [weakSelf refreshProjectCacheIfNeeded:YES];
+        [weakSelf.inlineFoldersView reloadForce:YES diskProjects:weakSelf.cachedDiskProjects ?: @[]];
+        [weakSelf scheduleImmediateTick];
     };
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     if (@available(iOS 13.0, *)) {
@@ -11423,6 +12996,7 @@ static void AlightMotionModsInit(void) {
                     (IMP)AMHook_tabBarSetSelectedItem,
                     &gOrigTabBarSetSelectedItem);
 
+    [[AMBackupManager shared] startAutoSaveObservers];
     [[AMHomepageSearchOverlayManager shared] start];
 
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
