@@ -9764,7 +9764,7 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     // Center Graph Canvas + Bottom Segment Navigator (< Segment 1/2 >)
     _graphView = [[AMPuppetGraphCanvasView alloc] init];
     _graphView.translatesAutoresizingMaskIntoConstraints = NO;
-    __weak typeof(self) weakSelf = self;
+    __weak __typeof__(self) weakSelf = self;
     _graphView.onCurveChanged = ^(BOOL ended) {
         [weakSelf persistGraphToCurrentKeyframe:ended];
     };
@@ -10394,7 +10394,7 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     // Row 2 Left: Compact Alight Motion Touch Control Pad (fine pin nudge + X/Y readout)
     _touchPad = [[AMPuppetTouchPadView alloc] init];
     _touchPad.translatesAutoresizingMaskIntoConstraints = NO;
-    __weak typeof(self) weakSelf = self;
+    __weak __typeof__(self) weakSelf = self;
     _touchPad.onDeltaNorm = ^(CGPoint d, BOOL ended) {
         [weakSelf nudgeSelectedPinByDelta:d ended:ended];
     };
@@ -10890,7 +10890,7 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     gvc.pinIndex = _selectedPinIndex;
     gvc.keyframeIndex = segIdx;
     gvc.holder = _holder;
-    __weak typeof(self) weakSelf = self;
+    __weak __typeof__(self) weakSelf = self;
     gvc.onDidModify = ^{
         [weakSelf refreshControls];
     };
