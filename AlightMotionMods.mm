@@ -21,6 +21,8 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <Metal/Metal.h>
+#import <os/lock.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <math.h>
@@ -1488,6 +1490,7 @@ static void AMHook_effectMainWillDisplayCell(id self, SEL _cmd, UICollectionView
 }
 
 static IMP gOrigURLsForResources = NULL;
+static NSArray<NSURL *> *AMEnsurePuppetSlotXMLs(void);
 
 static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd, NSString *ext, NSString *subpath) {
     NSArray<NSURL *> *orig = nil;
@@ -1498,17 +1501,19 @@ static NSArray<NSURL *> *AMHook_URLsForResourcesWithExtension(id self, SEL _cmd,
         ext && [ext caseInsensitiveCompare:@"xml"] == NSOrderedSame &&
         subpath && [subpath isEqualToString:@"BuiltinEffects"]) {
         AMInstallCustomEffectCategoryIfNeeded();
+        NSMutableArray<NSURL *> *merged = orig ? [orig mutableCopy] : [NSMutableArray array];
+        NSArray<NSURL *> *puppetURLs = AMEnsurePuppetSlotXMLs();
+        if (puppetURLs.count > 0) {
+            [merged addObjectsFromArray:puppetURLs];
+        }
         NSString *dir = AMCustomEffectsDir();
         NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
-        if (files.count > 0) {
-            NSMutableArray<NSURL *> *merged = orig ? [orig mutableCopy] : [NSMutableArray array];
-            for (NSString *fn in files) {
-                if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
-                    [merged addObject:[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:fn]]];
-                }
+        for (NSString *fn in files) {
+            if ([[fn pathExtension] caseInsensitiveCompare:@"xml"] == NSOrderedSame) {
+                [merged addObject:[NSURL fileURLWithPath:[dir stringByAppendingPathComponent:fn]]];
             }
-            return merged;
         }
+        return merged;
     }
     return orig;
 }
@@ -7987,6 +7992,3147 @@ static void AMHook_tabBarSetSelectedItem(id self, SEL _cmd, UITabBarItem *item) 
     [[AMHomepageSearchOverlayManager shared] scheduleImmediateTick];
 }
 
+// ============================================================================
+// Module 7: After Effects-Style Puppet Pin Tool (GPU MLS + Keyframes + Graphs)
+// ============================================================================
+
+static const int kAMPuppetMaxSlots = 16;
+static const int kAMPuppetMaxPins = 16;
+static const int kAMPuppetMaxKeyframesPerPin = 64;
+static const float kAMPuppetMagicFloat = 133742.25f;
+
+typedef struct {
+    int64_t timeMs;
+    float x;
+    float y;
+    int easingType; // 0 = Cubic Bezier, 1 = Step, 2 = Overshoot/Elastic, 3 = Bounce
+    float p1x;
+    float p1y;
+    float p2x;
+    float p2y;
+    float stepCount;
+} AMPuppetKeyframeC;
+
+typedef struct {
+    int pinId;
+    float restX;
+    float restY;
+    float currX;
+    float currY;
+    int keyframeCount;
+    AMPuppetKeyframeC keyframes[kAMPuppetMaxKeyframesPerPin];
+} AMPuppetPinC;
+
+typedef struct {
+    BOOL active;
+    uint64_t elementId;
+    int64_t startTimeMs;
+    int64_t endTimeMs;
+    float rigidity;
+    int deformMode; // 0 = Rigid MLS, 1 = Similarity/Stretch MLS, 2 = Smooth RBF
+    BOOL showMesh;
+    int pinCount;
+    AMPuppetPinC pins[kAMPuppetMaxPins];
+} AMPuppetSlotRuntime;
+
+typedef struct {
+    BOOL valid;
+    float screenToLayer[16];
+    float layerToScreen[16];
+    float screenSize[2];
+    float layerSize[2];
+    float lastShaderTime;
+    int timeMode; // 0 = unknown, 1 = layer-local sec, 2 = scene sec
+} AMPuppetTransformSnapshot;
+
+static os_unfair_lock gAMPuppetRuntimeLock = OS_UNFAIR_LOCK_INIT;
+static AMPuppetSlotRuntime gAMPuppetSlots[kAMPuppetMaxSlots + 1];
+static AMPuppetTransformSnapshot gAMPuppetTransforms[kAMPuppetMaxSlots + 1];
+static volatile int64_t gAMPuppetEditorCurrentTimeMs = 0;
+static volatile uint64_t gAMPuppetActiveElementId = 0;
+static volatile int gAMPuppetActivePinIndex = -1;
+static volatile BOOL gAMPuppetPanelVisible = NO;
+static volatile int gAMPuppetLastTransformSlotNotified = 0;
+
+// Clipboard for Copy/Paste Easing Curve inside Puppet Graph Editor
+static int gAMPuppetCopiedEasingType = 0;
+static float gAMPuppetCopiedP1X = 0.42f, gAMPuppetCopiedP1Y = 0.0f;
+static float gAMPuppetCopiedP2X = 0.58f, gAMPuppetCopiedP2Y = 1.0f;
+static float gAMPuppetCopiedStepCount = 4.0f;
+static BOOL gAMPuppetHasCopiedCurve = NO;
+
+static NSString *const kAMPuppetTransformUpdatedNotification = @"AMPuppetTransformUpdatedNotification";
+
+// --- Cubic Bezier / Easing Evaluator (exact Newton-Raphson + bisection) ---
+
+static float AMPuppetEvalCubic1D(float p1, float p2, float s) {
+    float inv = 1.0f - s;
+    return 3.0f * inv * inv * s * p1 + 3.0f * inv * s * s * p2 + s * s * s;
+}
+
+static float AMPuppetEvalCubicDeriv(float p1, float p2, float s) {
+    float inv = 1.0f - s;
+    return 3.0f * inv * inv * p1 + 6.0f * inv * s * (p2 - p1) + 3.0f * s * s * (1.0f - p2);
+}
+
+static float AMPuppetEvalEasing(int easingType, float p1x, float p1y, float p2x, float p2y, float stepCount, float u) {
+    if (u <= 0.0f) return 0.0f;
+    if (u >= 1.0f) return 1.0f;
+    if (easingType == 1) {
+        // Step easing
+        float steps = fmaxf(1.0f, roundf(stepCount));
+        if (steps <= 1.0f) return 0.0f; // Hold until next keyframe
+        return floorf(u * steps) / steps;
+    }
+    if (easingType == 2) {
+        // Elastic overshoot
+        float freq = fmaxf(1.0f, p1x * 6.0f + 1.5f);
+        float damp = fmaxf(1.0f, p2x * 8.0f + 3.0f);
+        return 1.0f - expf(-damp * u) * cosf(u * freq * (float)M_PI * 2.0f);
+    }
+    if (easingType == 3) {
+        // Bounce Out
+        float n1 = 7.5625f;
+        float d1 = 2.75f;
+        float t = u;
+        if (t < 1.0f / d1) {
+            return n1 * t * t;
+        } else if (t < 2.0f / d1) {
+            t -= 1.5f / d1;
+            return n1 * t * t + 0.75f;
+        } else if (t < 2.5f / d1) {
+            t -= 2.25f / d1;
+            return n1 * t * t + 0.9375f;
+        } else {
+            t -= 2.625f / d1;
+            return n1 * t * t + 0.984375f;
+        }
+    }
+    // Type 0: Cubic Bezier (p0=(0,0), p1=(p1x,p1y), p2=(p2x,p2y), p3=(1,1))
+    float cx1 = fminf(fmaxf(p1x, 0.0f), 1.0f);
+    float cx2 = fminf(fmaxf(p2x, 0.0f), 1.0f);
+    if (fabsf(cx1 - p1y) < 1e-4f && fabsf(cx2 - p2y) < 1e-4f) {
+        return u; // Fast path: Linear
+    }
+    float lo = 0.0f, hi = 1.0f, s = u;
+    for (int i = 0; i < 6; ++i) {
+        float x = AMPuppetEvalCubic1D(cx1, cx2, s) - u;
+        if (fabsf(x) < 1e-5f) break;
+        float dx = AMPuppetEvalCubicDeriv(cx1, cx2, s);
+        if (fabsf(dx) < 1e-5f) break;
+        float ns = s - x / dx;
+        if (ns < lo || ns > hi) break;
+        s = ns;
+    }
+    for (int i = 0; i < 8; ++i) {
+        float x = AMPuppetEvalCubic1D(cx1, cx2, s);
+        if (fabsf(x - u) < 1e-5f) break;
+        if (x < u) lo = s; else hi = s;
+        s = 0.5f * (lo + hi);
+    }
+    return AMPuppetEvalCubic1D(p1y, p2y, s);
+}
+
+static void AMPuppetEvalPinAtMs(const AMPuppetPinC *pin, int64_t timeMs, float *outX, float *outY) {
+    if (!pin) { *outX = 0.5f; *outY = 0.5f; return; }
+    int n = pin->keyframeCount;
+    if (n <= 0) {
+        *outX = pin->currX;
+        *outY = pin->currY;
+        return;
+    }
+    if (n == 1 || timeMs <= pin->keyframes[0].timeMs) {
+        *outX = pin->keyframes[0].x;
+        *outY = pin->keyframes[0].y;
+        return;
+    }
+    if (timeMs >= pin->keyframes[n - 1].timeMs) {
+        *outX = pin->keyframes[n - 1].x;
+        *outY = pin->keyframes[n - 1].y;
+        return;
+    }
+    for (int i = 0; i < n - 1; ++i) {
+        const AMPuppetKeyframeC *k0 = &pin->keyframes[i];
+        const AMPuppetKeyframeC *k1 = &pin->keyframes[i + 1];
+        if (timeMs >= k0->timeMs && timeMs <= k1->timeMs) {
+            int64_t dt = k1->timeMs - k0->timeMs;
+            if (dt <= 0) {
+                *outX = k1->x;
+                *outY = k1->y;
+                return;
+            }
+            float u = (float)((double)(timeMs - k0->timeMs) / (double)dt);
+            float e = AMPuppetEvalEasing(k0->easingType, k0->p1x, k0->p1y, k0->p2x, k0->p2y, k0->stepCount, u);
+            *outX = k0->x + (k1->x - k0->x) * e;
+            *outY = k0->y + (k1->y - k0->y) * e;
+            return;
+        }
+    }
+    *outX = pin->currX;
+    *outY = pin->currY;
+}
+
+// --- Built-in Internal Puppet Slot XMLs (1..16) with GPU MLS Shader ---
+
+static NSString *AMPuppetSlotsDir(void) {
+    NSString *dir = [AMCustomEffectsDir() stringByAppendingPathComponent:@"PuppetSlots"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+static NSString *AMPuppetEffectIdForSlot(int slot) {
+    return [NSString stringWithFormat:@"com.alightcreative.effects.am_puppet_slot_%d", slot];
+}
+
+static NSString *AMPuppetBuildSlotXML(int slot) {
+    NSMutableString *params = [NSMutableString string];
+    [params appendString:@"        <texture id=\"inputImg\" srcType=\"content\" />\n"];
+    [params appendFormat:@"        <float id=\"amPuppetMagic\" value=\"133742.25\" />\n"];
+    [params appendFormat:@"        <float id=\"puppetSlot\" value=\"%d.0\" />\n", slot];
+    [params appendString:@"        <float id=\"pinCount\" value=\"0.0\" />\n"];
+    [params appendString:@"        <float id=\"rigidity\" value=\"1.5\" />\n"];
+    [params appendString:@"        <float id=\"deformMode\" value=\"0.0\" />\n"];
+    [params appendString:@"        <float id=\"showMesh\" value=\"0.0\" />\n"];
+    for (int i = 0; i < kAMPuppetMaxPins; ++i) {
+        [params appendFormat:@"        <float id=\"r%dx\" value=\"0.5\" />\n", i];
+        [params appendFormat:@"        <float id=\"r%dy\" value=\"0.5\" />\n", i];
+        [params appendFormat:@"        <float id=\"c%dx\" value=\"0.5\" />\n", i];
+        [params appendFormat:@"        <float id=\"c%dy\" value=\"0.5\" />\n", i];
+    }
+
+    NSMutableString *assigns = [NSMutableString string];
+    for (int i = 0; i < kAMPuppetMaxPins; ++i) {
+        [assigns appendFormat:@"            pRest[%d] = vec2(r%dx, r%dy) * aspect;\n", i, i, i];
+        [assigns appendFormat:@"            pCurr[%d] = vec2(c%dx, c%dy) * aspect;\n", i, i, i];
+    }
+
+    return [NSString stringWithFormat:
+        @"<?xml version='1.0' encoding='UTF-8' ?>\n"
+        @"<effect id=\"com.alightcreative.effects.am_puppet_slot_%d\" compat=\"acScreenNorm-y\" name=\"Puppet\" desc=\"After Effects-style Puppet Pin Deformation.\" category=\"distort\" tags=\"distort,warp,puppet\" thumb=\"thumb/bend.webp\" internal=\"true\" overdraw=\"true\" max-overdraw=\"0.5\" maxOverdraw=\"0.5\">\n"
+        @"    <params>\n%@    </params>\n"
+        @"    <shader type=\"fragment\" precision=\"high\"><![CDATA[\n"
+        @"        void main() {\n"
+        @"            float keepTime = acTime * 0.0 + amPuppetMagic * 0.0 + puppetSlot * 0.0;\n"
+        @"            int nPins = int(pinCount + 0.5);\n"
+        @"            if (nPins <= 0) {\n"
+        @"                gl_FragColor = texture2DCv(inputImg.texture, acScreenNorm + vec2(keepTime, 0.0));\n"
+        @"                return;\n"
+        @"            }\n"
+        @"            vec2 aspect = vec2(acLayerSize.x / max(acLayerSize.y, 1.0), 1.0);\n"
+        @"            vec2 invAspect = vec2(1.0 / max(aspect.x, 0.0001), 1.0);\n"
+        @"            vec2 v = acLayerNorm * aspect;\n"
+        @"            vec2 pRest[16];\n"
+        @"            vec2 pCurr[16];\n"
+        @"%@"
+        @"            vec2 srcA = v;\n"
+        @"            if (nPins == 1) {\n"
+        @"                srcA = v - (pCurr[0] - pRest[0]);\n"
+        @"            } else {\n"
+        @"                float wArr[16];\n"
+        @"                float wSum = 0.0;\n"
+        @"                vec2 qStar = vec2(0.0, 0.0);\n"
+        @"                vec2 pStar = vec2(0.0, 0.0);\n"
+        @"                float alpha = clamp(rigidity, 0.5, 4.0);\n"
+        @"                for (int i = 0; i < 16; i++) {\n"
+        @"                    if (i >= nPins) break;\n"
+        @"                    vec2 d = v - pCurr[i];\n"
+        @"                    float d2 = dot(d, d) + 0.0006;\n"
+        @"                    float w = pow(max(d2, 0.0006), -alpha);\n"
+        @"                    wArr[i] = w;\n"
+        @"                    wSum += w;\n"
+        @"                    qStar += w * pCurr[i];\n"
+        @"                    pStar += w * pRest[i];\n"
+        @"                }\n"
+        @"                float invW = 1.0 / max(wSum, 0.00001);\n"
+        @"                qStar *= invW;\n"
+        @"                pStar *= invW;\n"
+        @"                if (deformMode >= 1.5) {\n"
+        @"                    srcA = v + (pStar - qStar);\n"
+        @"                } else {\n"
+        @"                    float mu = 0.0;\n"
+        @"                    float mx = 0.0;\n"
+        @"                    float my = 0.0;\n"
+        @"                    for (int i = 0; i < 16; i++) {\n"
+        @"                        if (i >= nPins) break;\n"
+        @"                        vec2 qh = pCurr[i] - qStar;\n"
+        @"                        vec2 ph = pRest[i] - pStar;\n"
+        @"                        float w = wArr[i];\n"
+        @"                        mu += w * dot(qh, qh);\n"
+        @"                        mx += w * (ph.x * qh.x + ph.y * qh.y);\n"
+        @"                        my += w * (ph.y * qh.x - ph.x * qh.y);\n"
+        @"                    }\n"
+        @"                    vec2 dv = v - qStar;\n"
+        @"                    if (deformMode < 0.5) {\n"
+        @"                        float mLen = sqrt(max(mx * mx + my * my, 0.0000001));\n"
+        @"                        float rx = mx / mLen;\n"
+        @"                        float ry = my / mLen;\n"
+        @"                        srcA = vec2(rx * dv.x - ry * dv.y, ry * dv.x + rx * dv.y) + pStar;\n"
+        @"                    } else {\n"
+        @"                        float invMu = 1.0 / max(mu, 0.00001);\n"
+        @"                        float sx = mx * invMu;\n"
+        @"                        float sy = my * invMu;\n"
+        @"                        srcA = vec2(sx * dv.x - sy * dv.y, sy * dv.x + sx * dv.y) + pStar;\n"
+        @"                    }\n"
+        @"                }\n"
+        @"            }\n"
+        @"            vec2 srcNorm = srcA * invAspect;\n"
+        @"            vec2 pxFeather = 1.0 / max(acLayerSize, vec2(1.0, 1.0));\n"
+        @"            float inX = smoothstep(-pxFeather.x, pxFeather.x, srcNorm.x) * (1.0 - smoothstep(1.0 - pxFeather.x, 1.0 + pxFeather.x, srcNorm.x));\n"
+        @"            float inY = smoothstep(-pxFeather.y, pxFeather.y, srcNorm.y) * (1.0 - smoothstep(1.0 - pxFeather.y, 1.0 + pxFeather.y, srcNorm.y));\n"
+        @"            float insideMask = inX * inY;\n"
+        @"            vec2 sampleScreen = (vec4(srcNorm, 0.0, 1.0) * acLayerToScreen).xy;\n"
+        @"            vec4 col = texture2DCv(inputImg.texture, sampleScreen + vec2(keepTime, 0.0)) * insideMask;\n"
+        @"            if (showMesh > 0.5 && insideMask > 0.01 && col.a > 0.02) {\n"
+        @"                float cells = 8.0;\n"
+        @"                vec2 g = fract(srcNorm * cells);\n"
+        @"                float dGrid = min(min(g.x, 1.0 - g.x), min(g.y, 1.0 - g.y));\n"
+        @"                float dDiag = abs(g.x - g.y) * 0.7071;\n"
+        @"                float edge = 1.0 - smoothstep(0.018, 0.048, min(dGrid, dDiag));\n"
+        @"                vec3 meshCol = vec3(0.204, 0.827, 0.600) * col.a;\n"
+        @"                col.rgb = mix(col.rgb, meshCol, edge * 0.62);\n"
+        @"            }\n"
+        @"            gl_FragColor = col;\n"
+        @"        }\n"
+        @"    ]]></shader>\n"
+        @"</effect>\n",
+        slot, params, assigns];
+}
+
+static NSArray<NSURL *> *AMEnsurePuppetSlotXMLs(void) {
+    static NSArray<NSURL *> *cached = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *dir = AMPuppetSlotsDir();
+        NSString *verFile = [dir stringByAppendingPathComponent:@".puppet_xml_v1"];
+        BOOL needsWrite = ![[NSFileManager defaultManager] fileExistsAtPath:verFile];
+        NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:kAMPuppetMaxSlots];
+        for (int s = 1; s <= kAMPuppetMaxSlots; ++s) {
+            NSString *p = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"am_puppet_slot_%d.xml", s]];
+            if (needsWrite || ![[NSFileManager defaultManager] fileExistsAtPath:p]) {
+                NSString *xml = AMPuppetBuildSlotXML(s);
+                [xml writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            }
+            [urls addObject:[NSURL fileURLWithPath:p]];
+        }
+        if (needsWrite) {
+            [@"1" writeToFile:verFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+        cached = [urls copy];
+    });
+    return cached;
+}
+
+// --- Metal setFragmentBytes Hook (Live Preview + Full-Res Video Export!) ---
+
+typedef struct {
+    __unsafe_unretained id encoder;
+    int magicIdx;
+    int slot;
+    NSUInteger length;
+    float headerFloats[16];
+} AMPuppetPendingEncoder;
+
+static thread_local AMPuppetPendingEncoder gAMPendingPuppetEnc = { nil, -1, 0, 0, {0} };
+static IMP gOrigMTLSetFragmentBytes = NULL;
+
+static void AMHook_mtlSetFragmentBytes(id self, SEL _cmd, const void *bytes, NSUInteger length, NSUInteger index) {
+    if (index == 0 && bytes != NULL && length >= 276 && length <= 512) {
+        const float *f = (const float *)bytes;
+        int maxScan = (int)(length / sizeof(float));
+        if (maxScan > 10) maxScan = 10;
+        int foundIdx = -1;
+        for (int i = 0; i < maxScan - 1; ++i) {
+            if (f[i] == kAMPuppetMagicFloat) {
+                foundIdx = i;
+                break;
+            }
+        }
+        if (foundIdx >= 0) {
+            int slot = (int)roundf(f[foundIdx + 1]);
+            if (slot >= 1 && slot <= kAMPuppetMaxSlots) {
+                gAMPendingPuppetEnc.encoder = self;
+                gAMPendingPuppetEnc.magicIdx = foundIdx;
+                gAMPendingPuppetEnc.slot = slot;
+                gAMPendingPuppetEnc.length = length;
+                int copyHdr = (foundIdx < 16) ? foundIdx : 16;
+                for (int k = 0; k < copyHdr; ++k) gAMPendingPuppetEnc.headerFloats[k] = f[k];
+            } else {
+                gAMPendingPuppetEnc.encoder = nil;
+            }
+        } else if (gAMPendingPuppetEnc.encoder == self) {
+            gAMPendingPuppetEnc.encoder = nil;
+        }
+    } else if (index == 1 && bytes != NULL && length == 0x140 && gAMPendingPuppetEnc.encoder == self) {
+        int slot = gAMPendingPuppetEnc.slot;
+        int magicIdx = gAMPendingPuppetEnc.magicIdx;
+        NSUInteger pLen = gAMPendingPuppetEnc.length;
+        gAMPendingPuppetEnc.encoder = nil;
+
+        const uint8_t *inBytes = (const uint8_t *)bytes;
+        float shaderTimeSec = *(const float *)(inBytes + 0x110);
+
+        float outBuf[128];
+        memset(outBuf, 0, sizeof(outBuf));
+        for (int k = 0; k < magicIdx && k < 16; ++k) {
+            outBuf[k] = gAMPendingPuppetEnc.headerFloats[k];
+        }
+        outBuf[magicIdx + 0] = kAMPuppetMagicFloat;
+        outBuf[magicIdx + 1] = (float)slot;
+
+        BOOL notifyTransform = NO;
+        os_unfair_lock_lock(&gAMPuppetRuntimeLock);
+        AMPuppetTransformSnapshot *tr = &gAMPuppetTransforms[slot];
+        BOOL wasValid = tr->valid;
+        memcpy(tr->screenToLayer, inBytes + 0x40, 16 * sizeof(float));
+        memcpy(tr->layerToScreen, inBytes + 0x80, 16 * sizeof(float));
+        memcpy(tr->screenSize, inBytes + 0xD0, 2 * sizeof(float));
+        memcpy(tr->layerSize, inBytes + 0xE0, 2 * sizeof(float));
+        tr->lastShaderTime = shaderTimeSec;
+        tr->valid = YES;
+
+        AMPuppetSlotRuntime *rt = &gAMPuppetSlots[slot];
+        if (!wasValid || (gAMPuppetPanelVisible && rt->active && rt->elementId == gAMPuppetActiveElementId)) {
+            notifyTransform = YES;
+        }
+
+        // Auto-calibrate acTime origin (layer-local sec vs scene sec)
+        if (rt->active && rt->startTimeMs > 50 && gAMPuppetPanelVisible && rt->elementId == gAMPuppetActiveElementId) {
+            double edSec = (double)gAMPuppetEditorCurrentTimeMs / 1000.0;
+            double edLocalSec = (double)(gAMPuppetEditorCurrentTimeMs - rt->startTimeMs) / 1000.0;
+            if (fabs((double)shaderTimeSec - edLocalSec) + 0.02 < fabs((double)shaderTimeSec - edSec)) {
+                tr->timeMode = 1; // layer-local
+            } else if (fabs((double)shaderTimeSec - edSec) + 0.02 < fabs((double)shaderTimeSec - edLocalSec)) {
+                tr->timeMode = 2; // scene
+            }
+        }
+
+        int64_t evalTimeMs = (int64_t)llround((double)shaderTimeSec * 1000.0);
+        if (tr->timeMode != 2 && rt->startTimeMs > 0) {
+            // Default assumption in Alight Motion: acTime is layer-local seconds unless proven scene seconds
+            evalTimeMs = rt->startTimeMs + (int64_t)llround((double)shaderTimeSec * 1000.0);
+        }
+
+        if (rt->active && rt->pinCount > 0) {
+            int n = rt->pinCount;
+            if (n > kAMPuppetMaxPins) n = kAMPuppetMaxPins;
+            outBuf[magicIdx + 2] = (float)n;
+            outBuf[magicIdx + 3] = rt->rigidity;
+            outBuf[magicIdx + 4] = (float)rt->deformMode;
+            outBuf[magicIdx + 5] = (rt->showMesh && gAMPuppetPanelVisible && rt->elementId == gAMPuppetActiveElementId) ? 1.0f : 0.0f;
+            int baseIdx = magicIdx + 6;
+            for (int i = 0; i < n; ++i) {
+                float cx = rt->pins[i].currX;
+                float cy = rt->pins[i].currY;
+                AMPuppetEvalPinAtMs(&rt->pins[i], evalTimeMs, &cx, &cy);
+                outBuf[baseIdx + i * 4 + 0] = rt->pins[i].restX;
+                outBuf[baseIdx + i * 4 + 1] = rt->pins[i].restY;
+                outBuf[baseIdx + i * 4 + 2] = cx;
+                outBuf[baseIdx + i * 4 + 3] = cy;
+            }
+        } else {
+            outBuf[magicIdx + 2] = 0.0f;
+            outBuf[magicIdx + 3] = 1.5f;
+            outBuf[magicIdx + 4] = 0.0f;
+            outBuf[magicIdx + 5] = 0.0f;
+        }
+        os_unfair_lock_unlock(&gAMPuppetRuntimeLock);
+
+        if (gOrigMTLSetFragmentBytes) {
+            NSUInteger uploadLen = (pLen <= sizeof(outBuf)) ? pLen : sizeof(outBuf);
+            ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))gOrigMTLSetFragmentBytes)(self, _cmd, outBuf, uploadLen, 0);
+        }
+        if (notifyTransform) {
+            int prev = gAMPuppetLastTransformSlotNotified;
+            if (prev != slot) {
+                gAMPuppetLastTransformSlotNotified = slot;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    gAMPuppetLastTransformSlotNotified = 0;
+                    [[NSNotificationCenter defaultCenter] postNotificationName:kAMPuppetTransformUpdatedNotification object:@(slot)];
+                });
+            }
+        }
+    }
+
+    if (gOrigMTLSetFragmentBytes) {
+        ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))gOrigMTLSetFragmentBytes)(self, _cmd, bytes, length, index);
+    }
+}
+
+static void AMInstallPuppetMetalHook(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (!dev) return;
+        id<MTLCommandQueue> q = [dev newCommandQueue];
+        if (!q) return;
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                      width:4
+                                                                                     height:4
+                                                                                  mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget;
+        id<MTLTexture> tex = [dev newTextureWithDescriptor:td];
+        if (!tex) return;
+        MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+        rpd.colorAttachments[0].texture = tex;
+        rpd.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        rpd.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+        if (!enc) return;
+        Class encCls = object_getClass(enc);
+        [enc endEncoding];
+        SEL sel = @selector(setFragmentBytes:length:atIndex:);
+        Method m = class_getInstanceMethod(encCls, sel);
+        if (m) {
+            gOrigMTLSetFragmentBytes = method_setImplementation(m, (IMP)AMHook_mtlSetFragmentBytes);
+        }
+    });
+}
+
+// --- Puppet Persistent Store (Documents/AMPuppetData.json) ---
+
+@interface AMPuppetStore : NSObject
++ (instancetype)shared;
+- (NSMutableDictionary *)layerDictForSlot:(int)slot create:(BOOL)create elementId:(uint64_t)elementId;
+- (NSMutableDictionary *)layerDictForElementId:(uint64_t)elementId;
+- (int)slotForElementId:(uint64_t)elementId;
+- (void)bindSlot:(int)slot toElementId:(uint64_t)elementId startTimeMs:(int64_t)startMs endTimeMs:(int64_t)endMs;
+- (void)syncAllToRuntime;
+- (void)save;
+@end
+
+@implementation AMPuppetStore {
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *_slots; // "1".."16" -> layer dict
+}
+
++ (instancetype)shared {
+    static AMPuppetStore *inst = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        inst = [[AMPuppetStore alloc] init];
+    });
+    return inst;
+}
+
+- (NSString *)storePath {
+    NSArray<NSString *> *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return [docs.firstObject stringByAppendingPathComponent:@"AMPuppetData.json"];
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _slots = [NSMutableDictionary dictionary];
+        [self loadFromDisk];
+        [self syncAllToRuntime];
+    }
+    return self;
+}
+
+- (void)loadFromDisk {
+    NSData *data = [NSData dataWithContentsOfFile:[self storePath]];
+    if (!data) return;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *root = (NSDictionary *)obj;
+        NSDictionary *slots = root[@"slots"];
+        if ([slots isKindOfClass:[NSDictionary class]]) {
+            for (NSString *k in slots) {
+                if ([slots[k] isKindOfClass:[NSMutableDictionary class]]) {
+                    _slots[k] = slots[k];
+                } else if ([slots[k] isKindOfClass:[NSDictionary class]]) {
+                    _slots[k] = [slots[k] mutableCopy];
+                }
+            }
+        }
+    }
+}
+
+- (void)save {
+    [self syncAllToRuntime];
+    NSDictionary *root = @{@"version": @1, @"slots": _slots ?: @{}};
+    NSData *data = [NSJSONSerialization dataWithJSONObject:root options:0 error:nil];
+    if (data) {
+        [data writeToFile:[self storePath] atomically:YES];
+    }
+}
+
+- (NSMutableDictionary *)layerDictForSlot:(int)slot create:(BOOL)create elementId:(uint64_t)elementId {
+    if (slot < 1 || slot > kAMPuppetMaxSlots) return nil;
+    NSString *key = [NSString stringWithFormat:@"%d", slot];
+    NSMutableDictionary *d = _slots[key];
+    if (!d && create) {
+        d = [NSMutableDictionary dictionaryWithDictionary:@{
+            @"slot": @(slot),
+            @"elementId": @(elementId),
+            @"startTimeMs": @(0),
+            @"endTimeMs": @(5000),
+            @"rigidity": @(1.5),
+            @"deformMode": @(0),
+            @"showMesh": @(YES),
+            @"nextPinId": @(1),
+            @"pins": [NSMutableArray array]
+        }];
+        _slots[key] = d;
+    }
+    return d;
+}
+
+- (NSMutableDictionary *)layerDictForElementId:(uint64_t)elementId {
+    if (elementId == 0) return nil;
+    for (int s = 1; s <= kAMPuppetMaxSlots; ++s) {
+        NSMutableDictionary *d = _slots[[NSString stringWithFormat:@"%d", s]];
+        if (d && [d[@"elementId"] unsignedLongLongValue] == elementId) {
+            return d;
+        }
+    }
+    return nil;
+}
+
+- (int)slotForElementId:(uint64_t)elementId {
+    NSMutableDictionary *d = [self layerDictForElementId:elementId];
+    return d ? [d[@"slot"] intValue] : 0;
+}
+
+- (void)bindSlot:(int)slot toElementId:(uint64_t)elementId startTimeMs:(int64_t)startMs endTimeMs:(int64_t)endMs {
+    NSMutableDictionary *d = [self layerDictForSlot:slot create:YES elementId:elementId];
+    if (!d) return;
+    d[@"slot"] = @(slot);
+    d[@"elementId"] = @(elementId);
+    if (startMs >= 0) d[@"startTimeMs"] = @(startMs);
+    if (endMs > startMs) d[@"endTimeMs"] = @(endMs);
+    if (![d[@"pins"] isKindOfClass:[NSMutableArray class]]) {
+        d[@"pins"] = d[@"pins"] ? [d[@"pins"] mutableCopy] : [NSMutableArray array];
+    }
+    [self save];
+}
+
+- (void)syncAllToRuntime {
+    os_unfair_lock_lock(&gAMPuppetRuntimeLock);
+    for (int s = 1; s <= kAMPuppetMaxSlots; ++s) {
+        AMPuppetSlotRuntime *rt = &gAMPuppetSlots[s];
+        memset(rt, 0, sizeof(*rt));
+        NSDictionary *d = _slots[[NSString stringWithFormat:@"%d", s]];
+        if (!d) continue;
+        rt->active = YES;
+        rt->elementId = [d[@"elementId"] unsignedLongLongValue];
+        rt->startTimeMs = [d[@"startTimeMs"] longLongValue];
+        rt->endTimeMs = [d[@"endTimeMs"] longLongValue];
+        rt->rigidity = [d[@"rigidity"] floatValue];
+        if (rt->rigidity < 0.5f || rt->rigidity > 4.0f) rt->rigidity = 1.5f;
+        rt->deformMode = [d[@"deformMode"] intValue];
+        rt->showMesh = [d[@"showMesh"] boolValue];
+        NSArray *pins = [d[@"pins"] isKindOfClass:[NSArray class]] ? d[@"pins"] : @[];
+        int pn = (int)pins.count;
+        if (pn > kAMPuppetMaxPins) pn = kAMPuppetMaxPins;
+        rt->pinCount = pn;
+        for (int i = 0; i < pn; ++i) {
+            NSDictionary *pd = pins[i];
+            AMPuppetPinC *pc = &rt->pins[i];
+            pc->pinId = [pd[@"id"] intValue];
+            pc->restX = [pd[@"restX"] floatValue];
+            pc->restY = [pd[@"restY"] floatValue];
+            pc->currX = [pd[@"currX"] floatValue];
+            pc->currY = [pd[@"currY"] floatValue];
+            NSArray *kfs = [pd[@"keyframes"] isKindOfClass:[NSArray class]] ? pd[@"keyframes"] : @[];
+            int kn = (int)kfs.count;
+            if (kn > kAMPuppetMaxKeyframesPerPin) kn = kAMPuppetMaxKeyframesPerPin;
+            pc->keyframeCount = kn;
+            for (int k = 0; k < kn; ++k) {
+                NSDictionary *kd = kfs[k];
+                AMPuppetKeyframeC *kc = &pc->keyframes[k];
+                kc->timeMs = [kd[@"t"] longLongValue];
+                kc->x = [kd[@"x"] floatValue];
+                kc->y = [kd[@"y"] floatValue];
+                kc->easingType = [kd[@"easingType"] intValue];
+                kc->p1x = kd[@"p1x"] ? [kd[@"p1x"] floatValue] : 0.42f;
+                kc->p1y = kd[@"p1y"] ? [kd[@"p1y"] floatValue] : 0.0f;
+                kc->p2x = kd[@"p2x"] ? [kd[@"p2x"] floatValue] : 0.58f;
+                kc->p2y = kd[@"p2y"] ? [kd[@"p2y"] floatValue] : 1.0f;
+                kc->stepCount = kd[@"stepCount"] ? [kd[@"stepCount"] floatValue] : 4.0f;
+            }
+        }
+    }
+    os_unfair_lock_unlock(&gAMPuppetRuntimeLock);
+}
+
+@end
+
+// --- Native Swift SceneElement Effect Attachment & Playhead Seek Helpers ---
+
+typedef struct {
+    uint64_t targetElementId;
+    int assignedSlot;
+    int64_t startTimeMs;
+    int64_t endTimeMs;
+    BOOL shouldAttachIfMissing;
+    BOOL didAttach;
+} AMPuppetAttachCtx;
+
+static AMPuppetAttachCtx gAMPuppetAttachCtx;
+
+static int AMPuppetMatchSlotFromSwiftString(uint64_t strLo, uint64_t strHi, intptr_t slide) {
+    typedef uint8_t (*AMStrEqFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint8_t);
+    AMStrEqFn strEq = (AMStrEqFn)(0x1025b7bb8ULL + slide);
+    static AMSwiftString slotStrs[kAMPuppetMaxSlots + 1];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        for (int s = 1; s <= kAMPuppetMaxSlots; ++s) {
+            slotStrs[s] = AMMakeSwiftString(AMPuppetEffectIdForSlot(s));
+        }
+    });
+    for (int s = 1; s <= kAMPuppetMaxSlots; ++s) {
+        if (strLo == slotStrs[s].lo && strHi == slotStrs[s].hi) return s;
+        if (strEq && (strEq(strLo, strHi, slotStrs[s].lo, slotStrs[s].hi, 0) & 1)) return s;
+    }
+    return 0;
+}
+
+static void AMPuppetAttachEditCallback(void *scenePtr) {
+    if (!scenePtr || gAMPuppetAttachCtx.targetElementId == 0) return;
+    intptr_t slide = AMMainBinarySlide();
+
+    typedef void *(*MetaFn)(uintptr_t);
+    typedef void (*DestroyFn)(void *, void *);
+    typedef void *(*BridgeRetainFn)(void *);
+
+    void *sceneMeta = ((MetaFn)(0x1003c6b10ULL + slide))(0);
+    void *elMeta = ((MetaFn)(0x1003e0404ULL + slide))(0);
+    void *efMeta = ((MetaFn)(0x100459f90ULL + slide))(0);
+    if (!sceneMeta || !elMeta || !efMeta) return;
+
+    int32_t elementsOff = *(int32_t *)((uint8_t *)sceneMeta + 0x1c);
+    void *elVWT = *(void **)((uint8_t *)elMeta - 8);
+    uint8_t elAlignMask = *(uint8_t *)((uint8_t *)elVWT + 0x50);
+    size_t elStride = *(size_t *)((uint8_t *)elVWT + 0x48);
+    int32_t startOff = *(int32_t *)((uint8_t *)elMeta + 0x14);
+    int32_t endOff = *(int32_t *)((uint8_t *)elMeta + 0x18);
+    int32_t vfxOff = *(int32_t *)((uint8_t *)elMeta + 0x78);
+
+    void *efVWT = *(void **)((uint8_t *)efMeta - 8);
+    uint8_t efAlignMask = *(uint8_t *)((uint8_t *)efVWT + 0x50);
+    size_t efSize = *(size_t *)((uint8_t *)efVWT + 0x40);
+    size_t efStride = *(size_t *)((uint8_t *)efVWT + 0x48);
+    int32_t efIdOff = *(int32_t *)((uint8_t *)efMeta + 0x14);
+    int32_t efParamsOff = *(int32_t *)((uint8_t *)efMeta + 0x18);
+    int32_t efRenderGroupOff = *(int32_t *)((uint8_t *)efMeta + 0x1c);
+    int32_t efDisabledOff = *(int32_t *)((uint8_t *)efMeta + 0x20);
+    int32_t efLocalOff = *(int32_t *)((uint8_t *)efMeta + 0x24);
+    int32_t efHiddenOff = *(int32_t *)((uint8_t *)efMeta + 0x28);
+
+    void *makeUnique = dlsym(RTLD_DEFAULT, "$sSa36_makeUniqueAndReserveCapacityIfNotUniqueyyF");
+    void **elementsField = (void **)((uint8_t *)scenePtr + elementsOff);
+    if (makeUnique && *elementsField) {
+        struct { uint64_t selfPtr, metaPtr, fnPtr; } uArgs = {
+            (uint64_t)elementsField, (uint64_t)elMeta, (uint64_t)makeUnique
+        };
+        __asm__ volatile(
+            "mov x9, %0\n"
+            "ldr x20, [x9, #0]\n"
+            "ldr x0,  [x9, #8]\n"
+            "ldr x16, [x9, #16]\n"
+            "blr x16\n"
+            :
+            : "r"(&uArgs)
+            : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+              "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+              "x16", "x17", "x20", "x30", "memory"
+        );
+    }
+
+    void *arrStorage = *elementsField;
+    if (!arrStorage) return;
+    int64_t count = *(int64_t *)((uint8_t *)arrStorage + 0x10);
+    size_t elHdrOff = (0x20 + (size_t)elAlignMask) & ~(size_t)elAlignMask;
+    uint8_t *basePtr = (uint8_t *)arrStorage + elHdrOff;
+    size_t efHdrOff = (0x20 + (size_t)efAlignMask) & ~(size_t)efAlignMask;
+
+    BOOL usedSlots[kAMPuppetMaxSlots + 1];
+    memset(usedSlots, 0, sizeof(usedSlots));
+    uint8_t *targetEl = NULL;
+    int existingSlot = 0;
+
+    for (int64_t i = 0; i < count; ++i) {
+        uint8_t *elPtr = basePtr + (size_t)i * elStride;
+        uint64_t eid = *(uint64_t *)(elPtr + 0x18);
+        void *vfxArr = *(void **)(elPtr + vfxOff);
+        if (vfxArr) {
+            int64_t vcnt = *(int64_t *)((uint8_t *)vfxArr + 0x10);
+            if (vcnt > 0 && vcnt < 256) {
+                uint8_t *efBase = (uint8_t *)vfxArr + efHdrOff;
+                for (int64_t j = 0; j < vcnt; ++j) {
+                    uint8_t *efPtr = efBase + (size_t)j * efStride;
+                    uint64_t slo = *(uint64_t *)(efPtr + efIdOff);
+                    uint64_t shi = *(uint64_t *)(efPtr + efIdOff + 8);
+                    int matched = AMPuppetMatchSlotFromSwiftString(slo, shi, slide);
+                    if (matched >= 1 && matched <= kAMPuppetMaxSlots) {
+                        usedSlots[matched] = YES;
+                        if (eid == gAMPuppetAttachCtx.targetElementId && existingSlot == 0) {
+                            existingSlot = matched;
+                        }
+                    }
+                }
+            }
+        }
+        if (eid == gAMPuppetAttachCtx.targetElementId) {
+            targetEl = elPtr;
+        }
+    }
+
+    if (!targetEl) return;
+    gAMPuppetAttachCtx.startTimeMs = *(int64_t *)(targetEl + startOff);
+    gAMPuppetAttachCtx.endTimeMs = *(int64_t *)(targetEl + endOff);
+
+    if (existingSlot > 0) {
+        gAMPuppetAttachCtx.assignedSlot = existingSlot;
+        return;
+    }
+    if (!gAMPuppetAttachCtx.shouldAttachIfMissing) return;
+
+    // Pick preferred slot from store if unused, otherwise first unused slot 1..16
+    int chosenSlot = [[AMPuppetStore shared] slotForElementId:gAMPuppetAttachCtx.targetElementId];
+    if (chosenSlot < 1 || chosenSlot > kAMPuppetMaxSlots || usedSlots[chosenSlot]) {
+        chosenSlot = 0;
+        for (int s = 1; s <= kAMPuppetMaxSlots; ++s) {
+            if (!usedSlots[s]) { chosenSlot = s; break; }
+        }
+    }
+    if (chosenSlot == 0) chosenSlot = 1;
+
+    // Construct KeyableVisualEffectRef cleanly and append via Alight Motion's native 0x1006e89dc!
+    void *emptyDict = dlsym(RTLD_DEFAULT, "_swiftEmptyDictionarySingleton");
+    void *emptySet = dlsym(RTLD_DEFAULT, "_swiftEmptySetSingleton");
+    if (!emptyDict || !emptySet) return;
+    BridgeRetainFn bridgeRetain = (BridgeRetainFn)(0x1025bb41cULL + slide);
+
+    uint8_t *efBuf = (uint8_t *)calloc(1, efSize + 32);
+    if (!efBuf) return;
+
+    // 1. instanceId: UUID v4 (16 bytes at +0x00)
+    arc4random_buf(efBuf, 16);
+    efBuf[6] = (efBuf[6] & 0x0F) | 0x40;
+    efBuf[8] = (efBuf[8] & 0x3F) | 0x80;
+
+    // 2. id: Swift String
+    AMSwiftString idStr = AMMakeSwiftString(AMPuppetEffectIdForSlot(chosenSlot));
+    *(uint64_t *)(efBuf + efIdOff) = idStr.lo;
+    *(uint64_t *)(efBuf + efIdOff + 8) = idStr.hi;
+
+    // 3. parameters: empty Swift Dictionary
+    bridgeRetain(emptyDict);
+    *(void **)(efBuf + efParamsOff) = emptyDict;
+
+    // 4. renderGroup: 0
+    *(int64_t *)(efBuf + efRenderGroupOff) = 0;
+
+    // 5. disabledRenderGroups: empty Swift Set
+    bridgeRetain(emptySet);
+    *(void **)(efBuf + efDisabledOff) = emptySet;
+
+    // 6. isLocallyApplied = true, hidden = false
+    *(uint8_t *)(efBuf + efLocalOff) = 1;
+    *(uint8_t *)(efBuf + efHiddenOff) = 0;
+
+    // Append using native 0x1006e89dc(x0 = inout SceneElement *, x5 = const KeyableVisualEffectRef *)
+    uintptr_t addEfAddr = (uintptr_t)(0x1006e89dcULL + slide);
+    struct { uint64_t elPtr, efPtr, fn; } aeArgs = {
+        (uint64_t)targetEl, (uint64_t)efBuf, (uint64_t)addEfAddr
+    };
+    __asm__ volatile(
+        "mov x9, %0\n"
+        "ldr x0,  [x9, #0]\n"
+        "mov x1,  #0\n"
+        "mov x2,  #0\n"
+        "mov x3,  #0\n"
+        "mov x4,  #0\n"
+        "ldr x5,  [x9, #8]\n"
+        "ldr x16, [x9, #16]\n"
+        "blr x16\n"
+        :
+        : "r"(&aeArgs)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+          "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+          "x16", "x17", "x20", "x30", "memory",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"
+    );
+
+    // Destroy our temporary efBuf (0x1006e89dc copied it via initializeWithCopy)
+    ((DestroyFn)(0x1000199c0ULL + slide))(efBuf, (void *)(0x100459f90ULL + slide));
+    free(efBuf);
+
+    gAMPuppetAttachCtx.assignedSlot = chosenSlot;
+    gAMPuppetAttachCtx.didAttach = YES;
+}
+
+static int AMPuppetSyncOrAttachEffect(void *holder, uint64_t elementId, BOOL attachIfMissing, int64_t *outStartMs, int64_t *outEndMs) {
+    if (!holder || elementId == 0) return 0;
+    intptr_t slide = AMMainBinarySlide();
+
+    memset(&gAMPuppetAttachCtx, 0, sizeof(gAMPuppetAttachCtx));
+    gAMPuppetAttachCtx.targetElementId = elementId;
+    gAMPuppetAttachCtx.shouldAttachIfMissing = attachIfMissing;
+
+    struct { uint64_t cb, holderPtr, fn; } peArgs = {
+        (uint64_t)AMPuppetAttachEditCallback, (uint64_t)holder, (uint64_t)(0x100392588ULL + slide)
+    };
+    __asm__ volatile(
+        "mov x9, %0\n"
+        "mov w0, #4\n"
+        "mov x1, #0\n"
+        "mov w2, #2\n"
+        "ldr x3,  [x9, #0]\n"
+        "mov x4, #0\n"
+        "ldr x20, [x9, #8]\n"
+        "ldr x16, [x9, #16]\n"
+        "blr x16\n"
+        :
+        : "r"(&peArgs)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+          "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+          "x16", "x17", "x20", "x30", "memory",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"
+    );
+
+    if (outStartMs) *outStartMs = gAMPuppetAttachCtx.startTimeMs;
+    if (outEndMs) *outEndMs = gAMPuppetAttachCtx.endTimeMs;
+    int slot = gAMPuppetAttachCtx.assignedSlot;
+    if (slot >= 1 && slot <= kAMPuppetMaxSlots) {
+        [[AMPuppetStore shared] bindSlot:slot
+                             toElementId:elementId
+                             startTimeMs:gAMPuppetAttachCtx.startTimeMs
+                               endTimeMs:gAMPuppetAttachCtx.endTimeMs];
+    }
+    return slot;
+}
+
+static void AMPuppetSeekHolderToTimeMs(void *holder, int64_t timeMs) {
+    if (!holder) return;
+    if (timeMs < 0) timeMs = 0;
+    intptr_t slide = AMMainBinarySlide();
+    ptrdiff_t flagOff = *(ptrdiff_t *)(0x1033e54d8ULL + slide);
+    ptrdiff_t timeOff = *(ptrdiff_t *)(0x1033e5508ULL + slide);
+    uint8_t *h = (uint8_t *)holder;
+    *(uint8_t *)(h + flagOff) = 1;
+    *(int64_t *)(h + timeOff) = timeMs;
+
+    AMSwiftRetain(holder, slide);
+    struct { uint64_t hPtr, fn; } sArgs = {
+        (uint64_t)holder, (uint64_t)(0x100395650ULL + slide)
+    };
+    __asm__ volatile(
+        "mov x9, %0\n"
+        "ldr x20, [x9, #0]\n"
+        "ldr x16, [x9, #8]\n"
+        "blr x16\n"
+        :
+        : "r"(&sArgs)
+        : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+          "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+          "x16", "x17", "x20", "x30", "memory",
+          "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"
+    );
+
+    // Notify time observers (updates timeline playhead & AVPlayer)
+    ptrdiff_t obsOff = *(ptrdiff_t *)(0x103332370ULL + slide);
+    void *obsArr = *(void **)(h + obsOff);
+    if (obsArr && (((uintptr_t)obsArr >> 62) == 0)) {
+        int64_t cnt = *(int64_t *)((uint8_t *)obsArr + 0x10);
+        if (cnt > 0 && cnt < 64) {
+            typedef void *(*WeakLoadObjFn)(void *);
+            WeakLoadObjFn weakLoad = (WeakLoadObjFn)(0x1025bb9ecULL + slide);
+            uintptr_t notifyFn = (uintptr_t)(0x10021c7dcULL + slide);
+            for (int64_t i = 0; i < cnt; ++i) {
+                void *box = *(void **)((uint8_t *)obsArr + 0x20 + i * 8);
+                if (!box) continue;
+                void *obs = weakLoad((uint8_t *)box + 0x10);
+                if (!obs) continue;
+                struct { uint64_t t, o, fn; } nArgs = { (uint64_t)timeMs, (uint64_t)obs, (uint64_t)notifyFn };
+                __asm__ volatile(
+                    "mov x9, %0\n"
+                    "ldr x0,  [x9, #0]\n"
+                    "ldr x20, [x9, #8]\n"
+                    "ldr x16, [x9, #16]\n"
+                    "blr x16\n"
+                    :
+                    : "r"(&nArgs)
+                    : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+                      "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+                      "x16", "x17", "x20", "x30", "memory"
+                );
+                AMSwiftRelease(obs, slide);
+            }
+        }
+    }
+    AMSwiftRelease(holder, slide);
+
+    AVPlayer *player = gActivePreviewPlayer;
+    if (player) {
+        [player seekToTime:CMTimeMake(timeMs, 1000) toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+    }
+}
+
+static void AMRedrawAllKeyframeViewsInView(UIView *v, Class kfCls) {
+    if (!v) return;
+    if ([v isKindOfClass:kfCls]) {
+        [v setNeedsDisplay];
+    }
+    for (UIView *sub in v.subviews) {
+        AMRedrawAllKeyframeViewsInView(sub, kfCls);
+    }
+}
+
+static void AMPuppetRedrawAllKeyframeViews(void) {
+    Class kfCls = NSClassFromString(@"_TtC12AlightMotion12KeyframeView");
+    if (!kfCls) return;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                AMRedrawAllKeyframeViewsInView(w, kfCls);
+            }
+        }
+    }
+}
+
+static UIView *AMFindProjectPreviewViewInView(UIView *v, Class cls) {
+    if (!v) return nil;
+    if ([v isKindOfClass:cls]) return v;
+    for (UIView *sub in v.subviews) {
+        UIView *found = AMFindProjectPreviewViewInView(sub, cls);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static UIView *AMPuppetFindProjectPreviewView(UIView *anchorView) {
+    Class pvCls = NSClassFromString(@"_TtC12AlightMotion18ProjectPreviewView");
+    if (!pvCls) return nil;
+    if (anchorView.window) {
+        UIView *found = AMFindProjectPreviewViewInView(anchorView.window, pvCls);
+        if (found) return found;
+    }
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                if (w.hidden) continue;
+                UIView *found = AMFindProjectPreviewViewInView(w, pvCls);
+                if (found) return found;
+            }
+        }
+    }
+    return nil;
+}
+
+// --- Custom Crisp Alight Motion Vector Icons ---
+
+static UIImage *AMPuppetTabIcon(void) {
+    static UIImage *img = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        CGSize sz = CGSizeMake(28.0, 28.0);
+        UIGraphicsBeginImageContextWithOptions(sz, NO, 0.0);
+        CGContextRef ctx = UIGraphicsGetCurrentContext();
+        [[UIColor whiteColor] setStroke];
+        [[UIColor whiteColor] setFill];
+        CGContextSetLineWidth(ctx, 1.7);
+        CGContextSetLineCap(ctx, kCGLineCapRound);
+        CGContextSetLineJoin(ctx, kCGLineJoinRound);
+
+        // Subtle curved mesh arcs beneath the pushpin (iconic AE Puppet Pin look, native AM stroke weight)
+        UIBezierPath *mesh = [UIBezierPath bezierPath];
+        [mesh moveToPoint:CGPointMake(3.5, 22.5)];
+        [mesh addQuadCurveToPoint:CGPointMake(24.5, 22.5) controlPoint:CGPointMake(14.0, 17.5)];
+        [mesh moveToPoint:CGPointMake(6.0, 25.0)];
+        [mesh addQuadCurveToPoint:CGPointMake(22.0, 25.0) controlPoint:CGPointMake(14.0, 21.5)];
+        mesh.lineWidth = 1.4;
+        [mesh stroke];
+
+        // Tilted Puppet Pushpin (head, neck, collar, needle touching mesh apex)
+        UIBezierPath *pinHead = [UIBezierPath bezierPath];
+        [pinHead moveToPoint:CGPointMake(15.5, 4.0)];
+        [pinHead addLineToPoint:CGPointMake(22.0, 10.5)];
+        [pinHead addLineToPoint:CGPointMake(19.5, 13.0)];
+        [pinHead addLineToPoint:CGPointMake(17.5, 11.5)];
+        [pinHead addLineToPoint:CGPointMake(15.0, 14.0)];
+        [pinHead addLineToPoint:CGPointMake(16.8, 15.8)];
+        [pinHead addLineToPoint:CGPointMake(14.5, 18.0)];
+        [pinHead addLineToPoint:CGPointMake(8.0, 11.5)];
+        [pinHead addLineToPoint:CGPointMake(10.2, 9.2)];
+        [pinHead addLineToPoint:CGPointMake(12.0, 11.0)];
+        [pinHead addLineToPoint:CGPointMake(14.5, 8.5)];
+        [pinHead addLineToPoint:CGPointMake(13.0, 6.5)];
+        [pinHead closePath];
+        pinHead.lineWidth = 1.65;
+        [pinHead stroke];
+
+        // Needle down to anchor point
+        UIBezierPath *needle = [UIBezierPath bezierPath];
+        [needle moveToPoint:CGPointMake(11.2, 14.8)];
+        [needle addLineToPoint:CGPointMake(7.2, 19.6)];
+        needle.lineWidth = 1.8;
+        [needle stroke];
+
+        // Anchor pin dot
+        UIBezierPath *dot = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(5.3, 18.0, 3.6, 3.6)];
+        [dot fill];
+
+        img = [UIGraphicsGetImageFromCurrentImageContext() imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        UIGraphicsEndImageContext();
+    });
+    return img;
+}
+
+static UIImage *AMPuppetDiamondIcon(BOOL filled) {
+    CGSize sz = CGSizeMake(22.0, 22.0);
+    UIGraphicsBeginImageContextWithOptions(sz, NO, 0.0);
+    UIBezierPath *p = [UIBezierPath bezierPath];
+    [p moveToPoint:CGPointMake(11.0, 3.0)];
+    [p addLineToPoint:CGPointMake(19.0, 11.0)];
+    [p addLineToPoint:CGPointMake(11.0, 19.0)];
+    [p addLineToPoint:CGPointMake(3.0, 11.0)];
+    [p closePath];
+    p.lineWidth = 1.8;
+    if (filled) {
+        [[UIColor whiteColor] setFill];
+        [p fill];
+    } else {
+        [[UIColor whiteColor] setStroke];
+        [p stroke];
+        UIBezierPath *plus = [UIBezierPath bezierPath];
+        [plus moveToPoint:CGPointMake(8.0, 11.0)];
+        [plus addLineToPoint:CGPointMake(14.0, 11.0)];
+        [plus moveToPoint:CGPointMake(11.0, 8.0)];
+        [plus addLineToPoint:CGPointMake(11.0, 14.0)];
+        plus.lineWidth = 1.6;
+        [plus stroke];
+    }
+    UIImage *res = [UIGraphicsGetImageFromCurrentImageContext() imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    UIGraphicsEndImageContext();
+    return res;
+}
+
+// --- Matrix Helpers (row-vector * column-major Metal float4x4) ---
+
+static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
+    float x = (float)pt.x;
+    float y = (float)pt.y;
+    float ox = x * m[0] + y * m[1] + m[3];
+    float oy = x * m[4] + y * m[5] + m[7];
+    float ow = x * m[12] + y * m[13] + m[15];
+    if (fabsf(ow) > 1e-5f) {
+        ox /= ow;
+        oy /= ow;
+    }
+    return CGPointMake(ox, oy);
+}
+
+// --- Interactive Canvas Overlay on ProjectPreviewView ---
+
+@protocol AMPuppetCanvasOverlayDelegate <NSObject>
+- (void)puppetCanvasDidTapAddPinAtLayerNorm:(CGPoint)layerNorm;
+- (void)puppetCanvasDidSelectPinIndex:(NSInteger)pinIndex;
+- (void)puppetCanvasDidDragPinIndex:(NSInteger)pinIndex toLayerNorm:(CGPoint)layerNorm ended:(BOOL)ended;
+@end
+
+@interface AMPuppetCanvasOverlayView : UIView
+@property (nonatomic, weak) id<AMPuppetCanvasOverlayDelegate> delegate;
+@property (nonatomic, weak) UIView *previewView;
+@property (nonatomic, assign) int slot;
+@property (nonatomic, assign) int64_t currentTimeMs;
+@property (nonatomic, assign) NSInteger selectedPinIndex;
+@property (nonatomic, assign) BOOL addPinMode;
+@end
+
+@implementation AMPuppetCanvasOverlayView {
+    NSInteger _draggingPinIndex;
+    CGPoint _touchStartViewPt;
+    BOOL _didMoveDuringDrag;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor clearColor];
+        self.opaque = NO;
+        self.multipleTouchEnabled = YES;
+        _draggingPinIndex = -1;
+        _selectedPinIndex = -1;
+        _addPinMode = YES;
+    }
+    return self;
+}
+
+- (AVPlayerLayer *)hostPlayerLayer {
+    UIView *pv = self.previewView;
+    if (!pv) return nil;
+    if ([pv respondsToSelector:@selector(playerLayer)]) {
+        AVPlayerLayer *pl = ((AVPlayerLayer *(*)(id, SEL))objc_msgSend)(pv, @selector(playerLayer));
+        if ([pl isKindOfClass:[AVPlayerLayer class]]) return pl;
+    }
+    for (CALayer *sub in pv.layer.sublayers) {
+        if ([sub isKindOfClass:[AVPlayerLayer class]]) return (AVPlayerLayer *)sub;
+    }
+    return nil;
+}
+
+- (BOOL)getTransformSnapshot:(AMPuppetTransformSnapshot *)outSnap {
+    if (self.slot < 1 || self.slot > kAMPuppetMaxSlots) return NO;
+    os_unfair_lock_lock(&gAMPuppetRuntimeLock);
+    *outSnap = gAMPuppetTransforms[self.slot];
+    os_unfair_lock_unlock(&gAMPuppetRuntimeLock);
+    return outSnap->valid;
+}
+
+- (CGPoint)viewPointFromLayerNorm:(CGPoint)ln {
+    AVPlayerLayer *pl = [self hostPlayerLayer];
+    UIView *pv = self.previewView;
+    if (!pl || !pv) return CGPointMake(self.bounds.size.width * ln.x, self.bounds.size.height * (1.0 - ln.y));
+    CGRect vr = pl.videoRect;
+    if (vr.size.width < 1.0 || vr.size.height < 1.0) vr = pl.bounds;
+    if (vr.size.width < 1.0 || vr.size.height < 1.0) return CGPointMake(self.bounds.size.width * ln.x, self.bounds.size.height * (1.0 - ln.y));
+
+    AMPuppetTransformSnapshot snap;
+    CGPoint screenUV = ln;
+    if ([self getTransformSnapshot:&snap]) {
+        screenUV = AMPuppetMulRowMat4(ln, snap.layerToScreen);
+    }
+    CGPoint ptPL = CGPointMake(vr.origin.x + screenUV.x * vr.size.width,
+                               vr.origin.y + (1.0 - screenUV.y) * vr.size.height);
+    CGPoint ptPV = [pv.layer convertPoint:ptPL fromLayer:pl];
+    return [self convertPoint:ptPV fromView:pv];
+}
+
+- (CGPoint)layerNormFromViewPoint:(CGPoint)vp {
+    AVPlayerLayer *pl = [self hostPlayerLayer];
+    UIView *pv = self.previewView;
+    if (!pl || !pv) {
+        return CGPointMake(vp.x / fmax(self.bounds.size.width, 1.0),
+                           1.0 - vp.y / fmax(self.bounds.size.height, 1.0));
+    }
+    CGRect vr = pl.videoRect;
+    if (vr.size.width < 1.0 || vr.size.height < 1.0) vr = pl.bounds;
+    if (vr.size.width < 1.0 || vr.size.height < 1.0) {
+        return CGPointMake(vp.x / fmax(self.bounds.size.width, 1.0),
+                           1.0 - vp.y / fmax(self.bounds.size.height, 1.0));
+    }
+    CGPoint ptPV = [pv convertPoint:vp fromView:self];
+    CGPoint ptPL = [pl convertPoint:ptPV fromLayer:pv.layer];
+    CGPoint screenUV = CGPointMake((ptPL.x - vr.origin.x) / vr.size.width,
+                                   1.0 - (ptPL.y - vr.origin.y) / vr.size.height);
+    AMPuppetTransformSnapshot snap;
+    if ([self getTransformSnapshot:&snap]) {
+        return AMPuppetMulRowMat4(screenUV, snap.screenToLayer);
+    }
+    return screenUV;
+}
+
+- (NSInteger)hitTestPinAtViewPoint:(CGPoint)vp {
+    if (self.slot < 1 || self.slot > kAMPuppetMaxSlots) return -1;
+    AMPuppetSlotRuntime rt;
+    os_unfair_lock_lock(&gAMPuppetRuntimeLock);
+    rt = gAMPuppetSlots[self.slot];
+    os_unfair_lock_unlock(&gAMPuppetRuntimeLock);
+    if (!rt.active || rt.pinCount <= 0) return -1;
+
+    NSInteger bestIdx = -1;
+    CGFloat bestDist = 28.0; // comfortable finger hit target
+    for (int i = 0; i < rt.pinCount; ++i) {
+        float cx = rt.pins[i].currX, cy = rt.pins[i].currY;
+        AMPuppetEvalPinAtMs(&rt.pins[i], self.currentTimeMs, &cx, &cy);
+        CGPoint p = [self viewPointFromLayerNorm:CGPointMake(cx, cy)];
+        CGFloat d = hypot(vp.x - p.x, vp.y - p.y);
+        if (d < bestDist) {
+            bestDist = d;
+            bestIdx = i;
+        }
+    }
+    return bestIdx;
+}
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.hidden || self.alpha < 0.01 || !self.userInteractionEnabled) return nil;
+    if (!CGRectContainsPoint(self.bounds, point)) return nil;
+    // Let 2+ finger zoom/pan pass through to ProjectPreviewView
+    if (event && event.allTouches.count >= 2) return nil;
+    // Check if touching a pin OR inside/near the layer bounds in Add Pin mode
+    if ([self hitTestPinAtViewPoint:point] >= 0) return self;
+    if (self.addPinMode) {
+        CGPoint ln = [self layerNormFromViewPoint:point];
+        if (ln.x >= -0.25 && ln.x <= 1.25 && ln.y >= -0.25 && ln.y <= 1.25) {
+            return self;
+        }
+    }
+    return nil;
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (event.allTouches.count >= 2) {
+        _draggingPinIndex = -1;
+        [super touchesBegan:touches withEvent:event];
+        return;
+    }
+    UITouch *t = [touches anyObject];
+    if (!t) return;
+    CGPoint pt = [t locationInView:self];
+    _touchStartViewPt = pt;
+    _didMoveDuringDrag = NO;
+
+    NSInteger hit = [self hitTestPinAtViewPoint:pt];
+    if (hit >= 0) {
+        _draggingPinIndex = hit;
+        self.selectedPinIndex = hit;
+        [self.delegate puppetCanvasDidSelectPinIndex:hit];
+        [self setNeedsDisplay];
+    } else if (self.addPinMode) {
+        CGPoint ln = [self layerNormFromViewPoint:pt];
+        if (ln.x >= -0.15 && ln.x <= 1.15 && ln.y >= -0.15 && ln.y <= 1.15) {
+            ln.x = fmin(fmax(ln.x, 0.0), 1.0);
+            ln.y = fmin(fmax(ln.y, 0.0), 1.0);
+            [self.delegate puppetCanvasDidTapAddPinAtLayerNorm:ln];
+            // Newly added pin becomes active immediately so user can keep dragging!
+            _draggingPinIndex = self.selectedPinIndex;
+            [self setNeedsDisplay];
+        }
+    }
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    if (event.allTouches.count >= 2 || _draggingPinIndex < 0) return;
+    UITouch *t = [touches anyObject];
+    if (!t) return;
+    CGPoint pt = [t locationInView:self];
+    if (!_didMoveDuringDrag && hypot(pt.x - _touchStartViewPt.x, pt.y - _touchStartViewPt.y) < 2.0) {
+        return;
+    }
+    _didMoveDuringDrag = YES;
+    CGPoint ln = [self layerNormFromViewPoint:pt];
+    ln.x = fmin(fmax(ln.x, -0.5), 1.5);
+    ln.y = fmin(fmax(ln.y, -0.5), 1.5);
+    [self.delegate puppetCanvasDidDragPinIndex:_draggingPinIndex toLayerNorm:ln ended:NO];
+    [self setNeedsDisplay];
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)event;
+    if (_draggingPinIndex >= 0 && _didMoveDuringDrag) {
+        UITouch *t = [touches anyObject];
+        CGPoint pt = t ? [t locationInView:self] : _touchStartViewPt;
+        CGPoint ln = [self layerNormFromViewPoint:pt];
+        ln.x = fmin(fmax(ln.x, -0.5), 1.5);
+        ln.y = fmin(fmax(ln.y, -0.5), 1.5);
+        [self.delegate puppetCanvasDidDragPinIndex:_draggingPinIndex toLayerNorm:ln ended:YES];
+    }
+    _draggingPinIndex = -1;
+    _didMoveDuringDrag = NO;
+    [self setNeedsDisplay];
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)touches; (void)event;
+    _draggingPinIndex = -1;
+    _didMoveDuringDrag = NO;
+    [self setNeedsDisplay];
+}
+
+- (void)drawRect:(CGRect)rect {
+    (void)rect;
+    if (self.slot < 1 || self.slot > kAMPuppetMaxSlots) return;
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) return;
+
+    AMPuppetSlotRuntime rt;
+    AMPuppetTransformSnapshot snap;
+    os_unfair_lock_lock(&gAMPuppetRuntimeLock);
+    rt = gAMPuppetSlots[self.slot];
+    snap = gAMPuppetTransforms[self.slot];
+    os_unfair_lock_unlock(&gAMPuppetRuntimeLock);
+
+    // 1. Subtle dashed mint border around the target media layer
+    if (snap.valid) {
+        CGPoint c00 = [self viewPointFromLayerNorm:CGPointMake(0.0, 0.0)];
+        CGPoint c10 = [self viewPointFromLayerNorm:CGPointMake(1.0, 0.0)];
+        CGPoint c11 = [self viewPointFromLayerNorm:CGPointMake(1.0, 1.0)];
+        CGPoint c01 = [self viewPointFromLayerNorm:CGPointMake(0.0, 1.0)];
+        CGContextSaveGState(ctx);
+        CGFloat dash[] = {5.0, 4.0};
+        CGContextSetLineDash(ctx, 0.0, dash, 2);
+        CGContextSetLineWidth(ctx, 1.2);
+        [[AMAccentGreenColor() colorWithAlphaComponent:0.55] setStroke];
+        CGContextMoveToPoint(ctx, c00.x, c00.y);
+        CGContextAddLineToPoint(ctx, c10.x, c10.y);
+        CGContextAddLineToPoint(ctx, c11.x, c11.y);
+        CGContextAddLineToPoint(ctx, c01.x, c01.y);
+        CGContextClosePath(ctx);
+        CGContextStrokePath(ctx);
+        CGContextRestoreGState(ctx);
+    }
+
+    if (!rt.active || rt.pinCount <= 0) return;
+
+    // 2. Motion path for the selected pin (AE-style dotted motion trajectory across keyframes)
+    if (self.selectedPinIndex >= 0 && self.selectedPinIndex < rt.pinCount) {
+        const AMPuppetPinC *selPin = &rt.pins[self.selectedPinIndex];
+        if (selPin->keyframeCount >= 2) {
+            CGContextSaveGState(ctx);
+            [[AMAccentGreenColor() colorWithAlphaComponent:0.75] setStroke];
+            CGContextSetLineWidth(ctx, 1.6);
+            CGFloat dash[] = {3.0, 3.0};
+            CGContextSetLineDash(ctx, 0.0, dash, 2);
+            int64_t tStart = selPin->keyframes[0].timeMs;
+            int64_t tEnd = selPin->keyframes[selPin->keyframeCount - 1].timeMs;
+            int samples = 48;
+            for (int s = 0; s <= samples; ++s) {
+                int64_t ts = tStart + (int64_t)llround((double)(tEnd - tStart) * ((double)s / (double)samples));
+                float px, py;
+                AMPuppetEvalPinAtMs(selPin, ts, &px, &py);
+                CGPoint vp = [self viewPointFromLayerNorm:CGPointMake(px, py)];
+                if (s == 0) CGContextMoveToPoint(ctx, vp.x, vp.y);
+                else CGContextAddLineToPoint(ctx, vp.x, vp.y);
+            }
+            CGContextStrokePath(ctx);
+
+            // Keyframe dots along path
+            CGContextSetLineDash(ctx, 0.0, NULL, 0);
+            [[UIColor whiteColor] setFill];
+            for (int k = 0; k < selPin->keyframeCount; ++k) {
+                CGPoint kp = [self viewPointFromLayerNorm:CGPointMake(selPin->keyframes[k].x, selPin->keyframes[k].y)];
+                CGContextFillEllipseInRect(ctx, CGRectMake(kp.x - 3.0, kp.y - 3.0, 6.0, 6.0));
+            }
+            CGContextRestoreGState(ctx);
+        }
+    }
+
+    // 3. Draw Puppet Pins (AE-style yellow/mint rings + subtle rest-to-current tether)
+    NSDictionary *badgeAttrs = @{
+        NSFontAttributeName: AMThemeFont(9.5, UIFontWeightBold),
+        NSForegroundColorAttributeName: [UIColor whiteColor]
+    };
+
+    for (int i = 0; i < rt.pinCount; ++i) {
+        const AMPuppetPinC *pin = &rt.pins[i];
+        float cx = pin->currX, cy = pin->currY;
+        AMPuppetEvalPinAtMs(pin, self.currentTimeMs, &cx, &cy);
+        CGPoint vp = [self viewPointFromLayerNorm:CGPointMake(cx, cy)];
+        CGPoint rp = [self viewPointFromLayerNorm:CGPointMake(pin->restX, pin->restY)];
+        BOOL isSel = (i == self.selectedPinIndex);
+
+        // Faint rest anchor dot + tether line when deformed
+        if (hypot(vp.x - rp.x, vp.y - rp.y) > 4.0) {
+            CGContextSaveGState(ctx);
+            [[UIColor colorWithWhite:1.0 alpha:0.32] setStroke];
+            CGContextSetLineWidth(ctx, 1.0);
+            CGContextMoveToPoint(ctx, rp.x, rp.y);
+            CGContextAddLineToPoint(ctx, vp.x, vp.y);
+            CGContextStrokePath(ctx);
+            [[UIColor colorWithWhite:1.0 alpha:0.4] setFill];
+            CGContextFillEllipseInRect(ctx, CGRectMake(rp.x - 2.5, rp.y - 2.5, 5.0, 5.0));
+            CGContextRestoreGState(ctx);
+        }
+
+        UIColor *pinColor = isSel ? AMAccentGreenColor() : [UIColor colorWithRed:1.0 green:0.84 blue:0.04 alpha:1.0];
+        CGFloat outerR = isSel ? 12.0 : 9.0;
+        CGFloat innerR = isSel ? 5.0 : 4.0;
+
+        // Dark contrast halo
+        [[UIColor colorWithWhite:0.0 alpha:0.55] setFill];
+        CGContextFillEllipseInRect(ctx, CGRectMake(vp.x - outerR - 1.5, vp.y - outerR - 1.5, (outerR + 1.5) * 2.0, (outerR + 1.5) * 2.0));
+
+        // Colored translucent halo
+        [[pinColor colorWithAlphaComponent:0.28] setFill];
+        CGContextFillEllipseInRect(ctx, CGRectMake(vp.x - outerR, vp.y - outerR, outerR * 2.0, outerR * 2.0));
+
+        // Crisp ring stroke
+        [(isSel ? [UIColor whiteColor] : pinColor) setStroke];
+        CGContextSetLineWidth(ctx, isSel ? 2.0 : 1.6);
+        CGContextStrokeEllipseInRect(ctx, CGRectMake(vp.x - outerR, vp.y - outerR, outerR * 2.0, outerR * 2.0));
+
+        // Center solid pin dot
+        [pinColor setFill];
+        CGContextFillEllipseInRect(ctx, CGRectMake(vp.x - innerR, vp.y - innerR, innerR * 2.0, innerR * 2.0));
+
+        // Pin number badge
+        NSString *numStr = [NSString stringWithFormat:@"%d", i + 1];
+        CGSize tsz = [numStr sizeWithAttributes:badgeAttrs];
+        CGRect bRect = CGRectMake(vp.x + outerR - 2.0, vp.y - outerR - tsz.height * 0.65, tsz.width + 6.0, tsz.height + 2.0);
+        UIBezierPath *bp = [UIBezierPath bezierPathWithRoundedRect:bRect cornerRadius:4.0];
+        [[UIColor colorWithRed:0.09 green:0.10 blue:0.15 alpha:0.88] setFill];
+        [bp fill];
+        [numStr drawAtPoint:CGPointMake(bRect.origin.x + 3.0, bRect.origin.y + 1.0) withAttributes:badgeAttrs];
+    }
+}
+
+@end
+
+// --- Native Alight Motion Easing Graph Editor for Puppet Pin Segments ---
+
+@interface AMPuppetGraphCanvasView : UIView
+@property (nonatomic, assign) int easingType; // 0=Cubic, 1=Step, 2=Elastic, 3=Bounce
+@property (nonatomic, assign) float p1x;
+@property (nonatomic, assign) float p1y;
+@property (nonatomic, assign) float p2x;
+@property (nonatomic, assign) float p2y;
+@property (nonatomic, assign) float stepCount;
+@property (nonatomic, assign) float playheadU; // 0..1 within segment, <0 if outside
+@property (nonatomic, assign) BOOL allowOvershoot;
+@property (nonatomic, copy) void (^onCurveChanged)(BOOL ended);
+@end
+
+@implementation AMPuppetGraphCanvasView {
+    int _dragHandle; // 0 = none, 1 = P1, 2 = P2
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = AMInputSurfaceColor();
+        self.layer.cornerRadius = 8.0;
+        self.clipsToBounds = YES;
+        _p1x = 0.42f; _p1y = 0.0f;
+        _p2x = 0.58f; _p2y = 1.0f;
+        _stepCount = 4.0f;
+        _playheadU = -1.0f;
+        _allowOvershoot = YES;
+    }
+    return self;
+}
+
+- (CGRect)plotRect {
+    CGFloat padX = 18.0;
+    CGFloat padY = self.allowOvershoot ? 34.0 : 16.0;
+    return CGRectInset(self.bounds, padX, padY);
+}
+
+- (CGPoint)ptForNormX:(float)nx y:(float)ny {
+    CGRect r = [self plotRect];
+    return CGPointMake(r.origin.x + nx * r.size.width,
+                       r.origin.y + (1.0f - ny) * r.size.height);
+}
+
+- (CGPoint)normForPt:(CGPoint)pt {
+    CGRect r = [self plotRect];
+    float nx = (float)((pt.x - r.origin.x) / fmax(r.size.width, 1.0));
+    float ny = (float)(1.0 - (pt.y - r.origin.y) / fmax(r.size.height, 1.0));
+    nx = fminf(fmaxf(nx, 0.0f), 1.0f);
+    float yMin = self.allowOvershoot ? -0.55f : 0.0f;
+    float yMax = self.allowOvershoot ? 1.55f : 1.0f;
+    ny = fminf(fmaxf(ny, yMin), yMax);
+    return CGPointMake(nx, ny);
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)event;
+    if (self.easingType != 0 && self.easingType != 2) return;
+    UITouch *t = [touches anyObject];
+    if (!t) return;
+    CGPoint pt = [t locationInView:self];
+    CGPoint h1 = [self ptForNormX:self.p1x y:self.p1y];
+    CGPoint h2 = [self ptForNormX:self.p2x y:self.p2y];
+    CGFloat d1 = hypot(pt.x - h1.x, pt.y - h1.y);
+    CGFloat d2 = hypot(pt.x - h2.x, pt.y - h2.y);
+    if (d1 <= 32.0 && d1 <= d2) _dragHandle = 1;
+    else if (d2 <= 32.0) _dragHandle = 2;
+    else _dragHandle = (d1 < d2) ? 1 : 2;
+    [self updateHandleFromPoint:pt ended:NO];
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)event;
+    if (_dragHandle == 0) return;
+    UITouch *t = [touches anyObject];
+    if (!t) return;
+    [self updateHandleFromPoint:[t locationInView:self] ended:NO];
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)event;
+    if (_dragHandle == 0) return;
+    UITouch *t = [touches anyObject];
+    if (t) [self updateHandleFromPoint:[t locationInView:self] ended:YES];
+    _dragHandle = 0;
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)touches; (void)event;
+    _dragHandle = 0;
+}
+
+- (void)updateHandleFromPoint:(CGPoint)pt ended:(BOOL)ended {
+    CGPoint n = [self normForPt:pt];
+    if (_dragHandle == 1) {
+        self.p1x = (float)n.x;
+        self.p1y = (float)n.y;
+    } else if (_dragHandle == 2) {
+        self.p2x = (float)n.x;
+        self.p2y = (float)n.y;
+    }
+    [self setNeedsDisplay];
+    if (self.onCurveChanged) self.onCurveChanged(ended);
+}
+
+- (void)drawRect:(CGRect)rect {
+    (void)rect;
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) return;
+    CGRect r = [self plotRect];
+
+    // Gridlines (4x4 matching Alight Motion EasingGraphView)
+    [[UIColor colorWithWhite:1.0 alpha:0.08] setStroke];
+    CGContextSetLineWidth(ctx, 1.0);
+    for (int i = 0; i <= 4; ++i) {
+        CGFloat f = (CGFloat)i / 4.0;
+        CGFloat x = r.origin.x + f * r.size.width;
+        CGFloat y = r.origin.y + f * r.size.height;
+        CGContextMoveToPoint(ctx, x, self.bounds.origin.y);
+        CGContextAddLineToPoint(ctx, x, CGRectGetMaxY(self.bounds));
+        CGContextMoveToPoint(ctx, r.origin.x, y);
+        CGContextAddLineToPoint(ctx, CGRectGetMaxX(r), y);
+    }
+    CGContextStrokePath(ctx);
+
+    // Dashed y=0 and y=1 overshoot bounds
+    CGContextSaveGState(ctx);
+    CGFloat dash[] = {4.0, 4.0};
+    CGContextSetLineDash(ctx, 0.0, dash, 2);
+    [[UIColor colorWithWhite:1.0 alpha:0.25] setStroke];
+    CGContextMoveToPoint(ctx, r.origin.x, r.origin.y);
+    CGContextAddLineToPoint(ctx, CGRectGetMaxX(r), r.origin.y);
+    CGContextMoveToPoint(ctx, r.origin.x, CGRectGetMaxY(r));
+    CGContextAddLineToPoint(ctx, CGRectGetMaxX(r), CGRectGetMaxY(r));
+    CGContextStrokePath(ctx);
+    CGContextRestoreGState(ctx);
+
+    // Vertical playhead progress guide
+    if (self.playheadU >= 0.0f && self.playheadU <= 1.0f) {
+        CGFloat px = r.origin.x + self.playheadU * r.size.width;
+        CGContextSaveGState(ctx);
+        CGFloat pdash[] = {3.0, 3.0};
+        CGContextSetLineDash(ctx, 0.0, pdash, 2);
+        [[AMAccentGreenColor() colorWithAlphaComponent:0.85] setStroke];
+        CGContextSetLineWidth(ctx, 1.4);
+        CGContextMoveToPoint(ctx, px, 0.0);
+        CGContextAddLineToPoint(ctx, px, self.bounds.size.height);
+        CGContextStrokePath(ctx);
+        CGContextRestoreGState(ctx);
+    }
+
+    // Easing Curve
+    CGContextSaveGState(ctx);
+    [[UIColor whiteColor] setStroke];
+    CGContextSetLineWidth(ctx, 2.4);
+    CGContextSetLineCap(ctx, kCGLineCapRound);
+    CGContextSetLineJoin(ctx, kCGLineJoinRound);
+    int steps = 72;
+    for (int i = 0; i <= steps; ++i) {
+        float u = (float)i / (float)steps;
+        float e = AMPuppetEvalEasing(self.easingType, self.p1x, self.p1y, self.p2x, self.p2y, self.stepCount, u);
+        CGPoint p = [self ptForNormX:u y:e];
+        if (i == 0) CGContextMoveToPoint(ctx, p.x, p.y);
+        else CGContextAddLineToPoint(ctx, p.x, p.y);
+    }
+    CGContextStrokePath(ctx);
+    CGContextRestoreGState(ctx);
+
+    // Endpoints (mint green like Alight Motion EasingGraphView)
+    CGPoint p0 = [self ptForNormX:0.0f y:0.0f];
+    CGPoint p3 = [self ptForNormX:1.0f y:1.0f];
+    [AMAccentGreenColor() setFill];
+    CGContextFillEllipseInRect(ctx, CGRectMake(p0.x - 4.5, p0.y - 4.5, 9.0, 9.0));
+    CGContextFillEllipseInRect(ctx, CGRectMake(p3.x - 4.5, p3.y - 4.5, 9.0, 9.0));
+
+    // Draggable P1/P2 Tangent Handles (for Cubic Bezier & Elastic modes)
+    if (self.easingType == 0 || self.easingType == 2) {
+        CGPoint h1 = [self ptForNormX:self.p1x y:self.p1y];
+        CGPoint h2 = [self ptForNormX:self.p2x y:self.p2y];
+
+        [[AMAccentGreenColor() colorWithAlphaComponent:0.85] setStroke];
+        CGContextSetLineWidth(ctx, 1.6);
+        CGContextMoveToPoint(ctx, p0.x, p0.y);
+        CGContextAddLineToPoint(ctx, h1.x, h1.y);
+        CGContextMoveToPoint(ctx, p3.x, p3.y);
+        CGContextAddLineToPoint(ctx, h2.x, h2.y);
+        CGContextStrokePath(ctx);
+
+        for (int h = 1; h <= 2; ++h) {
+            CGPoint hp = (h == 1) ? h1 : h2;
+            BOOL active = (_dragHandle == h);
+            CGFloat rad = active ? 9.0 : 7.5;
+            [[UIColor whiteColor] setFill];
+            CGContextFillEllipseInRect(ctx, CGRectMake(hp.x - rad, hp.y - rad, rad * 2.0, rad * 2.0));
+            [AMAccentGreenColor() setStroke];
+            CGContextSetLineWidth(ctx, 2.0);
+            CGContextStrokeEllipseInRect(ctx, CGRectMake(hp.x - rad, hp.y - rad, rad * 2.0, rad * 2.0));
+        }
+    }
+}
+
+@end
+
+@interface AMPuppetGraphPanelVC : UIViewController
+@property (nonatomic, assign) int slot;
+@property (nonatomic, assign) NSInteger pinIndex;
+@property (nonatomic, assign) NSInteger keyframeIndex;
+@property (nonatomic, assign) void *holder;
+@property (nonatomic, copy) void (^onDidModify)(void);
+@property (nonatomic, copy) void (^onRequestSeekMs)(int64_t timeMs);
+@end
+
+@implementation AMPuppetGraphPanelVC {
+    AMPuppetGraphCanvasView *_graphView;
+    UILabel *_infoLabel;
+    UIButton *_prevBtn;
+    UIButton *_nextBtn;
+    UIStackView *_presetStack;
+    NSTimer *_syncTimer;
+}
+
+- (NSMutableDictionary *)currentPinDict {
+    NSMutableDictionary *ld = [[AMPuppetStore shared] layerDictForSlot:self.slot create:NO elementId:0];
+    NSArray *pins = ld[@"pins"];
+    if (self.pinIndex >= 0 && self.pinIndex < (NSInteger)pins.count) {
+        return pins[self.pinIndex];
+    }
+    return nil;
+}
+
+- (NSMutableDictionary *)currentKeyframeDict {
+    NSMutableDictionary *pd = [self currentPinDict];
+    NSArray *kfs = pd[@"keyframes"];
+    if (self.keyframeIndex >= 0 && self.keyframeIndex + 1 < (NSInteger)kfs.count) {
+        return kfs[self.keyframeIndex];
+    }
+    return nil;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = AMBgColor();
+
+    // Left vertical tool rail (matching EditEasingPanelVC: Back, Reverse, Overflow)
+    UIView *leftRail = [[UIView alloc] init];
+    leftRail.translatesAutoresizingMaskIntoConstraints = NO;
+    leftRail.backgroundColor = [UIColor colorWithRed:0.114 green:0.122 blue:0.176 alpha:1.0];
+    [self.view addSubview:leftRail];
+
+    UIButton *backBtn = [self makeIconButton:@"ic_back" fallback:@"chevron.left" action:@selector(onTapBack)];
+    UIButton *revBtn = [self makeIconButton:@"ic_reverse" fallback:@"arrow.left.arrow.right" action:@selector(onTapReverse)];
+    UIButton *moreBtn = [self makeIconButton:@"ic_overflow" fallback:@"ellipsis" action:@selector(onTapOverflow:)];
+
+    UIStackView *leftStack = [[UIStackView alloc] initWithArrangedSubviews:@[backBtn, revBtn, moreBtn]];
+    leftStack.translatesAutoresizingMaskIntoConstraints = NO;
+    leftStack.axis = UILayoutConstraintAxisVertical;
+    leftStack.distribution = UIStackViewDistributionEqualSpacing;
+    leftStack.alignment = UIStackViewAlignmentCenter;
+    [leftRail addSubview:leftStack];
+
+    // Right preset column (Linear, Ease In, Ease Out, Ease In-Out, Overshoot, Bounce, Step)
+    UIScrollView *rightScroll = [[UIScrollView alloc] init];
+    rightScroll.translatesAutoresizingMaskIntoConstraints = NO;
+    rightScroll.showsVerticalScrollIndicator = NO;
+    [self.view addSubview:rightScroll];
+
+    _presetStack = [[UIStackView alloc] init];
+    _presetStack.translatesAutoresizingMaskIntoConstraints = NO;
+    _presetStack.axis = UILayoutConstraintAxisVertical;
+    _presetStack.spacing = 6.0;
+    [rightScroll addSubview:_presetStack];
+
+    NSArray<NSDictionary *> *presets = @[
+        @{@"t": @"Linear",   @"type": @0, @"p1x": @0.0,  @"p1y": @0.0,  @"p2x": @1.0,  @"p2y": @1.0},
+        @{@"t": @"Ease In",  @"type": @0, @"p1x": @0.42, @"p1y": @0.0,  @"p2x": @1.0,  @"p2y": @1.0},
+        @{@"t": @"Ease Out", @"type": @0, @"p1x": @0.0,  @"p1y": @0.0,  @"p2x": @0.58, @"p2y": @1.0},
+        @{@"t": @"In-Out",   @"type": @0, @"p1x": @0.42, @"p1y": @0.0,  @"p2x": @0.58, @"p2y": @1.0},
+        @{@"t": @"Snap",     @"type": @0, @"p1x": @0.16, @"p1y": @1.0,  @"p2x": @0.30, @"p2y": @1.0},
+        @{@"t": @"Overshoot",@"type": @0, @"p1x": @0.34, @"p1y": @1.45, @"p2x": @0.64, @"p2y": @1.0},
+        @{@"t": @"Elastic",  @"type": @2, @"p1x": @0.35, @"p1y": @0.0,  @"p2x": @0.45, @"p2y": @1.0},
+        @{@"t": @"Bounce",   @"type": @3, @"p1x": @0.0,  @"p1y": @0.0,  @"p2x": @1.0,  @"p2y": @1.0},
+        @{@"t": @"Hold",     @"type": @1, @"p1x": @0.0,  @"p1y": @0.0,  @"p2x": @1.0,  @"p2y": @1.0, @"steps": @1.0},
+        @{@"t": @"Steps 4",  @"type": @1, @"p1x": @0.0,  @"p1y": @0.0,  @"p2x": @1.0,  @"p2y": @1.0, @"steps": @4.0},
+    ];
+    for (NSUInteger i = 0; i < presets.count; ++i) {
+        UIButton *pb = [UIButton buttonWithType:UIButtonTypeSystem];
+        pb.tag = (NSInteger)i;
+        pb.backgroundColor = AMSurfaceColor();
+        pb.layer.cornerRadius = 6.0;
+        [pb setTitle:presets[i][@"t"] forState:UIControlStateNormal];
+        [pb setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        pb.titleLabel.font = AMThemeFont(11.0, UIFontWeightSemibold);
+        [pb.heightAnchor constraintEqualToConstant:28.0].active = YES;
+        objc_setAssociatedObject(pb, @selector(onTapPreset:), presets[i], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [pb addTarget:self action:@selector(onTapPreset:) forControlEvents:UIControlEventTouchUpInside];
+        [_presetStack addArrangedSubview:pb];
+    }
+
+    // Center Graph Canvas + Bottom Segment Navigator (< Segment 1/2 >)
+    _graphView = [[AMPuppetGraphCanvasView alloc] init];
+    _graphView.translatesAutoresizingMaskIntoConstraints = NO;
+    __weak typeof(self) weakSelf = self;
+    _graphView.onCurveChanged = ^(BOOL ended) {
+        [weakSelf persistGraphToCurrentKeyframe:ended];
+    };
+    [self.view addSubview:_graphView];
+
+    UIView *bottomBar = [[UIView alloc] init];
+    bottomBar.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:bottomBar];
+
+    _prevBtn = [self makeIconButton:nil fallback:@"chevron.left" action:@selector(onTapPrevSeg)];
+    _nextBtn = [self makeIconButton:nil fallback:@"chevron.right" action:@selector(onTapNextSeg)];
+    _infoLabel = [[UILabel alloc] init];
+    _infoLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _infoLabel.font = AMThemeFont(11.5, UIFontWeightSemibold);
+    _infoLabel.textColor = [UIColor colorWithWhite:0.88 alpha:1.0];
+    _infoLabel.textAlignment = NSTextAlignmentCenter;
+
+    [bottomBar addSubview:_prevBtn];
+    [bottomBar addSubview:_infoLabel];
+    [bottomBar addSubview:_nextBtn];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [leftRail.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [leftRail.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [leftRail.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [leftRail.widthAnchor constraintEqualToConstant:46.0],
+
+        [leftStack.topAnchor constraintEqualToAnchor:leftRail.topAnchor constant:12.0],
+        [leftStack.bottomAnchor constraintEqualToAnchor:leftRail.bottomAnchor constant:-12.0],
+        [leftStack.centerXAnchor constraintEqualToAnchor:leftRail.centerXAnchor],
+
+        [rightScroll.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-8.0],
+        [rightScroll.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:8.0],
+        [rightScroll.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor constant:-8.0],
+        [rightScroll.widthAnchor constraintEqualToConstant:78.0],
+
+        [_presetStack.topAnchor constraintEqualToAnchor:rightScroll.topAnchor],
+        [_presetStack.bottomAnchor constraintEqualToAnchor:rightScroll.bottomAnchor],
+        [_presetStack.leadingAnchor constraintEqualToAnchor:rightScroll.leadingAnchor],
+        [_presetStack.trailingAnchor constraintEqualToAnchor:rightScroll.trailingAnchor],
+        [_presetStack.widthAnchor constraintEqualToAnchor:rightScroll.widthAnchor],
+
+        [_graphView.leadingAnchor constraintEqualToAnchor:leftRail.trailingAnchor constant:10.0],
+        [_graphView.trailingAnchor constraintEqualToAnchor:rightScroll.leadingAnchor constant:-10.0],
+        [_graphView.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:10.0],
+        [_graphView.bottomAnchor constraintEqualToAnchor:bottomBar.topAnchor constant:-6.0],
+
+        [bottomBar.leadingAnchor constraintEqualToAnchor:_graphView.leadingAnchor],
+        [bottomBar.trailingAnchor constraintEqualToAnchor:_graphView.trailingAnchor],
+        [bottomBar.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-4.0],
+        [bottomBar.heightAnchor constraintEqualToConstant:30.0],
+
+        [_prevBtn.leadingAnchor constraintEqualToAnchor:bottomBar.leadingAnchor],
+        [_prevBtn.centerYAnchor constraintEqualToAnchor:bottomBar.centerYAnchor],
+        [_nextBtn.trailingAnchor constraintEqualToAnchor:bottomBar.trailingAnchor],
+        [_nextBtn.centerYAnchor constraintEqualToAnchor:bottomBar.centerYAnchor],
+        [_infoLabel.leadingAnchor constraintEqualToAnchor:_prevBtn.trailingAnchor constant:4.0],
+        [_infoLabel.trailingAnchor constraintEqualToAnchor:_nextBtn.leadingAnchor constant:-4.0],
+        [_infoLabel.centerYAnchor constraintEqualToAnchor:bottomBar.centerYAnchor],
+    ]];
+
+    [self loadCurrentKeyframeIntoGraph];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self loadCurrentKeyframeIntoGraph];
+    [_syncTimer invalidate];
+    _syncTimer = [NSTimer scheduledTimerWithTimeInterval:0.05 target:self selector:@selector(onSyncTick) userInfo:nil repeats:YES];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [_syncTimer invalidate];
+    _syncTimer = nil;
+}
+
+- (UIButton *)makeIconButton:(NSString *)assetName fallback:(NSString *)sfName action:(SEL)sel {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImage *img = assetName ? [UIImage imageNamed:assetName] : nil;
+    if (!img && sfName) {
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:15.0 weight:UIImageSymbolWeightMedium];
+            img = [UIImage systemImageNamed:sfName withConfiguration:cfg];
+        }
+    }
+    if (img) [b setImage:[img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+    b.tintColor = [UIColor whiteColor];
+    [b.widthAnchor constraintEqualToConstant:34.0].active = YES;
+    [b.heightAnchor constraintEqualToConstant:34.0].active = YES;
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)loadCurrentKeyframeIntoGraph {
+    NSMutableDictionary *pd = [self currentPinDict];
+    NSArray *kfs = pd[@"keyframes"];
+    NSInteger segCount = MAX(0, (NSInteger)kfs.count - 1);
+    if (segCount == 0) {
+        _infoLabel.text = @"Add 2+ Keyframes";
+        _prevBtn.enabled = NO;
+        _nextBtn.enabled = NO;
+        return;
+    }
+    if (self.keyframeIndex < 0) self.keyframeIndex = 0;
+    if (self.keyframeIndex >= segCount) self.keyframeIndex = segCount - 1;
+
+    NSDictionary *kf = kfs[self.keyframeIndex];
+    _graphView.easingType = [kf[@"easingType"] intValue];
+    _graphView.p1x = kf[@"p1x"] ? [kf[@"p1x"] floatValue] : 0.42f;
+    _graphView.p1y = kf[@"p1y"] ? [kf[@"p1y"] floatValue] : 0.0f;
+    _graphView.p2x = kf[@"p2x"] ? [kf[@"p2x"] floatValue] : 0.58f;
+    _graphView.p2y = kf[@"p2y"] ? [kf[@"p2y"] floatValue] : 1.0f;
+    _graphView.stepCount = kf[@"stepCount"] ? [kf[@"stepCount"] floatValue] : 4.0f;
+
+    _prevBtn.enabled = (self.keyframeIndex > 0);
+    _nextBtn.enabled = (self.keyframeIndex + 1 < segCount);
+    _prevBtn.alpha = _prevBtn.enabled ? 1.0 : 0.35;
+    _nextBtn.alpha = _nextBtn.enabled ? 1.0 : 0.35;
+
+    [self updateInfoLabel];
+    [self onSyncTick];
+    [_graphView setNeedsDisplay];
+}
+
+- (void)updateInfoLabel {
+    NSMutableDictionary *pd = [self currentPinDict];
+    NSArray *kfs = pd[@"keyframes"];
+    NSInteger segCount = MAX(0, (NSInteger)kfs.count - 1);
+    NSString *modeName = @"Cubic";
+    if (_graphView.easingType == 1) modeName = (_graphView.stepCount <= 1.0f) ? @"Hold" : @"Step";
+    else if (_graphView.easingType == 2) modeName = @"Elastic";
+    else if (_graphView.easingType == 3) modeName = @"Bounce";
+    _infoLabel.text = [NSString stringWithFormat:@"Pin %ld • %@ (%ld/%ld)",
+                       (long)(self.pinIndex + 1), modeName, (long)(self.keyframeIndex + 1), (long)segCount];
+}
+
+- (void)onSyncTick {
+    if (!self.holder) return;
+    int64_t tMs = AMReadHolderCurrentTime(self.holder, AMMainBinarySlide());
+    gAMPuppetEditorCurrentTimeMs = tMs;
+    NSMutableDictionary *pd = [self currentPinDict];
+    NSArray *kfs = pd[@"keyframes"];
+    if (self.keyframeIndex >= 0 && self.keyframeIndex + 1 < (NSInteger)kfs.count) {
+        int64_t t0 = [kfs[self.keyframeIndex][@"t"] longLongValue];
+        int64_t t1 = [kfs[self.keyframeIndex + 1][@"t"] longLongValue];
+        if (t1 > t0 && tMs >= t0 && tMs <= t1) {
+            _graphView.playheadU = (float)((double)(tMs - t0) / (double)(t1 - t0));
+        } else {
+            _graphView.playheadU = -1.0f;
+        }
+        [_graphView setNeedsDisplay];
+    }
+}
+
+- (void)persistGraphToCurrentKeyframe:(BOOL)saveDisk {
+    NSMutableDictionary *kf = [self currentKeyframeDict];
+    if (!kf) return;
+    kf[@"easingType"] = @(_graphView.easingType);
+    kf[@"p1x"] = @(_graphView.p1x);
+    kf[@"p1y"] = @(_graphView.p1y);
+    kf[@"p2x"] = @(_graphView.p2x);
+    kf[@"p2y"] = @(_graphView.p2y);
+    kf[@"stepCount"] = @(_graphView.stepCount);
+    if (saveDisk) [[AMPuppetStore shared] save];
+    else [[AMPuppetStore shared] syncAllToRuntime];
+    [self updateInfoLabel];
+    AMForceImmediatePreviewRedraw();
+    if (self.onDidModify) self.onDidModify();
+}
+
+- (void)onTapPreset:(UIButton *)sender {
+    NSDictionary *p = objc_getAssociatedObject(sender, @selector(onTapPreset:));
+    if (!p) return;
+    _graphView.easingType = [p[@"type"] intValue];
+    _graphView.p1x = [p[@"p1x"] floatValue];
+    _graphView.p1y = [p[@"p1y"] floatValue];
+    _graphView.p2x = [p[@"p2x"] floatValue];
+    _graphView.p2y = [p[@"p2y"] floatValue];
+    if (p[@"steps"]) _graphView.stepCount = [p[@"steps"] floatValue];
+    [_graphView setNeedsDisplay];
+    [self persistGraphToCurrentKeyframe:YES];
+}
+
+- (void)onTapReverse {
+    float np1x = 1.0f - _graphView.p2x;
+    float np1y = 1.0f - _graphView.p2y;
+    float np2x = 1.0f - _graphView.p1x;
+    float np2y = 1.0f - _graphView.p1y;
+    _graphView.p1x = np1x; _graphView.p1y = np1y;
+    _graphView.p2x = np2x; _graphView.p2y = np2y;
+    [_graphView setNeedsDisplay];
+    [self persistGraphToCurrentKeyframe:YES];
+}
+
+- (void)onTapOverflow:(UIButton *)sender {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Puppet Easing Curve" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Reset to Linear" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        (void)a;
+        self->_graphView.easingType = 0;
+        self->_graphView.p1x = 0.0f; self->_graphView.p1y = 0.0f;
+        self->_graphView.p2x = 1.0f; self->_graphView.p2y = 1.0f;
+        [self->_graphView setNeedsDisplay];
+        [self persistGraphToCurrentKeyframe:YES];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Copy Curve" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        (void)a;
+        gAMPuppetCopiedEasingType = self->_graphView.easingType;
+        gAMPuppetCopiedP1X = self->_graphView.p1x; gAMPuppetCopiedP1Y = self->_graphView.p1y;
+        gAMPuppetCopiedP2X = self->_graphView.p2x; gAMPuppetCopiedP2Y = self->_graphView.p2y;
+        gAMPuppetCopiedStepCount = self->_graphView.stepCount;
+        gAMPuppetHasCopiedCurve = YES;
+    }]];
+    if (gAMPuppetHasCopiedCurve) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"Paste Curve" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            (void)a;
+            self->_graphView.easingType = gAMPuppetCopiedEasingType;
+            self->_graphView.p1x = gAMPuppetCopiedP1X; self->_graphView.p1y = gAMPuppetCopiedP1Y;
+            self->_graphView.p2x = gAMPuppetCopiedP2X; self->_graphView.p2y = gAMPuppetCopiedP2Y;
+            self->_graphView.stepCount = gAMPuppetCopiedStepCount;
+            [self->_graphView setNeedsDisplay];
+            [self persistGraphToCurrentKeyframe:YES];
+        }]];
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:(self->_graphView.allowOvershoot ? @"Clamp Overshoot (0..1)" : @"Allow Overshoot")
+                                          style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        (void)a;
+        self->_graphView.allowOvershoot = !self->_graphView.allowOvershoot;
+        [self->_graphView setNeedsDisplay];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    if (ac.popoverPresentationController) {
+        ac.popoverPresentationController.sourceView = sender;
+        ac.popoverPresentationController.sourceRect = sender.bounds;
+    }
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)onTapPrevSeg {
+    if (self.keyframeIndex > 0) {
+        self.keyframeIndex -= 1;
+        [self loadCurrentKeyframeIntoGraph];
+        [self seekToSegmentMidpoint];
+    }
+}
+
+- (void)onTapNextSeg {
+    NSMutableDictionary *pd = [self currentPinDict];
+    NSArray *kfs = pd[@"keyframes"];
+    if (self.keyframeIndex + 2 < (NSInteger)kfs.count) {
+        self.keyframeIndex += 1;
+        [self loadCurrentKeyframeIntoGraph];
+        [self seekToSegmentMidpoint];
+    }
+}
+
+- (void)seekToSegmentMidpoint {
+    NSMutableDictionary *pd = [self currentPinDict];
+    NSArray *kfs = pd[@"keyframes"];
+    if (self.keyframeIndex >= 0 && self.keyframeIndex + 1 < (NSInteger)kfs.count) {
+        int64_t t0 = [kfs[self.keyframeIndex][@"t"] longLongValue];
+        int64_t t1 = [kfs[self.keyframeIndex + 1][@"t"] longLongValue];
+        if (self.onRequestSeekMs) self.onRequestSeekMs((t0 + t1) / 2);
+    }
+}
+
+- (void)onTapBack {
+    [self.navigationController popViewControllerAnimated:YES];
+}
+
+@end
+
+// --- Native Alight Motion Bottom Puppet Tool Panel (pushed onto EditingPanelNC) ---
+
+@interface AMPuppetTouchPadView : UIView
+@property (nonatomic, copy) void (^onDeltaNorm)(CGPoint deltaNorm, BOOL ended);
+@end
+
+@implementation AMPuppetTouchPadView {
+    CGPoint _lastPt;
+}
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = AMInputSurfaceColor();
+        self.layer.cornerRadius = 8.0;
+        self.layer.borderWidth = 1.0;
+        self.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.09].CGColor;
+    }
+    return self;
+}
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)event;
+    UITouch *t = [touches anyObject];
+    if (t) _lastPt = [t locationInView:self];
+}
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)event;
+    UITouch *t = [touches anyObject];
+    if (!t) return;
+    CGPoint p = [t locationInView:self];
+    CGPoint d = CGPointMake((p.x - _lastPt.x) / 260.0, -(p.y - _lastPt.y) / 260.0);
+    _lastPt = p;
+    if (self.onDeltaNorm) self.onDeltaNorm(d, NO);
+}
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    (void)touches; (void)event;
+    if (self.onDeltaNorm) self.onDeltaNorm(CGPointZero, YES);
+}
+@end
+
+@interface AMPuppetPanelVC : UIViewController <AMPuppetCanvasOverlayDelegate>
+@property (nonatomic, assign) void *holder;
+@property (nonatomic, assign) uint64_t elementId;
+@end
+
+@implementation AMPuppetPanelVC {
+    int _slot;
+    int64_t _startTimeMs;
+    int64_t _endTimeMs;
+    NSInteger _selectedPinIndex;
+    BOOL _addPinMode;
+    BOOL _pushingGraph;
+
+    AMPuppetCanvasOverlayView *_canvasOverlay;
+    NSTimer *_syncTimer;
+    int64_t _lastPolledTimeMs;
+
+    // Left rail controls (CompactSideToolVC style)
+    UIButton *_keyframeBtn;
+    UIButton *_prevKfBtn;
+    UIButton *_nextKfBtn;
+    UIButton *_graphBtn;
+
+    // Top pin chips & tools
+    UIScrollView *_pinScroll;
+    UIStackView *_pinStack;
+    UIButton *_addModeBtn;
+    UIButton *_meshBtn;
+    UIButton *_resetPinBtn;
+    UIButton *_delPinBtn;
+
+    // Center touch pad + mode + stiffness
+    AMPuppetTouchPadView *_touchPad;
+    UILabel *_coordLabel;
+    UILabel *_hintLabel;
+    UISegmentedControl *_modeSegment;
+    UISlider *_stiffnessSlider;
+    UILabel *_stiffnessLabel;
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [_syncTimer invalidate];
+    [_canvasOverlay removeFromSuperview];
+    gAMPuppetPanelVisible = NO;
+    gAMPuppetActiveElementId = 0;
+    gAMPuppetActivePinIndex = -1;
+    if (_holder) {
+        AMSwiftRelease(_holder, AMMainBinarySlide());
+        _holder = NULL;
+    }
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = AMBgColor();
+    _addPinMode = YES;
+    _selectedPinIndex = -1;
+    _lastPolledTimeMs = -1;
+
+    AMInstallPuppetMetalHook();
+    if (_holder) {
+        AMSwiftRetain(_holder, AMMainBinarySlide());
+        _slot = AMPuppetSyncOrAttachEffect(_holder, self.elementId, YES, &_startTimeMs, &_endTimeMs);
+        _lastPolledTimeMs = AMReadHolderCurrentTime(_holder, AMMainBinarySlide());
+        gAMPuppetEditorCurrentTimeMs = _lastPolledTimeMs;
+    }
+    if (_slot < 1) {
+        _slot = [[AMPuppetStore shared] slotForElementId:self.elementId];
+        if (_slot < 1) _slot = 1;
+        [[AMPuppetStore shared] bindSlot:_slot toElementId:self.elementId startTimeMs:_startTimeMs endTimeMs:_endTimeMs];
+    }
+
+    NSMutableDictionary *ld = [self layerDict];
+    NSArray *pins = ld[@"pins"];
+    if (pins.count > 0) _selectedPinIndex = 0;
+
+    [self buildUI];
+    [self rebuildPinChips];
+    [self refreshControls];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onTransformUpdated:)
+                                                 name:kAMPuppetTransformUpdatedNotification
+                                               object:nil];
+
+    AMForceImmediatePreviewRedraw();
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    _pushingGraph = NO;
+    gAMPuppetPanelVisible = YES;
+    gAMPuppetActiveElementId = self.elementId;
+    gAMPuppetActivePinIndex = (int)_selectedPinIndex;
+    [self attachCanvasOverlayIfNeeded];
+    [self startSyncTimer];
+    [self refreshControls];
+    AMForceImmediatePreviewRedraw();
+    AMPuppetRedrawAllKeyframeViews();
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    [self attachCanvasOverlayIfNeeded];
+    AMForceImmediatePreviewRedraw();
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    if (!_pushingGraph) {
+        [_syncTimer invalidate];
+        _syncTimer = nil;
+        [_canvasOverlay removeFromSuperview];
+        _canvasOverlay = nil;
+        gAMPuppetPanelVisible = NO;
+        gAMPuppetActiveElementId = 0;
+        gAMPuppetActivePinIndex = -1;
+        AMForceImmediatePreviewRedraw();
+        AMPuppetRedrawAllKeyframeViews();
+    }
+}
+
+- (NSMutableDictionary *)layerDict {
+    return [[AMPuppetStore shared] layerDictForSlot:_slot create:YES elementId:self.elementId];
+}
+
+- (NSMutableArray *)pinsArray {
+    NSMutableDictionary *ld = [self layerDict];
+    if (![ld[@"pins"] isKindOfClass:[NSMutableArray class]]) {
+        ld[@"pins"] = ld[@"pins"] ? [ld[@"pins"] mutableCopy] : [NSMutableArray array];
+    }
+    return ld[@"pins"];
+}
+
+- (NSMutableDictionary *)selectedPinDict {
+    NSMutableArray *pins = [self pinsArray];
+    if (_selectedPinIndex >= 0 && _selectedPinIndex < (NSInteger)pins.count) {
+        return pins[_selectedPinIndex];
+    }
+    return nil;
+}
+
+- (int64_t)currentTimeMs {
+    if (_holder) {
+        int64_t t = AMReadHolderCurrentTime(_holder, AMMainBinarySlide());
+        gAMPuppetEditorCurrentTimeMs = t;
+        return t;
+    }
+    return gAMPuppetEditorCurrentTimeMs;
+}
+
+- (void)attachCanvasOverlayIfNeeded {
+    UIView *pv = AMPuppetFindProjectPreviewView(self.view);
+    if (!pv) return;
+    if (_canvasOverlay && _canvasOverlay.superview == pv) {
+        _canvasOverlay.frame = pv.bounds;
+        _canvasOverlay.slot = _slot;
+        _canvasOverlay.selectedPinIndex = _selectedPinIndex;
+        _canvasOverlay.addPinMode = _addPinMode;
+        _canvasOverlay.currentTimeMs = [self currentTimeMs];
+        [_canvasOverlay setNeedsDisplay];
+        return;
+    }
+    [_canvasOverlay removeFromSuperview];
+    _canvasOverlay = [[AMPuppetCanvasOverlayView alloc] initWithFrame:pv.bounds];
+    _canvasOverlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _canvasOverlay.delegate = self;
+    _canvasOverlay.previewView = pv;
+    _canvasOverlay.slot = _slot;
+    _canvasOverlay.selectedPinIndex = _selectedPinIndex;
+    _canvasOverlay.addPinMode = _addPinMode;
+    _canvasOverlay.currentTimeMs = [self currentTimeMs];
+    [pv addSubview:_canvasOverlay];
+    [_canvasOverlay setNeedsDisplay];
+}
+
+- (void)startSyncTimer {
+    [_syncTimer invalidate];
+    _syncTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 30.0 target:self selector:@selector(onSyncTick) userInfo:nil repeats:YES];
+}
+
+- (void)onSyncTick {
+    if (!_holder) return;
+    // Auto-close cleanly if user switched/deselected layer
+    uint64_t *selIds = NULL;
+    NSUInteger selCount = 0;
+    BOOL stillSelected = NO;
+    if (AMReadHolderSelectedIds(_holder, AMMainBinarySlide(), &selIds, &selCount)) {
+        if (selCount == 1 && selIds[0] == self.elementId) stillSelected = YES;
+    }
+    if (selIds) free(selIds);
+    if (!stillSelected) {
+        [self.navigationController popViewControllerAnimated:NO];
+        return;
+    }
+
+    int64_t t = [self currentTimeMs];
+    if (_canvasOverlay) {
+        _canvasOverlay.currentTimeMs = t;
+        if (t != _lastPolledTimeMs) {
+            [_canvasOverlay setNeedsDisplay];
+        }
+    }
+    if (t != _lastPolledTimeMs) {
+        _lastPolledTimeMs = t;
+        [self refreshControls];
+    }
+}
+
+- (void)onTransformUpdated:(NSNotification *)note {
+    int s = [note.object intValue];
+    if (s == _slot && _canvasOverlay) {
+        [_canvasOverlay setNeedsDisplay];
+    }
+}
+
+- (UIButton *)makeRailButton:(NSString *)assetName fallback:(NSString *)sfName action:(SEL)sel {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImage *img = assetName ? [UIImage imageNamed:assetName] : nil;
+    if (!img && sfName) {
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:15.0 weight:UIImageSymbolWeightMedium];
+            img = [UIImage systemImageNamed:sfName withConfiguration:cfg];
+        }
+    }
+    if (img) [b setImage:[img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+    b.tintColor = [UIColor whiteColor];
+    [b.widthAnchor constraintEqualToConstant:36.0].active = YES;
+    [b.heightAnchor constraintEqualToConstant:32.0].active = YES;
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (UIButton *)makeActionPill:(NSString *)title sf:(NSString *)sf action:(SEL)sel {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    b.backgroundColor = AMSurfaceColor();
+    b.layer.cornerRadius = 6.0;
+    b.tintColor = [UIColor whiteColor];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.titleLabel.font = AMThemeFont(11.0, UIFontWeightSemibold);
+    if (title.length > 0) [b setTitle:title forState:UIControlStateNormal];
+    if (sf.length > 0) {
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:12.0 weight:UIImageSymbolWeightMedium];
+            [b setImage:[UIImage systemImageNamed:sf withConfiguration:cfg] forState:UIControlStateNormal];
+        }
+    }
+    b.contentEdgeInsets = UIEdgeInsetsMake(4.0, 8.0, 4.0, 8.0);
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)buildUI {
+    // Left vertical keyframe sidebar (identical layout & dimensions to CompactSideToolVC)
+    UIView *rail = [[UIView alloc] init];
+    rail.translatesAutoresizingMaskIntoConstraints = NO;
+    rail.backgroundColor = AMInputSurfaceColor();
+    [self.view addSubview:rail];
+
+    UIButton *backBtn = [self makeRailButton:@"ic_back" fallback:@"chevron.left" action:@selector(onTapBack)];
+    _keyframeBtn = [self makeRailButton:@"ic_add keyframe" fallback:nil action:@selector(onTapToggleKeyframe)];
+    if (![_keyframeBtn imageForState:UIControlStateNormal]) {
+        [_keyframeBtn setImage:AMPuppetDiamondIcon(NO) forState:UIControlStateNormal];
+    }
+    _prevKfBtn = [self makeRailButton:nil fallback:@"chevron.left.to.line" action:@selector(onTapPrevKeyframe)];
+    _nextKfBtn = [self makeRailButton:nil fallback:@"chevron.right.to.line" action:@selector(onTapNextKeyframe)];
+    _graphBtn = [self makeRailButton:@"ic_easing curve" fallback:@"point.topleft.down.curvedto.point.bottomright.up" action:@selector(onTapGraph)];
+
+    UIStackView *kfNav = [[UIStackView alloc] initWithArrangedSubviews:@[_prevKfBtn, _nextKfBtn]];
+    kfNav.axis = UILayoutConstraintAxisHorizontal;
+    kfNav.distribution = UIStackViewDistributionFillEqually;
+    kfNav.spacing = 0.0;
+    [_prevKfBtn.widthAnchor constraintEqualToConstant:22.0].active = YES;
+    [_nextKfBtn.widthAnchor constraintEqualToConstant:22.0].active = YES;
+
+    UIStackView *railStack = [[UIStackView alloc] initWithArrangedSubviews:@[backBtn, _keyframeBtn, kfNav, _graphBtn]];
+    railStack.translatesAutoresizingMaskIntoConstraints = NO;
+    railStack.axis = UILayoutConstraintAxisVertical;
+    railStack.distribution = UIStackViewDistributionEqualSpacing;
+    railStack.alignment = UIStackViewAlignmentCenter;
+    [rail addSubview:railStack];
+
+    // Right main content container
+    UIView *content = [[UIView alloc] init];
+    content.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:content];
+
+    // Row 1: Pin chips bar + quick tool buttons (Add Pin, Mesh, Reset, Delete)
+    _pinScroll = [[UIScrollView alloc] init];
+    _pinScroll.translatesAutoresizingMaskIntoConstraints = NO;
+    _pinScroll.showsHorizontalScrollIndicator = NO;
+    [content addSubview:_pinScroll];
+
+    _pinStack = [[UIStackView alloc] init];
+    _pinStack.translatesAutoresizingMaskIntoConstraints = NO;
+    _pinStack.axis = UILayoutConstraintAxisHorizontal;
+    _pinStack.spacing = 6.0;
+    [_pinScroll addSubview:_pinStack];
+
+    _addModeBtn = [self makeActionPill:@"+ Pin" sf:nil action:@selector(onTapAddPinMode)];
+    _meshBtn = [self makeActionPill:@"Mesh" sf:nil action:@selector(onTapToggleMesh)];
+    _resetPinBtn = [self makeActionPill:nil sf:@"arrow.counterclockwise" action:@selector(onTapResetPin)];
+    _delPinBtn = [self makeActionPill:nil sf:@"trash" action:@selector(onTapDeletePin)];
+    _delPinBtn.tintColor = [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0];
+
+    UIStackView *toolRow = [[UIStackView alloc] initWithArrangedSubviews:@[_addModeBtn, _meshBtn, _resetPinBtn, _delPinBtn]];
+    toolRow.translatesAutoresizingMaskIntoConstraints = NO;
+    toolRow.axis = UILayoutConstraintAxisHorizontal;
+    toolRow.spacing = 5.0;
+    [content addSubview:toolRow];
+
+    // Row 2 Left: Compact Alight Motion Touch Control Pad (fine pin nudge + X/Y readout)
+    _touchPad = [[AMPuppetTouchPadView alloc] init];
+    _touchPad.translatesAutoresizingMaskIntoConstraints = NO;
+    __weak typeof(self) weakSelf = self;
+    _touchPad.onDeltaNorm = ^(CGPoint d, BOOL ended) {
+        [weakSelf nudgeSelectedPinByDelta:d ended:ended];
+    };
+    [content addSubview:_touchPad];
+
+    _coordLabel = [[UILabel alloc] init];
+    _coordLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _coordLabel.font = AMThemeFont(12.0, UIFontWeightSemibold);
+    _coordLabel.textColor = [UIColor whiteColor];
+    _coordLabel.textAlignment = NSTextAlignmentCenter;
+    [_touchPad addSubview:_coordLabel];
+
+    _hintLabel = [[UILabel alloc] init];
+    _hintLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _hintLabel.font = AMThemeFont(10.5, UIFontWeightRegular);
+    _hintLabel.textColor = [UIColor colorWithWhite:0.65 alpha:1.0];
+    _hintLabel.textAlignment = NSTextAlignmentCenter;
+    _hintLabel.numberOfLines = 2;
+    [_touchPad addSubview:_hintLabel];
+
+    // Row 2 Right: Deformation Mode (Rigid / Stretch / Smooth) + Stiffness Slider
+    UIView *rightCtrl = [[UIView alloc] init];
+    rightCtrl.translatesAutoresizingMaskIntoConstraints = NO;
+    rightCtrl.backgroundColor = AMSurfaceColor();
+    rightCtrl.layer.cornerRadius = 8.0;
+    [content addSubview:rightCtrl];
+
+    UILabel *modeTitle = [[UILabel alloc] init];
+    modeTitle.translatesAutoresizingMaskIntoConstraints = NO;
+    modeTitle.text = @"DEFORM MODE";
+    modeTitle.font = AMThemeFont(9.5, UIFontWeightBold);
+    modeTitle.textColor = [UIColor colorWithWhite:0.62 alpha:1.0];
+    [rightCtrl addSubview:modeTitle];
+
+    _modeSegment = [[UISegmentedControl alloc] initWithItems:@[@"Rigid", @"Stretch", @"Smooth"]];
+    _modeSegment.translatesAutoresizingMaskIntoConstraints = NO;
+    _modeSegment.selectedSegmentIndex = [[self layerDict][@"deformMode"] integerValue];
+    _modeSegment.backgroundColor = AMInputSurfaceColor();
+    if (@available(iOS 13.0, *)) {
+        _modeSegment.selectedSegmentTintColor = AMAccentGreenColor();
+    }
+    [_modeSegment setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.82 alpha:1.0],
+                                           NSFontAttributeName: AMThemeFont(10.5, UIFontWeightSemibold)}
+                                forState:UIControlStateNormal];
+    [_modeSegment setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithRed:0.06 green:0.08 blue:0.12 alpha:1.0],
+                                           NSFontAttributeName: AMThemeFont(10.5, UIFontWeightBold)}
+                                forState:UIControlStateSelected];
+    [_modeSegment addTarget:self action:@selector(onChangeMode:) forControlEvents:UIControlEventValueChanged];
+    [rightCtrl addSubview:_modeSegment];
+
+    _stiffnessLabel = [[UILabel alloc] init];
+    _stiffnessLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _stiffnessLabel.font = AMThemeFont(10.5, UIFontWeightSemibold);
+    _stiffnessLabel.textColor = [UIColor colorWithWhite:0.85 alpha:1.0];
+    [rightCtrl addSubview:_stiffnessLabel];
+
+    _stiffnessSlider = [[UISlider alloc] init];
+    _stiffnessSlider.translatesAutoresizingMaskIntoConstraints = NO;
+    _stiffnessSlider.minimumValue = 0.8f;
+    _stiffnessSlider.maximumValue = 3.2f;
+    float savedRig = [[self layerDict][@"rigidity"] floatValue];
+    _stiffnessSlider.value = (savedRig >= 0.8f && savedRig <= 3.2f) ? savedRig : 1.5f;
+    _stiffnessSlider.minimumTrackTintColor = AMAccentGreenColor();
+    _stiffnessSlider.maximumTrackTintColor = AMInputSurfaceColor();
+    [_stiffnessSlider addTarget:self action:@selector(onStiffnessChanged:) forControlEvents:UIControlEventValueChanged];
+    [_stiffnessSlider addTarget:self action:@selector(onStiffnessEnded:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+    [rightCtrl addSubview:_stiffnessSlider];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [rail.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [rail.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [rail.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [rail.widthAnchor constraintEqualToConstant:46.0],
+
+        [railStack.topAnchor constraintEqualToAnchor:rail.topAnchor constant:10.0],
+        [railStack.bottomAnchor constraintEqualToAnchor:rail.safeAreaLayoutGuide.bottomAnchor constant:-10.0],
+        [railStack.centerXAnchor constraintEqualToAnchor:rail.centerXAnchor],
+
+        [content.leadingAnchor constraintEqualToAnchor:rail.trailingAnchor constant:8.0],
+        [content.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-8.0],
+        [content.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:8.0],
+        [content.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-6.0],
+
+        [toolRow.topAnchor constraintEqualToAnchor:content.topAnchor],
+        [toolRow.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+        [toolRow.heightAnchor constraintEqualToConstant:28.0],
+
+        [_pinScroll.topAnchor constraintEqualToAnchor:content.topAnchor],
+        [_pinScroll.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+        [_pinScroll.trailingAnchor constraintEqualToAnchor:toolRow.leadingAnchor constant:-6.0],
+        [_pinScroll.heightAnchor constraintEqualToConstant:28.0],
+
+        [_pinStack.topAnchor constraintEqualToAnchor:_pinScroll.topAnchor],
+        [_pinStack.bottomAnchor constraintEqualToAnchor:_pinScroll.bottomAnchor],
+        [_pinStack.leadingAnchor constraintEqualToAnchor:_pinScroll.leadingAnchor],
+        [_pinStack.trailingAnchor constraintEqualToAnchor:_pinScroll.trailingAnchor],
+        [_pinStack.heightAnchor constraintEqualToAnchor:_pinScroll.heightAnchor],
+
+        [_touchPad.topAnchor constraintEqualToAnchor:toolRow.bottomAnchor constant:8.0],
+        [_touchPad.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+        [_touchPad.bottomAnchor constraintEqualToAnchor:content.bottomAnchor],
+        [_touchPad.widthAnchor constraintEqualToAnchor:content.widthAnchor multiplier:0.46],
+
+        [_coordLabel.topAnchor constraintEqualToAnchor:_touchPad.topAnchor constant:10.0],
+        [_coordLabel.leadingAnchor constraintEqualToAnchor:_touchPad.leadingAnchor constant:6.0],
+        [_coordLabel.trailingAnchor constraintEqualToAnchor:_touchPad.trailingAnchor constant:-6.0],
+
+        [_hintLabel.centerYAnchor constraintEqualToAnchor:_touchPad.centerYAnchor constant:12.0],
+        [_hintLabel.leadingAnchor constraintEqualToAnchor:_touchPad.leadingAnchor constant:8.0],
+        [_hintLabel.trailingAnchor constraintEqualToAnchor:_touchPad.trailingAnchor constant:-8.0],
+
+        [rightCtrl.topAnchor constraintEqualToAnchor:toolRow.bottomAnchor constant:8.0],
+        [rightCtrl.leadingAnchor constraintEqualToAnchor:_touchPad.trailingAnchor constant:8.0],
+        [rightCtrl.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+        [rightCtrl.bottomAnchor constraintEqualToAnchor:content.bottomAnchor],
+
+        [modeTitle.topAnchor constraintEqualToAnchor:rightCtrl.topAnchor constant:8.0],
+        [modeTitle.leadingAnchor constraintEqualToAnchor:rightCtrl.leadingAnchor constant:10.0],
+
+        [_modeSegment.topAnchor constraintEqualToAnchor:modeTitle.bottomAnchor constant:5.0],
+        [_modeSegment.leadingAnchor constraintEqualToAnchor:rightCtrl.leadingAnchor constant:8.0],
+        [_modeSegment.trailingAnchor constraintEqualToAnchor:rightCtrl.trailingAnchor constant:-8.0],
+        [_modeSegment.heightAnchor constraintEqualToConstant:26.0],
+
+        [_stiffnessLabel.topAnchor constraintEqualToAnchor:_modeSegment.bottomAnchor constant:10.0],
+        [_stiffnessLabel.leadingAnchor constraintEqualToAnchor:rightCtrl.leadingAnchor constant:10.0],
+        [_stiffnessLabel.trailingAnchor constraintEqualToAnchor:rightCtrl.trailingAnchor constant:-10.0],
+
+        [_stiffnessSlider.topAnchor constraintEqualToAnchor:_stiffnessLabel.bottomAnchor constant:2.0],
+        [_stiffnessSlider.leadingAnchor constraintEqualToAnchor:rightCtrl.leadingAnchor constant:10.0],
+        [_stiffnessSlider.trailingAnchor constraintEqualToAnchor:rightCtrl.trailingAnchor constant:-10.0],
+    ]];
+}
+
+- (void)rebuildPinChips {
+    for (UIView *v in [_pinStack.arrangedSubviews copy]) {
+        [_pinStack removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
+    NSMutableArray *pins = [self pinsArray];
+    if (pins.count == 0) {
+        UILabel *empty = [[UILabel alloc] init];
+        empty.text = @"No Pins — Tap Media";
+        empty.font = AMThemeFont(11.0, UIFontWeightMedium);
+        empty.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
+        [_pinStack addArrangedSubview:empty];
+        return;
+    }
+    for (NSUInteger i = 0; i < pins.count; ++i) {
+        BOOL sel = ((NSInteger)i == _selectedPinIndex);
+        UIButton *chip = [UIButton buttonWithType:UIButtonTypeSystem];
+        chip.tag = (NSInteger)i;
+        NSArray *kfs = pins[i][@"keyframes"];
+        NSString *title = (kfs.count > 0)
+            ? [NSString stringWithFormat:@"Pin %lu ◆%lu", (unsigned long)(i + 1), (unsigned long)kfs.count]
+            : [NSString stringWithFormat:@"Pin %lu", (unsigned long)(i + 1)];
+        [chip setTitle:title forState:UIControlStateNormal];
+        chip.titleLabel.font = AMThemeFont(11.0, sel ? UIFontWeightBold : UIFontWeightSemibold);
+        chip.backgroundColor = sel ? AMAccentGreenColor() : AMSurfaceColor();
+        [chip setTitleColor:(sel ? [UIColor colorWithRed:0.06 green:0.08 blue:0.12 alpha:1.0] : [UIColor whiteColor])
+                   forState:UIControlStateNormal];
+        chip.layer.cornerRadius = 6.0;
+        chip.contentEdgeInsets = UIEdgeInsetsMake(4.0, 9.0, 4.0, 9.0);
+        [chip addTarget:self action:@selector(onSelectPinChip:) forControlEvents:UIControlEventTouchUpInside];
+        [_pinStack addArrangedSubview:chip];
+    }
+}
+
+- (NSInteger)keyframeIndexAtTimeMs:(int64_t)tMs forPin:(NSDictionary *)pd {
+    NSArray *kfs = pd[@"keyframes"];
+    for (NSUInteger i = 0; i < kfs.count; ++i) {
+        int64_t kt = [kfs[i][@"t"] longLongValue];
+        if (llabs(kt - tMs) <= 20) return (NSInteger)i;
+    }
+    return -1;
+}
+
+- (void)evalCurrentPin:(CGPoint *)outPt {
+    NSMutableDictionary *pd = [self selectedPinDict];
+    if (!pd) { *outPt = CGPointMake(0.5, 0.5); return; }
+    AMPuppetSlotRuntime rt;
+    os_unfair_lock_lock(&gAMPuppetRuntimeLock);
+    rt = gAMPuppetSlots[_slot];
+    os_unfair_lock_unlock(&gAMPuppetRuntimeLock);
+    if (rt.active && _selectedPinIndex >= 0 && _selectedPinIndex < rt.pinCount) {
+        float cx = rt.pins[_selectedPinIndex].currX;
+        float cy = rt.pins[_selectedPinIndex].currY;
+        AMPuppetEvalPinAtMs(&rt.pins[_selectedPinIndex], [self currentTimeMs], &cx, &cy);
+        *outPt = CGPointMake(cx, cy);
+    } else {
+        *outPt = CGPointMake([pd[@"currX"] floatValue], [pd[@"currY"] floatValue]);
+    }
+}
+
+- (void)refreshControls {
+    gAMPuppetActivePinIndex = (int)_selectedPinIndex;
+    NSMutableDictionary *ld = [self layerDict];
+    NSMutableDictionary *pd = [self selectedPinDict];
+    int64_t tMs = [self currentTimeMs];
+
+    // Add Pin toggle highlight
+    _addModeBtn.backgroundColor = _addPinMode ? AMAccentGreenColor() : AMSurfaceColor();
+    [_addModeBtn setTitleColor:(_addPinMode ? [UIColor colorWithRed:0.06 green:0.08 blue:0.12 alpha:1.0] : [UIColor whiteColor])
+                      forState:UIControlStateNormal];
+
+    // Mesh toggle highlight
+    BOOL meshOn = [ld[@"showMesh"] boolValue];
+    _meshBtn.backgroundColor = meshOn ? [AMAccentGreenColor() colorWithAlphaComponent:0.25] : AMSurfaceColor();
+    _meshBtn.layer.borderWidth = meshOn ? 1.0 : 0.0;
+    _meshBtn.layer.borderColor = AMAccentGreenColor().CGColor;
+
+    // Stiffness label
+    float rig = _stiffnessSlider.value;
+    _stiffnessLabel.text = [NSString stringWithFormat:@"Stiffness: %.2f", rig];
+
+    if (!pd) {
+        _coordLabel.text = @"Puppet Tool";
+        _hintLabel.text = @"Tap media on canvas to drop pins.\nDrag any pin to deform.";
+        _keyframeBtn.enabled = NO; _keyframeBtn.alpha = 0.35;
+        _prevKfBtn.enabled = NO; _prevKfBtn.alpha = 0.35;
+        _nextKfBtn.enabled = NO; _nextKfBtn.alpha = 0.35;
+        _graphBtn.enabled = NO; _graphBtn.alpha = 0.35;
+        _resetPinBtn.enabled = NO; _resetPinBtn.alpha = 0.35;
+        _delPinBtn.enabled = NO; _delPinBtn.alpha = 0.35;
+        return;
+    }
+
+    _keyframeBtn.enabled = YES; _keyframeBtn.alpha = 1.0;
+    _resetPinBtn.enabled = YES; _resetPinBtn.alpha = 1.0;
+    _delPinBtn.enabled = YES; _delPinBtn.alpha = 1.0;
+
+    CGPoint pt;
+    [self evalCurrentPin:&pt];
+    _coordLabel.text = [NSString stringWithFormat:@"Pin %ld   X: %.0f%%  Y: %.0f%%",
+                        (long)(_selectedPinIndex + 1), pt.x * 100.0, pt.y * 100.0];
+
+    NSArray *kfs = pd[@"keyframes"];
+    NSInteger onKf = [self keyframeIndexAtTimeMs:tMs forPin:pd];
+    if (onKf >= 0) {
+        UIImage *remImg = [UIImage imageNamed:@"ic_remove keyframe"] ?: AMPuppetDiamondIcon(YES);
+        [_keyframeBtn setImage:[remImg imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+        _keyframeBtn.tintColor = AMAccentGreenColor();
+    } else {
+        UIImage *addImg = [UIImage imageNamed:@"ic_add keyframe"] ?: AMPuppetDiamondIcon(NO);
+        [_keyframeBtn setImage:[addImg imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+        _keyframeBtn.tintColor = [UIColor whiteColor];
+    }
+
+    BOOL hasPrev = NO, hasNext = NO;
+    for (NSDictionary *kf in kfs) {
+        int64_t kt = [kf[@"t"] longLongValue];
+        if (kt < tMs - 20) hasPrev = YES;
+        if (kt > tMs + 20) hasNext = YES;
+    }
+    _prevKfBtn.enabled = hasPrev; _prevKfBtn.alpha = hasPrev ? 1.0 : 0.35;
+    _nextKfBtn.enabled = hasNext; _nextKfBtn.alpha = hasNext ? 1.0 : 0.35;
+
+    BOOL canGraph = (kfs.count >= 2);
+    _graphBtn.enabled = canGraph;
+    _graphBtn.alpha = canGraph ? 1.0 : 0.35;
+    _graphBtn.tintColor = canGraph ? AMAccentGreenColor() : [UIColor whiteColor];
+
+    _hintLabel.text = (kfs.count > 0)
+        ? [NSString stringWithFormat:@"Swipe pad to nudge • %lu keyframe%@", (unsigned long)kfs.count, kfs.count == 1 ? @"" : @"s"]
+        : @"Drag pin on canvas or swipe pad.\nTap ◆ to animate.";
+
+    if (_canvasOverlay) {
+        _canvasOverlay.selectedPinIndex = _selectedPinIndex;
+        _canvasOverlay.addPinMode = _addPinMode;
+        _canvasOverlay.currentTimeMs = tMs;
+        [_canvasOverlay setNeedsDisplay];
+    }
+}
+
+- (void)upsertKeyframeOnPin:(NSMutableDictionary *)pd timeMs:(int64_t)tMs x:(float)x y:(float)y {
+    if (![pd[@"keyframes"] isKindOfClass:[NSMutableArray class]]) {
+        pd[@"keyframes"] = pd[@"keyframes"] ? [pd[@"keyframes"] mutableCopy] : [NSMutableArray array];
+    }
+    NSMutableArray *kfs = pd[@"keyframes"];
+    NSInteger existing = [self keyframeIndexAtTimeMs:tMs forPin:pd];
+    if (existing >= 0) {
+        NSMutableDictionary *kf = kfs[existing];
+        kf[@"x"] = @(x);
+        kf[@"y"] = @(y);
+    } else if (kfs.count < kAMPuppetMaxKeyframesPerPin) {
+        NSMutableDictionary *kf = [NSMutableDictionary dictionaryWithDictionary:@{
+            @"t": @(tMs),
+            @"x": @(x),
+            @"y": @(y),
+            @"easingType": @(0),
+            @"p1x": @(0.42),
+            @"p1y": @(0.0),
+            @"p2x": @(0.58),
+            @"p2y": @(1.0),
+            @"stepCount": @(4.0)
+        }];
+        [kfs addObject:kf];
+        [kfs sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            return [a[@"t"] compare:b[@"t"]];
+        }];
+    }
+}
+
+- (void)setPinIndex:(NSInteger)idx position:(CGPoint)ln ended:(BOOL)ended {
+    NSMutableArray *pins = [self pinsArray];
+    if (idx < 0 || idx >= (NSInteger)pins.count) return;
+    NSMutableDictionary *pd = pins[idx];
+    float x = (float)ln.x, y = (float)ln.y;
+    pd[@"currX"] = @(x);
+    pd[@"currY"] = @(y);
+    NSArray *kfs = pd[@"keyframes"];
+    // Exact AE + Alight Motion auto-keyframe: if pin is already animated (>=1 keyframe), moving at new time records a keyframe!
+    if (kfs.count > 0) {
+        [self upsertKeyframeOnPin:pd timeMs:[self currentTimeMs] x:x y:y];
+    }
+    if (ended) {
+        [[AMPuppetStore shared] save];
+        [self rebuildPinChips];
+        AMPuppetRedrawAllKeyframeViews();
+    } else {
+        [[AMPuppetStore shared] syncAllToRuntime];
+    }
+    [self refreshControls];
+    AMForceImmediatePreviewRedraw();
+}
+
+- (void)nudgeSelectedPinByDelta:(CGPoint)d ended:(BOOL)ended {
+    if (_selectedPinIndex < 0) return;
+    CGPoint cur;
+    [self evalCurrentPin:&cur];
+    CGPoint next = CGPointMake(fmin(fmax(cur.x + d.x, -0.5), 1.5),
+                               fmin(fmax(cur.y + d.y, -0.5), 1.5));
+    [self setPinIndex:_selectedPinIndex position:next ended:ended];
+}
+
+// --- AMPuppetCanvasOverlayDelegate ---
+
+- (void)puppetCanvasDidTapAddPinAtLayerNorm:(CGPoint)layerNorm {
+    NSMutableArray *pins = [self pinsArray];
+    if (pins.count >= kAMPuppetMaxPins) return;
+    NSMutableDictionary *ld = [self layerDict];
+    int nextId = [ld[@"nextPinId"] intValue] ?: ((int)pins.count + 1);
+    ld[@"nextPinId"] = @(nextId + 1);
+
+    // Compute rest coordinate by inverse-evaluating? If no deformation yet, rest == layerNorm;
+    // when adding a pin to already-deformed media, place rest at layerNorm so it pins cleanly where tapped.
+    NSMutableDictionary *pin = [NSMutableDictionary dictionaryWithDictionary:@{
+        @"id": @(nextId),
+        @"restX": @(layerNorm.x),
+        @"restY": @(layerNorm.y),
+        @"currX": @(layerNorm.x),
+        @"currY": @(layerNorm.y),
+        @"keyframes": [NSMutableArray array]
+    }];
+    [pins addObject:pin];
+    _selectedPinIndex = (NSInteger)pins.count - 1;
+    if (_canvasOverlay) _canvasOverlay.selectedPinIndex = _selectedPinIndex;
+
+    [[AMPuppetStore shared] save];
+    [self rebuildPinChips];
+    [self refreshControls];
+    AMForceImmediatePreviewRedraw();
+    UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [h impactOccurred];
+}
+
+- (void)puppetCanvasDidSelectPinIndex:(NSInteger)pinIndex {
+    _selectedPinIndex = pinIndex;
+    [self rebuildPinChips];
+    [self refreshControls];
+    AMPuppetRedrawAllKeyframeViews();
+}
+
+- (void)puppetCanvasDidDragPinIndex:(NSInteger)pinIndex toLayerNorm:(CGPoint)layerNorm ended:(BOOL)ended {
+    _selectedPinIndex = pinIndex;
+    [self setPinIndex:pinIndex position:layerNorm ended:ended];
+}
+
+// --- Actions ---
+
+- (void)onSelectPinChip:(UIButton *)sender {
+    _selectedPinIndex = sender.tag;
+    [self rebuildPinChips];
+    [self refreshControls];
+    AMPuppetRedrawAllKeyframeViews();
+}
+
+- (void)onTapAddPinMode {
+    _addPinMode = !_addPinMode;
+    [self refreshControls];
+}
+
+- (void)onTapToggleMesh {
+    NSMutableDictionary *ld = [self layerDict];
+    ld[@"showMesh"] = @(![ld[@"showMesh"] boolValue]);
+    [[AMPuppetStore shared] save];
+    [self refreshControls];
+    AMForceImmediatePreviewRedraw();
+}
+
+- (void)onTapResetPin {
+    NSMutableDictionary *pd = [self selectedPinDict];
+    if (!pd) return;
+    CGPoint rest = CGPointMake([pd[@"restX"] floatValue], [pd[@"restY"] floatValue]);
+    [self setPinIndex:_selectedPinIndex position:rest ended:YES];
+}
+
+- (void)onTapDeletePin {
+    NSMutableArray *pins = [self pinsArray];
+    if (_selectedPinIndex < 0 || _selectedPinIndex >= (NSInteger)pins.count) return;
+    [pins removeObjectAtIndex:(NSUInteger)_selectedPinIndex];
+    if (_selectedPinIndex >= (NSInteger)pins.count) _selectedPinIndex = (NSInteger)pins.count - 1;
+    [[AMPuppetStore shared] save];
+    [self rebuildPinChips];
+    [self refreshControls];
+    AMForceImmediatePreviewRedraw();
+    AMPuppetRedrawAllKeyframeViews();
+}
+
+- (void)onTapToggleKeyframe {
+    NSMutableDictionary *pd = [self selectedPinDict];
+    if (!pd) return;
+    int64_t tMs = [self currentTimeMs];
+    if (![pd[@"keyframes"] isKindOfClass:[NSMutableArray class]]) {
+        pd[@"keyframes"] = pd[@"keyframes"] ? [pd[@"keyframes"] mutableCopy] : [NSMutableArray array];
+    }
+    NSMutableArray *kfs = pd[@"keyframes"];
+    NSInteger existing = [self keyframeIndexAtTimeMs:tMs forPin:pd];
+    if (existing >= 0) {
+        [kfs removeObjectAtIndex:(NSUInteger)existing];
+    } else {
+        CGPoint cur;
+        [self evalCurrentPin:&cur];
+        [self upsertKeyframeOnPin:pd timeMs:tMs x:(float)cur.x y:(float)cur.y];
+    }
+    [[AMPuppetStore shared] save];
+    [self rebuildPinChips];
+    [self refreshControls];
+    AMForceImmediatePreviewRedraw();
+    AMPuppetRedrawAllKeyframeViews();
+    UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [h impactOccurred];
+}
+
+- (void)onTapPrevKeyframe {
+    NSMutableDictionary *pd = [self selectedPinDict];
+    if (!pd) return;
+    int64_t tMs = [self currentTimeMs];
+    int64_t best = -1;
+    for (NSDictionary *kf in pd[@"keyframes"]) {
+        int64_t kt = [kf[@"t"] longLongValue];
+        if (kt < tMs - 20 && kt > best) best = kt;
+    }
+    if (best >= 0) {
+        AMPuppetSeekHolderToTimeMs(_holder, best);
+        _lastPolledTimeMs = best;
+        [self refreshControls];
+    }
+}
+
+- (void)onTapNextKeyframe {
+    NSMutableDictionary *pd = [self selectedPinDict];
+    if (!pd) return;
+    int64_t tMs = [self currentTimeMs];
+    int64_t best = INT64_MAX;
+    for (NSDictionary *kf in pd[@"keyframes"]) {
+        int64_t kt = [kf[@"t"] longLongValue];
+        if (kt > tMs + 20 && kt < best) best = kt;
+    }
+    if (best < INT64_MAX) {
+        AMPuppetSeekHolderToTimeMs(_holder, best);
+        _lastPolledTimeMs = best;
+        [self refreshControls];
+    }
+}
+
+- (void)onTapGraph {
+    NSMutableDictionary *pd = [self selectedPinDict];
+    NSArray *kfs = pd[@"keyframes"];
+    if (kfs.count < 2) return;
+
+    int64_t tMs = [self currentTimeMs];
+    NSInteger segIdx = 0;
+    for (NSInteger i = 0; i + 1 < (NSInteger)kfs.count; ++i) {
+        int64_t t0 = [kfs[i][@"t"] longLongValue];
+        int64_t t1 = [kfs[i + 1][@"t"] longLongValue];
+        if (tMs >= t0 && tMs <= t1) { segIdx = i; break; }
+        if (tMs > t1) segIdx = i;
+    }
+
+    AMPuppetGraphPanelVC *gvc = [[AMPuppetGraphPanelVC alloc] init];
+    gvc.slot = _slot;
+    gvc.pinIndex = _selectedPinIndex;
+    gvc.keyframeIndex = segIdx;
+    gvc.holder = _holder;
+    __weak typeof(self) weakSelf = self;
+    gvc.onDidModify = ^{
+        [weakSelf refreshControls];
+    };
+    gvc.onRequestSeekMs = ^(int64_t targetMs) {
+        AMPuppetSeekHolderToTimeMs(weakSelf.holder, targetMs);
+        [weakSelf refreshControls];
+    };
+    _pushingGraph = YES;
+    [self.navigationController pushViewController:gvc animated:YES];
+}
+
+- (void)onChangeMode:(UISegmentedControl *)seg {
+    NSMutableDictionary *ld = [self layerDict];
+    ld[@"deformMode"] = @(seg.selectedSegmentIndex);
+    [[AMPuppetStore shared] save];
+    AMForceImmediatePreviewRedraw();
+}
+
+- (void)onStiffnessChanged:(UISlider *)slider {
+    NSMutableDictionary *ld = [self layerDict];
+    ld[@"rigidity"] = @(slider.value);
+    [[AMPuppetStore shared] syncAllToRuntime];
+    [self refreshControls];
+    AMForceImmediatePreviewRedraw();
+}
+
+- (void)onStiffnessEnded:(UISlider *)slider {
+    (void)slider;
+    [[AMPuppetStore shared] save];
+}
+
+- (void)onTapBack {
+    [self.navigationController popViewControllerAnimated:YES];
+}
+
+@end
+
+// --- Native EditingPanelVC Hooks (Adds exact Alight Motion 'Puppet' Card!) ---
+
+static IMP gOrigEditingPanelNumItems = NULL;
+static IMP gOrigEditingPanelCellForItem = NULL;
+static IMP gOrigEditingPanelSizeForItem = NULL;
+static IMP gOrigEditingPanelDidSelectItem = NULL;
+
+static NSInteger AMEditingPanelOrigCount(id self, UICollectionView *cv, NSInteger section) {
+    if (!gOrigEditingPanelNumItems) return 0;
+    return ((NSInteger (*)(id, SEL, UICollectionView *, NSInteger))gOrigEditingPanelNumItems)(
+        self, @selector(collectionView:numberOfItemsInSection:), cv, section);
+}
+
+static NSInteger AMHook_editingPanelNumItems(id self, SEL _cmd, UICollectionView *cv, NSInteger section) {
+    NSInteger orig = gOrigEditingPanelNumItems
+        ? ((NSInteger (*)(id, SEL, UICollectionView *, NSInteger))gOrigEditingPanelNumItems)(self, _cmd, cv, section)
+        : 0;
+    if (orig >= 4) return orig + 1;
+    return orig;
+}
+
+static CGSize AMHook_editingPanelSizeForItem(id self, SEL _cmd, UICollectionView *cv, UICollectionViewLayout *layout, NSIndexPath *indexPath) {
+    NSInteger orig = AMEditingPanelOrigCount(self, cv, indexPath.section);
+    if (orig < 4) {
+        if (gOrigEditingPanelSizeForItem) {
+            return ((CGSize (*)(id, SEL, UICollectionView *, UICollectionViewLayout *, NSIndexPath *))gOrigEditingPanelSizeForItem)(
+                self, _cmd, cv, layout, indexPath);
+        }
+        return CGSizeMake(80.0, 64.0);
+    }
+    NSInteger total = orig + 1;
+    NSInteger topCols = total / 2;
+    NSInteger botCols = total - topCols;
+    NSInteger cols = (indexPath.row < topCols) ? topCols : botCols;
+    NSInteger rows = 2;
+
+    CGFloat interSpacing = 8.0;
+    CGFloat lineSpacing = 8.0;
+    UIEdgeInsets inset = UIEdgeInsetsZero;
+    if ([layout isKindOfClass:[UICollectionViewFlowLayout class]]) {
+        UICollectionViewFlowLayout *fl = (UICollectionViewFlowLayout *)layout;
+        interSpacing = fl.minimumInteritemSpacing;
+        lineSpacing = fl.minimumLineSpacing;
+        inset = fl.sectionInset;
+    }
+    CGFloat availW = cv.bounds.size.width - inset.left - inset.right - interSpacing * (CGFloat)(cols - 1) - 1.0;
+    CGFloat availH = cv.bounds.size.height - inset.top - inset.bottom - lineSpacing * (CGFloat)(rows - 1) - 1.0;
+    CGFloat w = floor(fmax(availW / (CGFloat)cols, 44.0));
+    CGFloat h = floor(fmax(availH / (CGFloat)rows, 44.0));
+    return CGSizeMake(w, h);
+}
+
+static UICollectionViewCell *AMHook_editingPanelCellForItem(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
+    NSInteger orig = AMEditingPanelOrigCount(self, cv, indexPath.section);
+    if (orig >= 4 && indexPath.row == orig) {
+        UICollectionViewCell *cell = [cv dequeueReusableCellWithReuseIdentifier:@"EditingPanelCell" forIndexPath:indexPath];
+        cell.layer.cornerRadius = 5.3;
+        cell.layer.masksToBounds = YES;
+        SEL labelSel = NSSelectorFromString(@"label");
+        if ([cell respondsToSelector:labelSel]) {
+            UILabel *lbl = ((UILabel *(*)(id, SEL))objc_msgSend)(cell, labelSel);
+            if ([lbl isKindOfClass:[UILabel class]]) {
+                lbl.text = @"Puppet";
+            }
+        }
+        SEL imgSel = NSSelectorFromString(@"imageView");
+        if ([cell respondsToSelector:imgSel]) {
+            UIImageView *iv = ((UIImageView *(*)(id, SEL))objc_msgSend)(cell, imgSel);
+            if ([iv isKindOfClass:[UIImageView class]]) {
+                iv.image = AMPuppetTabIcon();
+                iv.tintColor = [UIColor whiteColor];
+                iv.contentMode = UIViewContentModeScaleAspectFit;
+            }
+        }
+        SEL newTagSel = NSSelectorFromString(@"newTag");
+        if ([cell respondsToSelector:newTagSel]) {
+            UIView *nt = ((UIView *(*)(id, SEL))objc_msgSend)(cell, newTagSel);
+            if ([nt isKindOfClass:[UIView class]]) {
+                nt.alpha = 0.0;
+            }
+        }
+        return cell;
+    }
+    if (gOrigEditingPanelCellForItem) {
+        return ((UICollectionViewCell *(*)(id, SEL, UICollectionView *, NSIndexPath *))gOrigEditingPanelCellForItem)(self, _cmd, cv, indexPath);
+    }
+    return [[UICollectionViewCell alloc] init];
+}
+
+static void AMHook_editingPanelDidSelectItem(id self, SEL _cmd, UICollectionView *cv, NSIndexPath *indexPath) {
+    NSInteger orig = AMEditingPanelOrigCount(self, cv, indexPath.section);
+    if (orig >= 4 && indexPath.row == orig) {
+        [cv deselectItemAtIndexPath:indexPath animated:YES];
+        intptr_t slide = AMMainBinarySlide();
+        Ivar holderIvar = class_getInstanceVariable([self class], "holder");
+        void *holder = holderIvar ? *(void **)((uint8_t *)(__bridge void *)self + ivar_getOffset(holderIvar)) : NULL;
+        if (!holder) return;
+
+        uint64_t *selIds = NULL;
+        NSUInteger selCount = 0;
+        uint64_t targetId = 0;
+        if (AMReadHolderSelectedIds(holder, slide, &selIds, &selCount) && selCount > 0) {
+            targetId = selIds[0];
+        }
+        if (selIds) free(selIds);
+        if (targetId == 0) return;
+
+        AMPuppetPanelVC *pvc = [[AMPuppetPanelVC alloc] init];
+        pvc.holder = holder;
+        pvc.elementId = targetId;
+        UIViewController *vc = (UIViewController *)self;
+        if (vc.navigationController) {
+            [vc.navigationController pushViewController:pvc animated:YES];
+        }
+        return;
+    }
+    if (gOrigEditingPanelDidSelectItem) {
+        ((void (*)(id, SEL, UICollectionView *, NSIndexPath *))gOrigEditingPanelDidSelectItem)(self, _cmd, cv, indexPath);
+    }
+}
+
+// --- Native Timeline KeyframeView Diamonds Hook ---
+
+static IMP gOrigKeyframeViewDrawRect = NULL;
+
+static void AMHook_keyframeViewDrawRect(id self, SEL _cmd, CGRect rect) {
+    if (gOrigKeyframeViewDrawRect) {
+        ((void (*)(id, SEL, CGRect))gOrigKeyframeViewDrawRect)(self, _cmd, rect);
+    }
+    Class cls = [self class];
+    Ivar ivId = class_getInstanceVariable(cls, "elementId");
+    Ivar ivScale = class_getInstanceVariable(cls, "timeScaleFactor");
+    Ivar ivOff = class_getInstanceVariable(cls, "timeOffset");
+    if (!ivId || !ivScale || !ivOff) return;
+
+    uint8_t *base = (uint8_t *)(__bridge void *)self;
+    uint64_t eid = *(uint64_t *)(base + ivar_getOffset(ivId));
+    float scaleF = *(float *)(base + ivar_getOffset(ivScale));
+    float offsetF = *(float *)(base + ivar_getOffset(ivOff));
+    if (eid == 0) return;
+
+    // Collect puppet keyframe times for this elementId under lock
+    int64_t startMs = 0, endMs = 0;
+    int selPin = (gAMPuppetPanelVisible && eid == gAMPuppetActiveElementId) ? gAMPuppetActivePinIndex : -1;
+    int64_t kfTimes[256];
+    uint8_t kfIsSel[256];
+    int kfTotal = 0;
+
+    os_unfair_lock_lock(&gAMPuppetRuntimeLock);
+    for (int s = 1; s <= kAMPuppetMaxSlots; ++s) {
+        const AMPuppetSlotRuntime *rt = &gAMPuppetSlots[s];
+        if (!rt->active || rt->elementId != eid) continue;
+        startMs = rt->startTimeMs;
+        endMs = rt->endTimeMs;
+        for (int p = 0; p < rt->pinCount; ++p) {
+            for (int k = 0; k < rt->pins[p].keyframeCount && kfTotal < 256; ++k) {
+                kfTimes[kfTotal] = rt->pins[p].keyframes[k].timeMs;
+                kfIsSel[kfTotal] = (p == selPin) ? 1 : 0;
+                kfTotal++;
+            }
+        }
+        break;
+    }
+    os_unfair_lock_unlock(&gAMPuppetRuntimeLock);
+
+    if (kfTotal <= 0 || endMs <= startMs) return;
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) return;
+
+    UIView *v = (UIView *)self;
+    CGFloat w = v.bounds.size.width;
+    CGFloat cy = v.bounds.size.height * 0.5;
+    double dur = (double)(endMs - startMs);
+
+    CGContextSaveGState(ctx);
+    for (int i = 0; i < kfTotal; ++i) {
+        float tNorm = (float)((double)(kfTimes[i] - startMs) / dur);
+        CGFloat x = (CGFloat)(tNorm * scaleF + offsetF) * w;
+        if (x < -8.0 || x > w + 8.0) continue;
+
+        CGFloat r = kfIsSel[i] ? 5.2 : 4.2;
+        UIBezierPath *d = [UIBezierPath bezierPath];
+        [d moveToPoint:CGPointMake(x, cy - r)];
+        [d addLineToPoint:CGPointMake(x + r, cy)];
+        [d addLineToPoint:CGPointMake(x, cy + r)];
+        [d addLineToPoint:CGPointMake(x - r, cy)];
+        [d closePath];
+
+        if (kfIsSel[i]) {
+            [AMAccentGreenColor() setFill];
+            [d fill];
+            [[UIColor whiteColor] setStroke];
+            d.lineWidth = 1.2;
+            [d stroke];
+        } else {
+            [[UIColor colorWithRed:0.14 green:0.16 blue:0.24 alpha:0.95] setFill];
+            [d fill];
+            [[UIColor whiteColor] setStroke];
+            d.lineWidth = 1.3;
+            [d stroke];
+        }
+    }
+    CGContextRestoreGState(ctx);
+}
+
 static void AMSwizzleMethod(NSString *className, NSString *selName, IMP replacement, IMP *outOrig) {
     Class cls = NSClassFromString(className);
     if (!cls) return;
@@ -8112,6 +11258,30 @@ static void AlightMotionModsInit(void) {
                     @"tableView:didSelectRowAtIndexPath:",
                     (IMP)AMHook_layerParentingDidSelectRow,
                     &gOrigLayerParentingDidSelectRow);
+
+    // Module 7: Puppet Tool (EditingPanelVC native card, Timeline KeyframeView diamonds, Metal uniform hook)
+    [AMPuppetStore shared];
+    AMInstallPuppetMetalHook();
+    AMSwizzleMethod(@"_TtC12AlightMotion14EditingPanelVC",
+                    @"collectionView:numberOfItemsInSection:",
+                    (IMP)AMHook_editingPanelNumItems,
+                    &gOrigEditingPanelNumItems);
+    AMSwizzleMethod(@"_TtC12AlightMotion14EditingPanelVC",
+                    @"collectionView:layout:sizeForItemAtIndexPath:",
+                    (IMP)AMHook_editingPanelSizeForItem,
+                    &gOrigEditingPanelSizeForItem);
+    AMSwizzleMethod(@"_TtC12AlightMotion14EditingPanelVC",
+                    @"collectionView:cellForItemAtIndexPath:",
+                    (IMP)AMHook_editingPanelCellForItem,
+                    &gOrigEditingPanelCellForItem);
+    AMSwizzleMethod(@"_TtC12AlightMotion14EditingPanelVC",
+                    @"collectionView:didSelectItemAtIndexPath:",
+                    (IMP)AMHook_editingPanelDidSelectItem,
+                    &gOrigEditingPanelDidSelectItem);
+    AMSwizzleMethod(@"_TtC12AlightMotion12KeyframeView",
+                    @"drawRect:",
+                    (IMP)AMHook_keyframeViewDrawRect,
+                    &gOrigKeyframeViewDrawRect);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         AMInstallCustomEffectCategoryIfNeeded();

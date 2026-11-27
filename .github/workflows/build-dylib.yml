@@ -30,6 +30,7 @@ jobs:
             -framework UniformTypeIdentifiers \
             -framework AVFoundation \
             -framework CoreMedia \
+            -framework Metal \
             -o AlightMotionMods.dylib \
             AlightMotionMods.mm
           codesign -f -s - AlightMotionMods.dylib
