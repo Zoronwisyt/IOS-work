@@ -8459,11 +8459,11 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc) {
         btn.accessibilityLabel = @"Search Projects";
         btn.backgroundColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08]; // subtle gray matching header
         btn.tintColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0]; // #1D1E2C
-        btn.layer.cornerRadius = 17.0;
+        btn.layer.cornerRadius = 16.0;
         btn.layer.borderWidth = 0.5;
         btn.layer.borderColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08].CGColor;
         if (@available(iOS 13.0, *)) {
-            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:15.0 weight:UIImageSymbolWeightSemibold];
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.5 weight:UIImageSymbolWeightSemibold];
             [btn setImage:[UIImage systemImageNamed:@"magnifyingglass" withConfiguration:cfg] forState:UIControlStateNormal];
         } else {
             [btn setTitle:@"Q" forState:UIControlStateNormal];
@@ -8477,11 +8477,11 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc) {
         ibtn.accessibilityLabel = @"Import Projects";
         ibtn.backgroundColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08];
         ibtn.tintColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
-        ibtn.layer.cornerRadius = 17.0;
+        ibtn.layer.cornerRadius = 16.0;
         ibtn.layer.borderWidth = 0.5;
         ibtn.layer.borderColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08].CGColor;
         if (@available(iOS 13.0, *)) {
-            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.5 weight:UIImageSymbolWeightSemibold];
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.0 weight:UIImageSymbolWeightSemibold];
             [ibtn setImage:[UIImage systemImageNamed:@"square.and.arrow.down" withConfiguration:cfg] forState:UIControlStateNormal];
         } else {
             [ibtn setTitle:@"+" forState:UIControlStateNormal];
@@ -8495,11 +8495,11 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc) {
         bbtn.accessibilityLabel = @"Save and Backup Vault";
         bbtn.backgroundColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08];
         bbtn.tintColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:1.0];
-        bbtn.layer.cornerRadius = 17.0;
+        bbtn.layer.cornerRadius = 16.0;
         bbtn.layer.borderWidth = 0.5;
         bbtn.layer.borderColor = [UIColor colorWithRed:0.114 green:0.118 blue:0.173 alpha:0.08].CGColor;
         if (@available(iOS 13.0, *)) {
-            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.0 weight:UIImageSymbolWeightSemibold];
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:13.5 weight:UIImageSymbolWeightSemibold];
             NSString *sym = [[AMBackupManager shared] hasLinkedExternalFolder] ? @"externaldrive.badge.checkmark" : @"externaldrive";
             [bbtn setImage:[UIImage systemImageNamed:sym withConfiguration:cfg] forState:UIControlStateNormal];
         } else {
@@ -8620,17 +8620,20 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc) {
 
     self.assignFolderButton.hidden = YES;
 
-    CGFloat size = 34.0;
-    CGFloat sx = win.bounds.size.width - 16.0 - 36.0 - 10.0 - size;
-    CGFloat sy = win.safeAreaInsets.top + 8.0;
+    CGFloat size = 32.0;
+    CGFloat sy = win.safeAreaInsets.top + 9.0;
+
+    // Right cluster: Search + Import tucked cleanly beside the native profile avatar (~36pt from right edge)
+    CGFloat sx = win.bounds.size.width - 44.0 - size;
     self.searchButton.frame = [hostView convertRect:CGRectMake(sx, sy, size, size) fromView:win];
     self.searchButton.hidden = NO;
 
-    CGFloat ix = sx - 8.0 - size;
+    CGFloat ix = sx - 6.0 - size;
     self.importProjectsButton.frame = [hostView convertRect:CGRectMake(ix, sy, size, size) fromView:win];
     self.importProjectsButton.hidden = NO;
 
-    CGFloat bx = ix - 8.0 - size;
+    // Left slot: Backup Vault button placed cleanly beside the hamburger menu (clear of centered "Alight Motion" logo)
+    CGFloat bx = 50.0;
     self.backupButton.frame = [hostView convertRect:CGRectMake(bx, sy, size, size) fromView:win];
     self.backupButton.hidden = NO;
 
