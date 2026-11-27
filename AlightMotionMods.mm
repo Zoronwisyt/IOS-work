@@ -19584,7 +19584,7 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
     }
 
     BOOL audioOnly = (self.modeControl.selectedSegmentIndex == 1);
-    __weak typeof(self) weakSelf = self;
+    __weak AMLinkMediaImportVC *weakSelf = self;
 
     void (^statusCb)(NSString *, float) = ^(NSString *st, float p) {
         [weakSelf setBusyState:YES status:st progress:p isError:NO];
@@ -19592,7 +19592,7 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
 
     void (^doneCb)(NSURL * _Nullable, NSString * _Nullable, NSError * _Nullable) = ^(NSURL * _Nullable localURL, NSString * _Nullable title, NSError * _Nullable err) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            __strong typeof(weakSelf) strongSelf = weakSelf;
+            AMLinkMediaImportVC *strongSelf = weakSelf;
             if (!strongSelf) return;
             if (err || !localURL) {
                 [strongSelf setBusyState:NO status:(err.localizedDescription ?: @"Download failed.") progress:0.0f isError:YES];
