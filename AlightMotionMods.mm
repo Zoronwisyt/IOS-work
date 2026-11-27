@@ -11811,23 +11811,8 @@ static void AMPresentKeyframeActionMenu(UIViewController *vc,
     CGContextStrokePath(ctx);
     CGContextRestoreGState(ctx);
 
-    // Live playhead dot on the curve
-    if (self.playheadU >= 0.0f && self.playheadU <= 1.0f) {
-        float pe = AMPuppetEvalEasing(self.easingType, self.p1x, self.p1y, self.p2x, self.p2y, self.stepCount, self.playheadU);
-        CGPoint dotPt = [self ptForNormX:self.playheadU y:pe];
-        [[UIColor whiteColor] setFill];
-        CGContextFillEllipseInRect(ctx, CGRectMake(dotPt.x - 4.0, dotPt.y - 4.0, 8.0, 8.0));
-        [AMNativeMintColor() setStroke];
-        CGContextSetLineWidth(ctx, 1.5);
-        CGContextStrokeEllipseInRect(ctx, CGRectMake(dotPt.x - 4.0, dotPt.y - 4.0, 8.0, 8.0));
-    }
-
-    // Endpoints (6x6 white dots)
     CGPoint p0 = [self ptForNormX:0.0f y:0.0f];
     CGPoint p3 = [self ptForNormX:1.0f y:1.0f];
-    [[UIColor whiteColor] setFill];
-    CGContextFillEllipseInRect(ctx, CGRectMake(p0.x - 3.0, p0.y - 3.0, 6.0, 6.0));
-    CGContextFillEllipseInRect(ctx, CGRectMake(p3.x - 3.0, p3.y - 3.0, 6.0, 6.0));
 
     if (self.easingType == 0) {
         // White tangent stems + exact 24pt (r=12) solid white tangent handle circles
@@ -11865,6 +11850,11 @@ static void AMPresentKeyframeActionMenu(UIViewController *vc,
         CGContextSetLineWidth(ctx, 2.0);
         CGContextStrokeEllipseInRect(ctx, CGRectMake(hp.x - rad, hp.y - rad, rad * 2.0, rad * 2.0));
     }
+
+    // Endpoints (7x7 Y1 mint green dots matching native Alight Motion EasingGraphView)
+    [AMNativeMintColor() setFill];
+    CGContextFillEllipseInRect(ctx, CGRectMake(p0.x - 3.5, p0.y - 3.5, 7.0, 7.0));
+    CGContextFillEllipseInRect(ctx, CGRectMake(p3.x - 3.5, p3.y - 3.5, 7.0, 7.0));
 }
 
 @end
@@ -12007,6 +11997,7 @@ static void AMPresentKeyframeActionMenu(UIViewController *vc,
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    self.title = @"Easing Curve";
     _detailBtns = [NSMutableArray array];
     // Exact EditEasingPanelVC root color #3F4361
     self.view.backgroundColor = [UIColor colorWithRed:0.2471 green:0.2627 blue:0.3804 alpha:1.0];
@@ -12098,8 +12089,12 @@ static void AMPresentKeyframeActionMenu(UIViewController *vc,
     bottomBar.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:bottomBar];
 
-    _prevBtn = [self makeIconBtn:@"ic_lh_expand_l" sf:@"chevron.left" width:42.0 height:39.0 action:@selector(onTapPrevSeg)];
-    _nextBtn = [self makeIconBtn:@"ic_lh_expand_r" sf:@"chevron.right" width:42.0 height:39.0 action:@selector(onTapNextSeg)];
+    _prevBtn = [self makeIconBtn:@"ic_lh_expand_l" sf:@"chevron.left" width:28.0 height:28.0 action:@selector(onTapPrevSeg)];
+    _prevBtn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.18];
+    _prevBtn.layer.cornerRadius = 4.0;
+    _nextBtn = [self makeIconBtn:@"ic_lh_expand_r" sf:@"chevron.right" width:28.0 height:28.0 action:@selector(onTapNextSeg)];
+    _nextBtn.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.18];
+    _nextBtn.layer.cornerRadius = 4.0;
     _infoLabel = [[UILabel alloc] init];
     _infoLabel.translatesAutoresizingMaskIntoConstraints = NO;
     _infoLabel.font = AMThemeFont(12.0, UIFontWeightMedium);
@@ -12178,10 +12173,10 @@ static void AMPresentKeyframeActionMenu(UIViewController *vc,
 
     for (int c = 0; c < 3; ++c) {
         BOOL sel = (c == _activeCategory);
-        _catBtns[c].tintColor = sel ? AMNativeMintColor() : [UIColor colorWithWhite:0.78 alpha:1.0];
-        _catBtns[c].layer.borderWidth = sel ? 1.0 : 0.0;
-        _catBtns[c].layer.borderColor = AMNativeMintColor().CGColor;
-        _catCues[c].hidden = !sel;
+        _catBtns[c].tintColor = sel ? AMNativeMintColor() : [UIColor colorWithWhite:0.90 alpha:1.0];
+        _catBtns[c].backgroundColor = sel ? [UIColor colorWithRed:0.0784 green:0.0863 blue:0.1255 alpha:1.0] : [UIColor clearColor];
+        _catBtns[c].layer.borderWidth = 0.0;
+        _catCues[c].hidden = YES;
     }
 
     NSArray<NSDictionary *> *presets = [self presetsForCategory:_activeCategory];
@@ -12270,20 +12265,20 @@ static void AMPresentKeyframeActionMenu(UIViewController *vc,
 - (void)updateInfoLabel {
     NSArray *kfs = [self keyframesArray];
     NSInteger segCount = MAX(0, (NSInteger)kfs.count - 1);
-    NSString *prefix = self.subjectTitle.length > 0 ? self.subjectTitle : @"Segment";
-    NSString *modeName = @"Cubic";
-    if (_graphView.easingType == 0) {
-        modeName = [NSString stringWithFormat:@"%.2f, %.2f, %.2f, %.2f",
-                    _graphView.p1x, _graphView.p1y, _graphView.p2x, _graphView.p2y];
-    } else if (_graphView.easingType == 1) {
-        modeName = (_graphView.stepCount <= 1.0f) ? @"Hold" : [NSString stringWithFormat:@"%.0f Steps", _graphView.stepCount];
+    NSString *modeName = @"Cubic Bezier Easing";
+    if (_graphView.easingType == 1) {
+        modeName = (_graphView.stepCount <= 1.0f) ? @"Step Hold Easing" : [NSString stringWithFormat:@"Step Easing (%.0f)", _graphView.stepCount];
     } else if (_graphView.easingType == 2) {
-        modeName = @"Elastic";
+        modeName = @"Elastic Easing";
     } else if (_graphView.easingType == 3) {
-        modeName = @"Bounce";
+        modeName = @"Bounce Easing";
     }
-    _infoLabel.text = [NSString stringWithFormat:@"%@ • %@ (%ld/%ld)",
-                       prefix, modeName, (long)(self.keyframeIndex + 1), (long)segCount];
+    if (segCount > 1) {
+        _infoLabel.text = [NSString stringWithFormat:@"%@ (%ld/%ld)",
+                           modeName, (long)(self.keyframeIndex + 1), (long)segCount];
+    } else {
+        _infoLabel.text = modeName;
+    }
 }
 
 - (void)onSyncTick {
@@ -18492,7 +18487,6 @@ static void AMHook_keyframeViewDrawRect(id self, SEL _cmd, CGRect rect) {
     double dur = (double)(endMs - startMs);
     UIColor *colW1 = AMColorNamedOrFallback(@"W1", [UIColor whiteColor]);
     UIColor *colY1 = AMNativeMintColor();
-    UIColor *colP6 = AMNativeP6DarkColor();
     UIColor *colBl1 = AMColorNamedOrFallback(@"Bl1", [UIColor blackColor]);
 
     CGContextSaveGState(ctx);
@@ -18503,11 +18497,11 @@ static void AMHook_keyframeViewDrawRect(id self, SEL _cmd, CGRect rect) {
 
         uint8_t st = kfStyle[i];
         BOOL atPlayhead = (llabs(kfTimes[i] - gAMPuppetEditorCurrentTimeMs) <= 20);
-        // Exact KeyframeView scale formula: bounds.height * 0.40 * (active ? 0.75 : 0.65)
-        CGFloat diamondH = MAX(10.0, v.bounds.size.height * 0.40 * (atPlayhead ? 0.75 : 0.65));
-        UIBezierPath *d = AMNativeKeyframeDiamondPathCentered(diamondH, CGPointMake(x, cy));
 
         if (st > 0) {
+            // Selected property (Puppet Pin or 3D Rotate panel active): solid white diamond, Bl1/Y1 stroke
+            CGFloat diamondH = MAX(10.0, v.bounds.size.height * 0.40 * (atPlayhead ? 0.75 : 0.65));
+            UIBezierPath *d = AMNativeKeyframeDiamondPathCentered(diamondH, CGPointMake(x, cy));
             [colW1 setFill];
             [d fill];
             if (atPlayhead) {
@@ -18519,14 +18513,117 @@ static void AMHook_keyframeViewDrawRect(id self, SEL _cmd, CGRect rect) {
             }
             [d stroke];
         } else {
-            [colP6 setFill];
-            [d fill];
+            // Unselected / layer-level keyframe: hollow diamond at exact 0.40 * height with W1/Y1 stroke
+            CGFloat diamondH = MAX(10.0, v.bounds.size.height * 0.40);
+            UIBezierPath *d = AMNativeKeyframeDiamondPathCentered(diamondH, CGPointMake(x, cy));
             [(atPlayhead ? colY1 : colW1) setStroke];
-            d.lineWidth = atPlayhead ? 1.8 : 0.8;
+            d.lineWidth = atPlayhead ? 1.8 : 0.9;
             [d stroke];
         }
     }
     CGContextRestoreGState(ctx);
+}
+
+// --- PreviewControlBarVC Left/Right Arrow Keyframe Snap (Puppet + 3D Rotate) ---
+
+static IMP gOrigPreviewControlBarMovePrev = NULL;
+static IMP gOrigPreviewControlBarMoveNext = NULL;
+
+static BOOL AMElementIdMatchesSelection(uint64_t eid, const uint64_t *selIds, NSUInteger selCount) {
+    if (eid == 0) return NO;
+    for (NSUInteger i = 0; i < selCount; ++i) {
+        if (selIds[i] == eid) return YES;
+    }
+    if (selCount == 0) {
+        if (gAMPuppetPanelVisible && eid == gAMPuppetActiveElementId) return YES;
+        if (gAMRot3DPanelVisible && eid == gAMRot3DActiveElementId) return YES;
+    }
+    return NO;
+}
+
+static void AMPreviewControlBarStepToKeyframe(id self, SEL _cmd, id sender, IMP origImp, BOOL forward) {
+    intptr_t slide = AMMainBinarySlide();
+    void *holder = AMRot3DCopyActiveHolderOnMain(slide);
+    if (!holder) {
+        if (origImp) ((void (*)(id, SEL, id))origImp)(self, _cmd, sender);
+        return;
+    }
+
+    int64_t tBefore = AMReadHolderCurrentTime(holder, slide);
+    if (origImp) ((void (*)(id, SEL, id))origImp)(self, _cmd, sender);
+    int64_t tAfter = AMReadHolderCurrentTime(holder, slide);
+
+    uint64_t *selIds = NULL;
+    NSUInteger selCount = 0;
+    AMReadHolderSelectedIds(holder, slide, &selIds, &selCount);
+
+    int64_t bestKf = forward ? INT64_MAX : -1;
+
+    os_unfair_lock_lock(&gAMPuppetRuntimeLock);
+    for (int s = 1; s <= kAMPuppetMaxSlots; ++s) {
+        const AMPuppetSlotRuntime *rt = &gAMPuppetSlots[s];
+        if (!rt->active || !AMElementIdMatchesSelection(rt->elementId, selIds, selCount)) continue;
+        for (int p = 0; p < rt->pinCount; ++p) {
+            for (int k = 0; k < rt->pins[p].keyframeCount; ++k) {
+                int64_t kt = rt->pins[p].keyframes[k].timeMs;
+                if (forward) {
+                    if (kt > tBefore + 20 && kt < bestKf) bestKf = kt;
+                } else {
+                    if (kt < tBefore - 20 && kt > bestKf) bestKf = kt;
+                }
+            }
+        }
+    }
+    os_unfair_lock_unlock(&gAMPuppetRuntimeLock);
+
+    os_unfair_lock_lock(&gAMRot3DRuntimeLock);
+    for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
+        const AMRot3DSlotRuntime *rt = &gAMRot3DSlots[s];
+        if (!rt->active || !AMElementIdMatchesSelection(rt->elementId, selIds, selCount)) continue;
+        for (int tr = 0; tr < kAMRot3DTrackCount; ++tr) {
+            for (int k = 0; k < rt->tracks[tr].keyframeCount; ++k) {
+                int64_t kt = rt->tracks[tr].keyframes[k].timeMs;
+                if (forward) {
+                    if (kt > tBefore + 20 && kt < bestKf) bestKf = kt;
+                } else {
+                    if (kt < tBefore - 20 && kt > bestKf) bestKf = kt;
+                }
+            }
+        }
+    }
+    os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
+
+    if (selIds) free(selIds);
+
+    BOOL useCustom = NO;
+    if (forward) {
+        if (bestKf < INT64_MAX && (tAfter <= tBefore + 5 || bestKf < tAfter - 5)) {
+            useCustom = YES;
+        }
+    } else {
+        if (bestKf >= 0 && (tAfter >= tBefore - 5 || bestKf > tAfter + 5)) {
+            useCustom = YES;
+        }
+    }
+
+    if (useCustom) {
+        AMPuppetSeekHolderToTimeMs(holder, bestKf);
+        gAMPuppetEditorCurrentTimeMs = bestKf;
+        AMPuppetRedrawAllKeyframeViews();
+    } else if (tAfter != tBefore) {
+        gAMPuppetEditorCurrentTimeMs = tAfter;
+        AMPuppetRedrawAllKeyframeViews();
+    }
+
+    AMSwiftRelease(holder, slide);
+}
+
+static void AMHook_previewControlBarMovePrev(id self, SEL _cmd, id sender) {
+    AMPreviewControlBarStepToKeyframe(self, _cmd, sender, gOrigPreviewControlBarMovePrev, NO);
+}
+
+static void AMHook_previewControlBarMoveNext(id self, SEL _cmd, id sender) {
+    AMPreviewControlBarStepToKeyframe(self, _cmd, sender, gOrigPreviewControlBarMoveNext, YES);
 }
 
 // ============================================================================
@@ -19396,6 +19493,16 @@ static void AlightMotionModsInit(void) {
                     (IMP)AMHook_previewControlBarViewDidLoad,
                     &gOrigPreviewControlBarViewDidLoad);
 
+    AMSwizzleMethod(@"_TtC12AlightMotion19PreviewControlBarVC",
+                    @"onTapMovePrev:",
+                    (IMP)AMHook_previewControlBarMovePrev,
+                    &gOrigPreviewControlBarMovePrev);
+
+    AMSwizzleMethod(@"_TtC12AlightMotion19PreviewControlBarVC",
+                    @"onTapMoveNext:",
+                    (IMP)AMHook_previewControlBarMoveNext,
+                    &gOrigPreviewControlBarMoveNext);
+
     AMSwizzleMethod(@"_TtC12AlightMotion10SettingsVC",
                     @"viewDidLoad",
                     (IMP)AMHook_settingsVCViewDidLoad,
@@ -19567,7 +19674,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-7";
+                static NSString *const kAMModBuildVersion = @"2026.11.27-8";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
