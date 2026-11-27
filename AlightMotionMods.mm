@@ -18559,6 +18559,461 @@ static void AMHook_fontBrowserDidPickURLs(id self, SEL _cmd, id picker, NSArray<
     (void)lastImported;
 }
 
+// ============================================================================
+// Module 9C: Folder & ZIP Batch Font Importer in FontBrowserVC Side Menu
+// ============================================================================
+
+static BOOL AMIsValidFontFileAtURL(NSURL *fileURL) {
+    if (!fileURL || !fileURL.isFileURL) return NO;
+    NSString *name = fileURL.lastPathComponent ?: @"";
+    if (name.length == 0 || [name hasPrefix:@"."]) return NO;
+    NSString *path = fileURL.path ?: @"";
+    if ([path containsString:@"/__MACOSX/"] || [name isEqualToString:@"__MACOSX"]) return NO;
+
+    NSString *ext = name.pathExtension.lowercaseString ?: @"";
+    if (![ext isEqualToString:@"ttf"] && ![ext isEqualToString:@"otf"] && ![ext isEqualToString:@"ttc"]) {
+        return NO;
+    }
+
+    NSNumber *isSym = nil;
+    if ([fileURL getResourceValue:&isSym forKey:NSURLIsSymbolicLinkKey error:nil] && isSym.boolValue) {
+        return NO;
+    }
+    NSNumber *isReg = nil;
+    if ([fileURL getResourceValue:&isReg forKey:NSURLIsRegularFileKey error:nil] && isReg && !isReg.boolValue) {
+        return NO;
+    }
+    NSNumber *fsize = nil;
+    if (![fileURL getResourceValue:&fsize forKey:NSURLFileSizeKey error:nil] || !fsize || fsize.unsignedLongLongValue < 64) {
+        return NO;
+    }
+
+    FILE *fp = fopen(fileURL.fileSystemRepresentation, "rb");
+    if (!fp) return NO;
+    uint8_t magic[4] = {0, 0, 0, 0};
+    size_t nread = fread(magic, 1, 4, fp);
+    fclose(fp);
+    if (nread < 4) return NO;
+
+    BOOL isTTF = (magic[0] == 0x00 && magic[1] == 0x01 && magic[2] == 0x00 && magic[3] == 0x00);
+    BOOL isOTF = (magic[0] == 'O' && magic[1] == 'T' && magic[2] == 'T' && magic[3] == 'O');
+    BOOL isTTC = (magic[0] == 't' && magic[1] == 't' && magic[2] == 'c' && magic[3] == 'f');
+    BOOL isTrue = (magic[0] == 't' && magic[1] == 'r' && magic[2] == 'u' && magic[3] == 'e');
+    BOOL isTyp1 = (magic[0] == 't' && magic[1] == 'y' && magic[2] == 'p' && magic[3] == '1');
+    return (isTTF || isOTF || isTTC || isTrue || isTyp1);
+}
+
+static void AMCopyFontsFromDirectoryTree(NSURL *rootURL,
+                                         NSString *docsDir,
+                                         NSUInteger *outImported,
+                                         NSUInteger *outSkipped) {
+    if (!rootURL || docsDir.length == 0) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSSet<NSString *> *skipDirs = AMSkippedDocsSubdirs();
+    NSArray<NSURLResourceKey> *keys = @[
+        NSURLIsDirectoryKey,
+        NSURLIsRegularFileKey,
+        NSURLIsSymbolicLinkKey,
+        NSURLFileSizeKey
+    ];
+    NSDirectoryEnumerator *en = [fm enumeratorAtURL:rootURL
+                         includingPropertiesForKeys:keys
+                                            options:NSDirectoryEnumerationSkipsHiddenFiles
+                                       errorHandler:^BOOL(NSURL *u, NSError *err) {
+        (void)u;
+        (void)err;
+        return YES;
+    }];
+
+    for (NSURL *itemURL in en) {
+        @autoreleasepool {
+            if (![itemURL isKindOfClass:[NSURL class]]) continue;
+            NSString *name = itemURL.lastPathComponent ?: @"";
+            if ([name hasPrefix:@"._"] || [name isEqualToString:@".DS_Store"] || [name isEqualToString:@"__MACOSX"]) {
+                [en skipDescendants];
+                continue;
+            }
+            NSNumber *isDir = nil;
+            [itemURL getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
+            if (isDir.boolValue) {
+                if ([skipDirs containsObject:name]) {
+                    [en skipDescendants];
+                }
+                continue;
+            }
+
+            NSString *ext = name.pathExtension.lowercaseString ?: @"";
+            BOOL looksLikeFont = ([ext isEqualToString:@"ttf"] || [ext isEqualToString:@"otf"] || [ext isEqualToString:@"ttc"]);
+            if (!looksLikeFont) continue;
+
+            if (!AMIsValidFontFileAtURL(itemURL)) {
+                if (outSkipped) (*outSkipped)++;
+                continue;
+            }
+
+            NSString *srcPath = itemURL.path ?: @"";
+            NSString *srcStd = srcPath.stringByStandardizingPath ?: @"";
+            NSString *dstPath = [docsDir stringByAppendingPathComponent:name];
+            NSString *dstStd = dstPath.stringByStandardizingPath ?: @"";
+            if (srcStd.length == 0 || dstStd.length == 0) {
+                if (outSkipped) (*outSkipped)++;
+                continue;
+            }
+            if ([dstStd isEqualToString:srcStd]) {
+                if (outImported) (*outImported)++;
+                continue;
+            }
+
+            if ([fm fileExistsAtPath:dstPath]) {
+                [fm removeItemAtPath:dstPath error:nil];
+            }
+            if ([fm copyItemAtPath:srcPath toPath:dstPath error:nil]) {
+                if (outImported) (*outImported)++;
+            } else {
+                if (outSkipped) (*outSkipped)++;
+            }
+        }
+    }
+}
+
+@interface AMBatchFontPickerHelper : NSObject <UIDocumentPickerDelegate>
+@property (nonatomic, weak) UIViewController *hostVC;
+@property (nonatomic, assign) BOOL isZipMode;
+@property (nonatomic, assign) BOOL isImporting;
+- (void)presentFolderPicker;
+- (void)presentZipPicker;
+@end
+
+@implementation AMBatchFontPickerHelper
+
+- (void)presentFolderPicker {
+    if (self.isImporting || !self.hostVC) return;
+    self.isZipMode = NO;
+    UIDocumentPickerViewController *picker =
+        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeFolder]];
+    picker.delegate = self;
+    picker.allowsMultipleSelection = YES;
+    picker.modalPresentationStyle = UIModalPresentationFormSheet;
+    [self.hostVC presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)presentZipPicker {
+    if (self.isImporting || !self.hostVC) return;
+    self.isZipMode = YES;
+    UIDocumentPickerViewController *picker =
+        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeZIP] asCopy:YES];
+    picker.delegate = self;
+    picker.allowsMultipleSelection = YES;
+    picker.modalPresentationStyle = UIModalPresentationFormSheet;
+    [self.hostVC presentViewController:picker animated:YES completion:nil];
+}
+
+- (UIView *)showImportingHUDInView:(UIView *)hostView {
+    if (!hostView) return nil;
+    UIView *hud = [[UIView alloc] init];
+    hud.translatesAutoresizingMaskIntoConstraints = NO;
+    hud.backgroundColor = [UIColor colorWithRed:0.125 green:0.137 blue:0.196 alpha:0.96];
+    hud.layer.cornerRadius = 12.0;
+    hud.layer.borderWidth = 1.0;
+    hud.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.14].CGColor;
+    hud.layer.shadowColor = [UIColor blackColor].CGColor;
+    hud.layer.shadowOpacity = 0.45;
+    hud.layer.shadowRadius = 12.0;
+    hud.layer.shadowOffset = CGSizeMake(0.0, 4.0);
+
+    UIActivityIndicatorView *spin = nil;
+    if (@available(iOS 13.0, *)) {
+        spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    } else {
+        spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleWhite];
+    }
+    spin.translatesAutoresizingMaskIntoConstraints = NO;
+    spin.color = [UIColor colorWithRed:0.0 green:1.0 blue:0.659 alpha:1.0];
+    [spin startAnimating];
+
+    UILabel *lbl = [[UILabel alloc] init];
+    lbl.translatesAutoresizingMaskIntoConstraints = NO;
+    lbl.text = @"Importing fonts...";
+    lbl.textColor = [UIColor whiteColor];
+    lbl.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightSemibold];
+
+    [hud addSubview:spin];
+    [hud addSubview:lbl];
+    [hostView addSubview:hud];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [hud.centerXAnchor constraintEqualToAnchor:hostView.centerXAnchor],
+        [hud.centerYAnchor constraintEqualToAnchor:hostView.centerYAnchor],
+        [hud.heightAnchor constraintEqualToConstant:44.0],
+        [spin.leadingAnchor constraintEqualToAnchor:hud.leadingAnchor constant:16.0],
+        [spin.centerYAnchor constraintEqualToAnchor:hud.centerYAnchor],
+        [lbl.leadingAnchor constraintEqualToAnchor:spin.trailingAnchor constant:10.0],
+        [lbl.trailingAnchor constraintEqualToAnchor:hud.trailingAnchor constant:-16.0],
+        [lbl.centerYAnchor constraintEqualToAnchor:hud.centerYAnchor]
+    ]];
+    return hud;
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+    (void)controller;
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    if (!urls || urls.count == 0 || self.isImporting) return;
+    UIViewController *vc = self.hostVC;
+    if (!vc) return;
+
+    self.isImporting = YES;
+    BOOL zipMode = self.isZipMode;
+    UIView *hud = [self showImportingHUDInView:vc.view];
+    NSArray<NSURL *> *pickedURLs = [urls copy];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *docsDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: @"";
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSUInteger imported = 0;
+        NSUInteger skipped = 0;
+        NSMutableArray<NSString *> *errors = [NSMutableArray array];
+
+        if (zipMode) {
+            Class zipCls = NSClassFromString(@"SSZipArchive");
+            SEL unzipSel = NSSelectorFromString(@"unzipFileAtPath:toDestination:overwrite:password:error:");
+            BOOL hasUnzip = (zipCls != Nil && [zipCls respondsToSelector:unzipSel]);
+
+            if (!hasUnzip) {
+                [errors addObject:@"ZIP extractor unavailable in this build."];
+            } else {
+                for (NSURL *zipURL in pickedURLs) {
+                    @autoreleasepool {
+                        if (![zipURL isKindOfClass:[NSURL class]]) continue;
+                        BOOL scoped = [zipURL startAccessingSecurityScopedResource];
+                        NSString *tmpDir = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                                            [NSString stringWithFormat:@"am_fontzip_%@", [NSUUID UUID].UUIDString]];
+                        [fm createDirectoryAtPath:tmpDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+                        __block BOOL ok = NO;
+                        __block NSError *unzipErr = nil;
+                        NSError *coordErr = nil;
+                        NSFileCoordinator *coord = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+                        [coord coordinateReadingItemAtURL:zipURL
+                                                  options:NSFileCoordinatorReadingWithoutChanges
+                                                    error:&coordErr
+                                               byAccessor:^(NSURL *newURL) {
+                            NSString *srcPath = newURL.path ?: @"";
+                            if (srcPath.length == 0) return;
+                            ok = ((BOOL (*)(id, SEL, NSString *, NSString *, BOOL, NSString *, NSError **))objc_msgSend)(
+                                (id)zipCls, unzipSel, srcPath, tmpDir, YES, nil, &unzipErr);
+                        }];
+
+                        if (coordErr && !ok) {
+                            NSString *fallbackPath = zipURL.path ?: @"";
+                            if (fallbackPath.length > 0) {
+                                ok = ((BOOL (*)(id, SEL, NSString *, NSString *, BOOL, NSString *, NSError **))objc_msgSend)(
+                                    (id)zipCls, unzipSel, fallbackPath, tmpDir, YES, nil, &unzipErr);
+                            }
+                        }
+
+                        if (ok) {
+                            AMCopyFontsFromDirectoryTree([NSURL fileURLWithPath:tmpDir], docsDir, &imported, &skipped);
+                        } else {
+                            NSString *msg = unzipErr.localizedDescription ?: coordErr.localizedDescription ?: @"Could not extract ZIP archive.";
+                            [errors addObject:msg];
+                        }
+
+                        [fm removeItemAtPath:tmpDir error:nil];
+                        NSString *tmpRoot = NSTemporaryDirectory().stringByStandardizingPath ?: @"";
+                        NSString *zipStd = zipURL.path.stringByStandardizingPath ?: @"";
+                        if (tmpRoot.length > 0 && [zipStd hasPrefix:tmpRoot]) {
+                            [fm removeItemAtURL:zipURL error:nil];
+                        }
+                        if (scoped) [zipURL stopAccessingSecurityScopedResource];
+                    }
+                }
+            }
+        } else {
+            for (NSURL *folderURL in pickedURLs) {
+                @autoreleasepool {
+                    if (![folderURL isKindOfClass:[NSURL class]]) continue;
+                    BOOL scoped = [folderURL startAccessingSecurityScopedResource];
+                    __block BOOL visited = NO;
+                    NSError *coordErr = nil;
+                    NSFileCoordinator *coord = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+                    [coord coordinateReadingItemAtURL:folderURL
+                                              options:NSFileCoordinatorReadingWithoutChanges
+                                                error:&coordErr
+                                           byAccessor:^(NSURL *newURL) {
+                        visited = YES;
+                        AMCopyFontsFromDirectoryTree(newURL, docsDir, &imported, &skipped);
+                    }];
+                    if (!visited) {
+                        AMCopyFontsFromDirectoryTree(folderURL, docsDir, &imported, &skipped);
+                    }
+                    if (coordErr && imported == 0 && !visited) {
+                        [errors addObject:coordErr.localizedDescription ?: @"Could not read selected folder."];
+                    }
+                    if (scoped) [folderURL stopAccessingSecurityScopedResource];
+                }
+            }
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [hud removeFromSuperview];
+            self.isImporting = NO;
+
+            if (imported > 0 && gOrigFontBrowserDidPickURLs) {
+                ((void (*)(id, SEL, id, NSArray<NSURL *> *))gOrigFontBrowserDidPickURLs)(
+                    vc, @selector(documentPicker:didPickDocumentsAtURLs:), controller, @[]);
+            }
+
+            NSString *title = nil;
+            NSString *msg = nil;
+            if (imported > 0) {
+                title = @"Fonts Imported";
+                if (skipped > 0) {
+                    msg = [NSString stringWithFormat:@"Imported %lu font%@.\nSkipped %lu invalid or unreadable file%@.",
+                           (unsigned long)imported, imported == 1 ? @"" : @"s",
+                           (unsigned long)skipped, skipped == 1 ? @"" : @"s"];
+                } else {
+                    msg = [NSString stringWithFormat:@"Imported %lu font%@.",
+                           (unsigned long)imported, imported == 1 ? @"" : @"s"];
+                }
+            } else if (errors.count > 0) {
+                title = @"Import Failed";
+                msg = errors.firstObject;
+            } else {
+                title = @"No Fonts Found";
+                msg = zipMode
+                    ? @"No valid .ttf, .otf, or .ttc font files were found in the selected ZIP archive."
+                    : @"No valid .ttf, .otf, or .ttc font files were found in the selected folder.";
+            }
+
+            void (^presentResult)(void) = ^{
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
+                                                                            message:msg
+                                                                     preferredStyle:UIAlertControllerStyleAlert];
+                [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [vc presentViewController:ac animated:YES completion:nil];
+            };
+
+            if (vc.presentedViewController == nil) {
+                presentResult();
+            } else {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    if (vc.presentedViewController == nil) {
+                        presentResult();
+                    }
+                });
+            }
+        });
+    });
+}
+
+@end
+
+static const void *kAMBatchFontHelperKey = &kAMBatchFontHelperKey;
+static const NSInteger kAMBatchFontButtonTag = 0x414D4642;
+
+static IMP gOrigFontBrowserViewDidLoad = NULL;
+static void AMHook_fontBrowserViewDidLoad(id self, SEL _cmd) {
+    if (gOrigFontBrowserViewDidLoad) {
+        ((void (*)(id, SEL))gOrigFontBrowserViewDidLoad)(self, _cmd);
+    }
+    if (![self isKindOfClass:[UIViewController class]]) return;
+    UIViewController *vc = (UIViewController *)self;
+
+    SEL impBtnSel = @selector(importFontsButton);
+    if (![vc respondsToSelector:impBtnSel]) return;
+    UIButton *importBtn = ((UIButton *(*)(id, SEL))objc_msgSend)(vc, impBtnSel);
+    if (![importBtn isKindOfClass:[UIButton class]]) return;
+    if (![importBtn.superview isKindOfClass:[UIStackView class]]) return;
+
+    UIStackView *rowStack = (UIStackView *)importBtn.superview;
+    if ([rowStack viewWithTag:kAMBatchFontButtonTag] != nil) return;
+
+    AMBatchFontPickerHelper *helper = [[AMBatchFontPickerHelper alloc] init];
+    helper.hostVC = vc;
+    objc_setAssociatedObject(vc, kAMBatchFontHelperKey, helper, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // Keep Import Fonts left-aligned and shrink-safe while hugging its content so Folder/ZIP sits right beside it
+    importBtn.titleEdgeInsets = UIEdgeInsetsMake(0.0, 15.0, 0.0, 8.0);
+    [importBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [importBtn setContentCompressionResistancePriority:UILayoutPriorityDefaultHigh forAxis:UILayoutConstraintAxisHorizontal];
+    importBtn.titleLabel.adjustsFontSizeToFitWidth = YES;
+    importBtn.titleLabel.minimumScaleFactor = 0.80;
+    importBtn.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+
+    UIButton *batchBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    batchBtn.tag = kAMBatchFontButtonTag;
+    batchBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    batchBtn.backgroundColor = [UIColor colorWithRed:0.157 green:0.173 blue:0.251 alpha:1.0];
+    batchBtn.layer.cornerRadius = 8.0;
+    batchBtn.layer.borderWidth = 1.0;
+    batchBtn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.14].CGColor;
+    batchBtn.layer.masksToBounds = YES;
+    batchBtn.tintColor = [UIColor colorWithRed:0.0 green:1.0 blue:0.659 alpha:1.0];
+    [batchBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    batchBtn.titleLabel.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold];
+    [batchBtn setTitle:@"Folder / ZIP" forState:UIControlStateNormal];
+
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *symCfg =
+            [UIImageSymbolConfiguration configurationWithPointSize:12.0 weight:UIImageSymbolWeightSemibold];
+        UIImage *icon = [[UIImage systemImageNamed:@"folder.badge.plus" withConfiguration:symCfg]
+                         imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        [batchBtn setImage:icon forState:UIControlStateNormal];
+    }
+
+    batchBtn.contentEdgeInsets = UIEdgeInsetsMake(0.0, 9.0, 0.0, 9.0);
+    batchBtn.imageEdgeInsets = UIEdgeInsetsMake(0.0, -3.0, 0.0, 3.0);
+    batchBtn.titleEdgeInsets = UIEdgeInsetsMake(0.0, 2.0, 0.0, -2.0);
+    [batchBtn setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [batchBtn setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [batchBtn.heightAnchor constraintEqualToConstant:30.0].active = YES;
+
+    if (@available(iOS 14.0, *)) {
+        __weak AMBatchFontPickerHelper *weakHelper = helper;
+        UIAction *folderAction = [UIAction actionWithTitle:@"Import Folder"
+                                                     image:[UIImage systemImageNamed:@"folder.fill"]
+                                                identifier:nil
+                                                   handler:^(__kindof UIAction *action) {
+            (void)action;
+            [weakHelper presentFolderPicker];
+        }];
+        UIAction *zipAction = [UIAction actionWithTitle:@"Import ZIP File"
+                                                  image:[UIImage systemImageNamed:@"doc.zipper"]
+                                             identifier:nil
+                                                handler:^(__kindof UIAction *action) {
+            (void)action;
+            [weakHelper presentZipPicker];
+        }];
+        batchBtn.menu = [UIMenu menuWithTitle:@"" children:@[folderAction, zipAction]];
+        batchBtn.showsMenuAsPrimaryAction = YES;
+    }
+
+    UIView *gapSpacer = [[UIView alloc] init];
+    gapSpacer.translatesAutoresizingMaskIntoConstraints = NO;
+    gapSpacer.backgroundColor = [UIColor clearColor];
+    [gapSpacer.widthAnchor constraintEqualToConstant:6.0].active = YES;
+
+    UIView *trailingSpacer = [[UIView alloc] init];
+    trailingSpacer.translatesAutoresizingMaskIntoConstraints = NO;
+    trailingSpacer.backgroundColor = [UIColor clearColor];
+    [trailingSpacer setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    [trailingSpacer setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    [trailingSpacer.widthAnchor constraintGreaterThanOrEqualToConstant:10.0].active = YES;
+
+    NSUInteger impIdx = [rowStack.arrangedSubviews indexOfObject:importBtn];
+    if (impIdx != NSNotFound) {
+        [rowStack insertArrangedSubview:gapSpacer atIndex:impIdx + 1];
+        [rowStack insertArrangedSubview:batchBtn atIndex:impIdx + 2];
+        [rowStack insertArrangedSubview:trailingSpacer atIndex:impIdx + 3];
+    } else {
+        [rowStack addArrangedSubview:gapSpacer];
+        [rowStack addArrangedSubview:batchBtn];
+        [rowStack addArrangedSubview:trailingSpacer];
+    }
+}
+
 static void AMSwizzleMethod(NSString *className, NSString *selName, IMP replacement, IMP *outOrig) {
     Class cls = NSClassFromString(className);
     if (!cls) return;
@@ -18789,6 +19244,10 @@ static void AlightMotionModsInit(void) {
                     @"documentPicker:didPickDocumentsAtURLs:",
                     (IMP)AMHook_fontBrowserDidPickURLs,
                     &gOrigFontBrowserDidPickURLs);
+    AMSwizzleMethod(@"_TtC12AlightMotion13FontBrowserVC",
+                    @"viewDidLoad",
+                    (IMP)AMHook_fontBrowserViewDidLoad,
+                    &gOrigFontBrowserViewDidLoad);
 
     [[AMBackupManager shared] startAutoSaveObservers];
     [[AMHomepageSearchOverlayManager shared] start];
@@ -18817,7 +19276,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-5";
+                static NSString *const kAMModBuildVersion = @"2026.11.27-6";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
