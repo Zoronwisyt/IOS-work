@@ -14784,6 +14784,200 @@ static void AMInstallSideStoreStabilityGuard(void) {
     });
 }
 
+// ============================================================================
+// Module 9B: Multi-Font & Files Paste/Import Crash Fix
+// ============================================================================
+
+static NSSet<NSString *> *AMSkippedDocsSubdirs(void) {
+    static NSSet<NSString *> *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s = [NSSet setWithArray:@[
+            @"RockMotionBackup",
+            @"CustomEffects",
+            @"ProjectFolders",
+            @"Inbox",
+            @"__MACOSX",
+            @".Trash"
+        ]];
+    });
+    return s;
+}
+
+@interface AMSafeDocumentsEnumerator : NSDirectoryEnumerator
+@property (nonatomic, strong) NSDirectoryEnumerator *inner;
+@property (nonatomic, copy) NSString *docsPrefix;
+@end
+
+@implementation AMSafeDocumentsEnumerator
+
+- (id)nextObject {
+    NSSet<NSString *> *skipDirs = AMSkippedDocsSubdirs();
+    while (YES) {
+        id obj = [self.inner nextObject];
+        if (!obj) return nil;
+        if ([obj isKindOfClass:[NSURL class]]) {
+            NSURL *u = (NSURL *)obj;
+            NSString *name = u.lastPathComponent ?: @"";
+            if ([name hasPrefix:@"._"] || [name isEqualToString:@".DS_Store"] || [name isEqualToString:@"__MACOSX"]) {
+                [self.inner skipDescendants];
+                continue;
+            }
+            if ([skipDirs containsObject:name]) {
+                [self.inner skipDescendants];
+                continue;
+            }
+            // Skip 0-byte font files that can choke CGFontCreateWithDataProvider
+            NSString *ext = u.pathExtension.lowercaseString;
+            if ([ext isEqualToString:@"ttf"] || [ext isEqualToString:@"otf"] || [ext isEqualToString:@"ttc"]) {
+                NSNumber *sz = nil;
+                if ([u getResourceValue:&sz forKey:NSURLFileSizeKey error:nil] && sz && sz.unsignedLongLongValue < 64) {
+                    continue;
+                }
+            }
+        }
+        return obj;
+    }
+}
+
+- (NSUInteger)countByEnumeratingWithState:(NSFastEnumerationState *)state
+                                  objects:(id __unsafe_unretained _Nonnull [_Nonnull])buffer
+                                    count:(NSUInteger)len {
+    if (state->state == 0) {
+        state->mutationsPtr = &state->extra[0];
+        state->state = 1;
+    }
+    state->itemsPtr = buffer;
+    NSUInteger n = 0;
+    while (n < len) {
+        id obj = [self nextObject];
+        if (!obj) break;
+        buffer[n++] = obj;
+    }
+    return n;
+}
+
+- (void)skipDescendants { [self.inner skipDescendants]; }
+- (void)skipDescendents { [self.inner skipDescendents]; }
+- (NSDictionary<NSFileAttributeKey, id> *)fileAttributes { return [self.inner fileAttributes]; }
+- (NSDictionary<NSFileAttributeKey, id> *)directoryAttributes { return [self.inner directoryAttributes]; }
+- (NSUInteger)level { return [self.inner level]; }
+- (BOOL)isEnumeratingDirectoryPostOrder {
+    if (@available(iOS 13.0, *)) {
+        return [self.inner isEnumeratingDirectoryPostOrder];
+    }
+    return NO;
+}
+
+@end
+
+static IMP gOrigFMEnumeratorAtURL = NULL;
+static NSDirectoryEnumerator *AMHook_fmEnumeratorAtURL(id self,
+                                                       SEL _cmd,
+                                                       NSURL *url,
+                                                       NSArray<NSURLResourceKey> *keys,
+                                                       NSDirectoryEnumerationOptions mask,
+                                                       BOOL (^handler)(NSURL *, NSError *)) {
+    NSDirectoryEnumerator *res = ((NSDirectoryEnumerator *(*)(id, SEL, NSURL *, NSArray *, NSDirectoryEnumerationOptions, BOOL (^)(NSURL *, NSError *)))gOrigFMEnumeratorAtURL)(self, _cmd, url, keys, mask, handler);
+    if (!res || !url.isFileURL) return res;
+
+    static NSString *sDocsPath = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: @"";
+        sDocsPath = d.stringByStandardizingPath;
+    });
+
+    NSString *reqPath = url.path.stringByStandardizingPath ?: @"";
+    if (sDocsPath.length > 0 && [reqPath isEqualToString:sDocsPath]) {
+        AMSafeDocumentsEnumerator *proxy = [[AMSafeDocumentsEnumerator alloc] init];
+        proxy.inner = res;
+        proxy.docsPrefix = sDocsPath;
+        return proxy;
+    }
+    return res;
+}
+
+static IMP gOrigFMContentsEqualAtPath = NULL;
+static BOOL AMHook_fmContentsEqualAtPath(id self, SEL _cmd, NSString *path1, NSString *path2) {
+    if (path1.length == 0 || path2.length == 0) return NO;
+    if ([path1 isEqualToString:path2]) return YES;
+    NSFileManager *fm = (NSFileManager *)self;
+    NSDictionary *a1 = [fm attributesOfItemAtPath:path1 error:nil];
+    NSDictionary *a2 = [fm attributesOfItemAtPath:path2 error:nil];
+    if (!a1 || !a2) return NO;
+    if (![a1[NSFileType] isEqualToString:NSFileTypeRegular] || ![a2[NSFileType] isEqualToString:NSFileTypeRegular]) {
+        return NO;
+    }
+    if ([a1[NSFileSize] unsignedLongLongValue] != [a2[NSFileSize] unsignedLongLongValue]) {
+        return NO;
+    }
+    return ((BOOL (*)(id, SEL, NSString *, NSString *))gOrigFMContentsEqualAtPath)(self, _cmd, path1, path2);
+}
+
+static IMP gOrigFontBrowserDidPickURLs = NULL;
+static void AMHook_fontBrowserDidPickURLs(id self, SEL _cmd, id picker, NSArray<NSURL *> *urls) {
+    if (!urls || urls.count <= 1) {
+        if (gOrigFontBrowserDidPickURLs) {
+            ((void (*)(id, SEL, id, NSArray<NSURL *> *))gOrigFontBrowserDidPickURLs)(self, _cmd, picker, urls);
+        }
+        return;
+    }
+
+    // Batch-copy all selected valid font files safely into Documents/ (stock handler only imports urls[0] via moveItemAtURL:)
+    NSString *docsDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: @"";
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSURL *lastImported = nil;
+    NSUInteger importedCount = 0;
+
+    for (NSURL *srcURL in urls) {
+        @autoreleasepool {
+            if (![srcURL isKindOfClass:[NSURL class]]) continue;
+            BOOL scoped = [srcURL startAccessingSecurityScopedResource];
+            NSString *name = srcURL.lastPathComponent ?: @"";
+            NSString *ext = name.pathExtension.lowercaseString ?: @"";
+            BOOL isFont = ([ext isEqualToString:@"ttf"] || [ext isEqualToString:@"otf"] || [ext isEqualToString:@"ttc"]);
+            if (isFont && name.length > 0 && ![name hasPrefix:@"._"] && docsDir.length > 0) {
+                NSString *srcPath = srcURL.path;
+                NSDictionary *attrs = srcPath.length > 0 ? [fm attributesOfItemAtPath:srcPath error:nil] : nil;
+                unsigned long long fsize = [attrs[NSFileSize] unsignedLongLongValue];
+                if (fsize >= 64) {
+                    NSString *dstPath = [docsDir stringByAppendingPathComponent:name];
+                    if (![dstPath isEqualToString:srcPath]) {
+                        if ([fm fileExistsAtPath:dstPath]) {
+                            [fm removeItemAtPath:dstPath error:nil];
+                        }
+                        if ([fm copyItemAtPath:srcPath toPath:dstPath error:nil]) {
+                            lastImported = [NSURL fileURLWithPath:dstPath];
+                            importedCount++;
+                        }
+                    } else {
+                        lastImported = [NSURL fileURLWithPath:dstPath];
+                        importedCount++;
+                    }
+                }
+            }
+            if (scoped) [srcURL stopAccessingSecurityScopedResource];
+        }
+    }
+
+    // Pass only an empty array to stock handler so it reloads FontBrowserVM cleanly without crashing on moveItemAtURL:
+    if (gOrigFontBrowserDidPickURLs) {
+        ((void (*)(id, SEL, id, NSArray<NSURL *> *))gOrigFontBrowserDidPickURLs)(self, _cmd, picker, @[]);
+    }
+    if (importedCount > 0 && [self isKindOfClass:[UIViewController class]]) {
+        UIViewController *vc = (UIViewController *)self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Fonts Imported"
+                                                                        message:[NSString stringWithFormat:@"Imported %lu fonts safely.", (unsigned long)importedCount]
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [vc presentViewController:ac animated:YES completion:nil];
+        });
+    }
+    (void)lastImported;
+}
+
 static void AMSwizzleMethod(NSString *className, NSString *selName, IMP replacement, IMP *outOrig) {
     Class cls = NSClassFromString(className);
     if (!cls) return;
@@ -14977,6 +15171,20 @@ static void AlightMotionModsInit(void) {
                     (IMP)AMHook_appAttestAttestKey,
                     &gOrigAppAttestAttestKey);
     AMInstallSideStoreStabilityGuard();
+
+    // Module 9B: Multi-Font & Files Paste/Import Crash Fix
+    AMSwizzleMethod(@"NSFileManager",
+                    @"enumeratorAtURL:includingPropertiesForKeys:options:errorHandler:",
+                    (IMP)AMHook_fmEnumeratorAtURL,
+                    &gOrigFMEnumeratorAtURL);
+    AMSwizzleMethod(@"NSFileManager",
+                    @"contentsEqualAtPath:andPath:",
+                    (IMP)AMHook_fmContentsEqualAtPath,
+                    &gOrigFMContentsEqualAtPath);
+    AMSwizzleMethod(@"_TtC12AlightMotion13FontBrowserVC",
+                    @"documentPicker:didPickDocumentsAtURLs:",
+                    (IMP)AMHook_fontBrowserDidPickURLs,
+                    &gOrigFontBrowserDidPickURLs);
 
     [[AMBackupManager shared] startAutoSaveObservers];
     [[AMHomepageSearchOverlayManager shared] start];
