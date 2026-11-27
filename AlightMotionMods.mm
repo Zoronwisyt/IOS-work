@@ -106,8 +106,10 @@ static BOOL AMItemUsesAMCompositor(AVPlayerItem *item) {
     return (compCls != Nil && vc.customVideoCompositorClass == compCls);
 }
 
+static BOOL gAMIntroActive = NO;
+
 static void AMTrackPlayerIfPreview(AVPlayer *player, AVPlayerItem *item) {
-    if (!player) return;
+    if (!player || gAMIntroActive) return;
     if (AMItemUsesAMCompositor(item)) {
         item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmVarispeed;
     }
@@ -3142,7 +3144,7 @@ static BOOL AMHomepageModalCovering(UIWindow *win, UIViewController *mainVC) {
 
 static BOOL AMIsOnHomepage(UIWindow *win) {
     if (!win || !win.rootViewController) return NO;
-    if (gAMSearchModalOpen || gAMFoldersModalOpen || gAMImportModalOpen) return NO;
+    if (gAMIntroActive || gAMSearchModalOpen || gAMFoldersModalOpen || gAMImportModalOpen) return NO;
     UIViewController *root = win.rootViewController;
     if ([root isKindOfClass:[UINavigationController class]]) {
         UINavigationController *nav = (UINavigationController *)root;
@@ -7139,6 +7141,188 @@ static void AMQueueSequentialAmprojImports(NSArray<NSURL *> *urls) {
 @end
 
 // ============================================================================
+// Launch Intro Video -> Loading Screen -> Fade Out to Alight Motion
+// ============================================================================
+
+@interface AMLaunchIntroManager : NSObject
+@property (nonatomic, strong, nullable) UIWindow *overlayWindow;
+@property (nonatomic, strong, nullable) AVPlayer *player;
+@property (nonatomic, strong, nullable) AVPlayerLayer *playerLayer;
+@property (nonatomic, strong, nullable) UIView *loadingView;
+@property (nonatomic, assign) BOOL didStart;
+@property (nonatomic, assign) BOOL didTransitionToLoading;
+@property (nonatomic, assign) BOOL didFadeOut;
+@property (nonatomic, assign) NSTimeInterval loadingStartTime;
++ (instancetype)shared;
+- (void)startIfNeeded;
+@end
+
+@implementation AMLaunchIntroManager
+
++ (instancetype)shared {
+    static AMLaunchIntroManager *inst = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        inst = [[AMLaunchIntroManager alloc] init];
+    });
+    return inst;
+}
+
+- (void)startIfNeeded {
+    if (self.didStart) return;
+    UIWindow *keyWin = AMKeyWindow();
+    if (!keyWin) return;
+
+    NSURL *videoURL = [[NSBundle mainBundle] URLForResource:@"AMIntro" withExtension:@"mp4"];
+    if (!videoURL) return;
+
+    self.didStart = YES;
+    gAMIntroActive = YES;
+
+    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryAmbient error:nil];
+
+    UIWindow *win = nil;
+    if (@available(iOS 13.0, *)) {
+        if (keyWin.windowScene) {
+            win = [[UIWindow alloc] initWithWindowScene:keyWin.windowScene];
+        }
+    }
+    if (!win) {
+        win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    }
+    win.frame = [UIScreen mainScreen].bounds;
+    win.windowLevel = UIWindowLevelAlert + 50.0;
+    win.backgroundColor = [UIColor colorWithRed:0.055 green:0.067 blue:0.090 alpha:1.0];
+    win.rootViewController = [[UIViewController alloc] init];
+    win.rootViewController.view.backgroundColor = win.backgroundColor;
+    win.hidden = NO;
+    self.overlayWindow = win;
+
+    AVPlayer *player = [AVPlayer playerWithURL:videoURL];
+    player.actionAtItemEnd = AVPlayerActionAtItemEndPause;
+    self.player = player;
+
+    AVPlayerLayer *layer = [AVPlayerLayer playerLayerWithPlayer:player];
+    layer.frame = win.bounds;
+    layer.videoGravity = AVLayerVideoGravityResizeAspectFill;
+    [win.rootViewController.view.layer addSublayer:layer];
+    self.playerLayer = layer;
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onVideoDidFinish:)
+                                                 name:AVPlayerItemDidPlayToEndTimeNotification
+                                               object:player.currentItem];
+
+    [player play];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self transitionToLoadingScreen];
+    });
+}
+
+- (void)onVideoDidFinish:(NSNotification *)note {
+    (void)note;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self transitionToLoadingScreen];
+    });
+}
+
+- (void)transitionToLoadingScreen {
+    if (self.didTransitionToLoading) return;
+    self.didTransitionToLoading = YES;
+
+    [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                    name:AVPlayerItemDidPlayToEndTimeNotification
+                                                  object:nil];
+
+    UIWindow *win = self.overlayWindow;
+    if (!win) {
+        [self fadeOutToAlightMotion];
+        return;
+    }
+
+    UIView *loading = [[UIView alloc] initWithFrame:win.bounds];
+    loading.backgroundColor = [UIColor colorWithRed:0.055 green:0.067 blue:0.090 alpha:1.0];
+    loading.alpha = 0.0;
+
+    UIActivityIndicatorView *spinner = nil;
+    if (@available(iOS 13.0, *)) {
+        spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
+    } else {
+        spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleWhiteLarge];
+    }
+    spinner.color = [UIColor whiteColor];
+    spinner.center = CGPointMake(loading.bounds.size.width * 0.5, loading.bounds.size.height * 0.5 - 12.0);
+    [spinner startAnimating];
+    [loading addSubview:spinner];
+
+    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(24.0, CGRectGetMaxY(spinner.frame) + 14.0, loading.bounds.size.width - 48.0, 22.0)];
+    lbl.text = @"Loading...";
+    lbl.textColor = [UIColor colorWithWhite:1.0 alpha:0.75];
+    lbl.font = AMThemeFont(14.0, UIFontWeightMedium);
+    lbl.textAlignment = NSTextAlignmentCenter;
+    [loading addSubview:lbl];
+
+    [win.rootViewController.view addSubview:loading];
+    self.loadingView = loading;
+    self.loadingStartTime = [NSDate timeIntervalSinceReferenceDate];
+
+    [UIView animateWithDuration:0.25 animations:^{
+        loading.alpha = 1.0;
+    } completion:^(BOOL finished) {
+        (void)finished;
+        [self.player pause];
+        [self.playerLayer removeFromSuperlayer];
+        self.playerLayer = nil;
+        self.player = nil;
+    }];
+
+    [self checkReadyToFadeOut];
+}
+
+- (void)checkReadyToFadeOut {
+    if (self.didFadeOut) return;
+    NSTimeInterval elapsed = [NSDate timeIntervalSinceReferenceDate] - self.loadingStartTime;
+    UIWindow *keyWin = AMKeyWindow();
+    UIViewController *mainVC = keyWin ? AMFindMainVCInHierarchy(keyWin.rootViewController, 0) : nil;
+    BOOL appReady = (mainVC && mainVC.isViewLoaded && mainVC.view.window == keyWin && !AMVCTreeContainsEditor(keyWin.rootViewController, 0));
+
+    if ((elapsed >= 0.80 && appReady) || elapsed >= 3.5) {
+        [self fadeOutToAlightMotion];
+        return;
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self checkReadyToFadeOut];
+    });
+}
+
+- (void)fadeOutToAlightMotion {
+    if (self.didFadeOut) return;
+    self.didFadeOut = YES;
+
+    gAMIntroActive = NO;
+    [[AMHomepageSearchOverlayManager shared] scheduleImmediateTick];
+
+    UIWindow *win = self.overlayWindow;
+    if (!win) return;
+
+    [UIView animateWithDuration:0.45
+                          delay:0.0
+                        options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        win.alpha = 0.0;
+    } completion:^(BOOL finished) {
+        (void)finished;
+        win.hidden = YES;
+        self.loadingView = nil;
+        self.overlayWindow = nil;
+    }];
+}
+
+@end
+
+// ============================================================================
 // Multi-Layer Parenting (Timeline Multi-Select Toolbar)
 // ============================================================================
 
@@ -7951,4 +8135,19 @@ static void AlightMotionModsInit(void) {
                     &gOrigTabBarSetSelectedItem);
 
     [[AMHomepageSearchOverlayManager shared] start];
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        (void)note;
+        [[AMLaunchIntroManager shared] startIfNeeded];
+    }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeKeyNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        (void)note;
+        [[AMLaunchIntroManager shared] startIfNeeded];
+    }];
 }
