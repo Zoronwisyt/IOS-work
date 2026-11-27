@@ -238,6 +238,25 @@ static void AMHook_avCompReqFinishError(id self, SEL _cmd, NSError *err) {
     AMNotifyCompositorRequestFinished();
 }
 
+static CMTime AMMakeDistinctLiveSeekTime(AVPlayer *player, AVPlayerItem *item) {
+    CMTime cur = player.currentTime;
+    if (!CMTIME_IS_NUMERIC(cur)) return kCMTimeInvalid;
+    CMTime t60k = CMTimeConvertScale(cur, 60000, kCMTimeRoundingMethod_Default);
+    int64_t val = t60k.value;
+    if (val < 0) val = 0;
+    int64_t base = val & ~1LL;
+    int64_t alt = base + 1;
+    CMTime dur = item.duration;
+    if (CMTIME_IS_NUMERIC(dur) && dur.value > 0) {
+        CMTime d60k = CMTimeConvertScale(dur, 60000, kCMTimeRoundingMethod_Default);
+        if (d60k.value > 2 && alt >= d60k.value) {
+            alt = (base > 0) ? (base - 1) : 0;
+        }
+    }
+    int64_t targetVal = (val == base) ? alt : base;
+    return CMTimeMake(targetVal, 60000);
+}
+
 static void AMForceImmediatePreviewRedraw(void) {
     AVPlayer *player = AMResolveActivePreviewPlayer();
     if (!player) return;
@@ -248,22 +267,18 @@ static void AMForceImmediatePreviewRedraw(void) {
     gAMLiveRedrawPending = NO;
     ++gAMLiveRedrawSeq;
 
-    int64_t reqBefore = __atomic_load_n(&gAMCompositorStartCount, __ATOMIC_RELAXED);
+    // mutableCopy allocates a genuinely distinct AVMutableVideoComposition (unlike immutable -copy which returns self!)
     AVVideoComposition *vc = item.videoComposition;
     if (vc) {
-        AVVideoComposition *copied = [vc copy];
-        if (copied) {
-            item.videoComposition = copied;
+        AVMutableVideoComposition *mvc = [vc mutableCopy];
+        if (mvc) {
+            item.videoComposition = mvc;
         }
     }
     if (player.rate == 0.0f) {
-        CMTime cur = player.currentTime;
-        if (CMTIME_IS_NUMERIC(cur)) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-                if (__atomic_load_n(&gAMCompositorStartCount, __ATOMIC_RELAXED) == reqBefore && player.rate == 0.0f) {
-                    [player seekToTime:cur toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
-                }
-            });
+        CMTime target = AMMakeDistinctLiveSeekTime(player, item);
+        if (CMTIME_IS_NUMERIC(target)) {
+            [player seekToTime:target toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
         }
     }
 }
@@ -285,37 +300,27 @@ static void AMRequestCoalescedPreviewRedraw(void) {
     gAMLiveRedrawInFlight = YES;
     gAMLiveRedrawPending = NO;
     uint64_t seq = ++gAMLiveRedrawSeq;
-    int64_t reqBefore = __atomic_load_n(&gAMCompositorStartCount, __ATOMIC_RELAXED);
 
-    // Match Alight Motion's native 0x100228d28 live refresh: swap videoComposition to trigger
-    // AMCompositor.startVideoCompositionRequest: WITHOUT a premature seekToTime: completion cancelling it!
+    // 1. Assign a genuinely new AVMutableVideoComposition (-copy on immutable AVVideoComposition returns self!)
     AVVideoComposition *vc = item.videoComposition;
     if (vc) {
-        AVVideoComposition *copied = [vc copy];
-        if (copied) {
-            item.videoComposition = copied;
+        AVMutableVideoComposition *mvc = [vc mutableCopy];
+        if (mvc) {
+            item.videoComposition = mvc;
         }
     }
 
-    // Fallback kick ONLY if setVideoComposition: did not wake AMCompositor within 20ms
-    CMTime cur = player.currentTime;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-        if (!gAMLiveRedrawInFlight || gAMLiveRedrawSeq != seq) return;
-        if (__atomic_load_n(&gAMCompositorStartCount, __ATOMIC_RELAXED) == reqBefore) {
-            if (player.rate == 0.0f && CMTIME_IS_NUMERIC(cur)) {
-                [player seekToTime:cur toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
-            } else {
-                gAMLiveRedrawInFlight = NO;
-                if (gAMLiveRedrawPending) {
-                    gAMLiveRedrawPending = NO;
-                    AMRequestCoalescedPreviewRedraw();
-                }
-            }
-        }
-    });
+    // 2. Seek to a 1-tick (1/60000s = 0.016ms) alternating CMTime so AVPlayer NEVER dedups
+    //    the paused frame as "already at currentTime" and ALWAYS invokes AMCompositor live.
+    //    No completionHandler here: AMHook_avCompReqFinishFrame unlocks gAMLiveRedrawInFlight
+    //    the exact millisecond Metal finishes rendering, preventing premature cancellation.
+    CMTime target = AMMakeDistinctLiveSeekTime(player, item);
+    if (CMTIME_IS_NUMERIC(target)) {
+        [player seekToTime:target toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+    }
 
     // Hard safety timeout so in-flight gate can never stall if AVFoundation drops a request
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(85 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(75 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
         if (gAMLiveRedrawInFlight && gAMLiveRedrawSeq == seq) {
             gAMLiveRedrawInFlight = NO;
             if (gAMLiveRedrawPending) {
