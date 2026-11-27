@@ -902,13 +902,15 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     CGFloat w = tv.bounds.size.width > 0 ? tv.bounds.size.width : 280.0;
     UIView *existingHdr = tv.tableHeaderView;
     CGFloat existingH = existingHdr ? existingHdr.frame.size.height : 0.0;
-    CGFloat pillContainerH = 100.0;
+    // Trim excess bottom padding of SettingsHeaderView so "Open Alight Link" sits higher and leaves clean separation above Section 0
+    CGFloat hdrH = (existingH > 40.0) ? MAX(38.0, existingH - 10.0) : existingH;
+    CGFloat pillContainerH = 112.0;
 
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, existingH + pillContainerH)];
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, hdrH + pillContainerH)];
     header.backgroundColor = [UIColor clearColor];
 
     if (existingHdr) {
-        existingHdr.frame = CGRectMake(0, 0, w, existingH);
+        existingHdr.frame = CGRectMake(0, 0, w, hdrH);
         existingHdr.autoresizingMask = UIViewAutoresizingFlexibleWidth;
         [header addSubview:existingHdr];
     }
@@ -966,7 +968,7 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     [NSLayoutConstraint activateConstraints:@[
         [pill.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16.0],
         [pill.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16.0],
-        [pill.topAnchor constraintEqualToAnchor:header.topAnchor constant:existingH + 4.0],
+        [pill.topAnchor constraintEqualToAnchor:header.topAnchor constant:hdrH + 2.0],
         [pill.heightAnchor constraintEqualToConstant:42.0],
 
         [lbl.leadingAnchor constraintEqualToAnchor:pill.leadingAnchor constant:16.0],
@@ -9952,10 +9954,14 @@ static float AMPuppetEvalEasing(int easingType, float p1x, float p1y, float p2x,
         return 1.0f - expf(-damp * u) * cosf(u * freq * (float)M_PI * 2.0f);
     }
     if (easingType == 3) {
-        // Bounce Out
+        // Bounce Out (Penner default when p1x/p1y near 0; draggable amplitude/tempo via p1x/p1y)
+        float t = u;
+        if (fabsf(p1x) > 0.02f || fabsf(p1y) > 0.02f) {
+            float warp = 0.65f + fminf(fmaxf(p1x, 0.0f), 1.0f) * 0.85f;
+            t = powf(u, warp);
+        }
         float n1 = 7.5625f;
         float d1 = 2.75f;
-        float t = u;
         if (t < 1.0f / d1) {
             return n1 * t * t;
         } else if (t < 2.0f / d1) {
@@ -10970,16 +10976,63 @@ static UIImage *AMPuppetTabIcon(void) {
     return img;
 }
 
+static UIColor *AMColorNamedOrFallback(NSString *name, UIColor *fallback) {
+    if (name.length > 0) {
+        if (@available(iOS 11.0, *)) {
+            UIColor *c = [UIColor colorNamed:name];
+            if (c) return c;
+        }
+    }
+    return fallback;
+}
+
+static UIColor *AMNativeMintColor(void) {
+    return AMColorNamedOrFallback(@"Y1", [UIColor colorWithRed:0.0 green:1.0 blue:0.6588 alpha:1.0]);
+}
+
+static UIColor *AMNativeP6DarkColor(void) {
+    return AMColorNamedOrFallback(@"P6", [UIColor colorWithRed:0.118 green:0.125 blue:0.169 alpha:1.0]);
+}
+
+// Exact rounded tall diamond vector extracted from AlightMotion KeyframeView (0x102a1b590, 50.65 x 74.99 bbox)
+static UIBezierPath *AMNativeKeyframeDiamondPathCentered(CGFloat targetHeight, CGPoint center) {
+    static UIBezierPath *sUnitCentered = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        UIBezierPath *raw = [UIBezierPath bezierPath];
+        [raw moveToPoint:CGPointMake(49.5739, 34.7699)];
+        [raw addLineToPoint:CGPointMake(27.8609, 1.3649)];
+        [raw addCurveToPoint:CGPointMake(22.7909, 1.3649)
+               controlPoint1:CGPointMake(26.6639, -0.4541)
+               controlPoint2:CGPointMake(23.9879, -0.4541)];
+        [raw addLineToPoint:CGPointMake(1.0769, 34.7699)];
+        [raw addCurveToPoint:CGPointMake(1.0769, 42.0189)
+               controlPoint1:CGPointMake(-0.3581, 36.9769)
+               controlPoint2:CGPointMake(-0.3581, 39.8119)];
+        [raw addLineToPoint:CGPointMake(22.7909, 73.6339)];
+        [raw addCurveToPoint:CGPointMake(27.8609, 73.6339)
+               controlPoint1:CGPointMake(23.9879, 75.4429)
+               controlPoint2:CGPointMake(26.6639, 75.4429)];
+        [raw addLineToPoint:CGPointMake(49.5739, 42.0189)];
+        [raw addCurveToPoint:CGPointMake(49.5739, 34.7699)
+               controlPoint1:CGPointMake(51.0089, 39.8119)
+               controlPoint2:CGPointMake(51.0089, 36.9769)];
+        [raw closePath];
+        [raw applyTransform:CGAffineTransformMakeTranslation(-25.325, -37.495)];
+        [raw applyTransform:CGAffineTransformMakeScale(1.0 / 74.99, 1.0 / 74.99)];
+        sUnitCentered = raw;
+    });
+    UIBezierPath *p = [sUnitCentered copy];
+    [p applyTransform:CGAffineTransformMakeScale(targetHeight, targetHeight)];
+    [p applyTransform:CGAffineTransformMakeTranslation(center.x, center.y)];
+    return p;
+}
+
 static UIImage *AMPuppetDiamondIcon(BOOL filled) {
-    CGSize sz = CGSizeMake(22.0, 22.0);
+    CGSize sz = CGSizeMake(24.0, 24.0);
     UIGraphicsBeginImageContextWithOptions(sz, NO, 0.0);
-    UIBezierPath *p = [UIBezierPath bezierPath];
-    [p moveToPoint:CGPointMake(11.0, 3.0)];
-    [p addLineToPoint:CGPointMake(19.0, 11.0)];
-    [p addLineToPoint:CGPointMake(11.0, 19.0)];
-    [p addLineToPoint:CGPointMake(3.0, 11.0)];
-    [p closePath];
-    p.lineWidth = 1.8;
+    UIBezierPath *p = AMNativeKeyframeDiamondPathCentered(19.0, CGPointMake(12.0, 12.0));
+    p.lineWidth = 1.6;
     if (filled) {
         [[UIColor whiteColor] setFill];
         [p fill];
@@ -10987,10 +11040,10 @@ static UIImage *AMPuppetDiamondIcon(BOOL filled) {
         [[UIColor whiteColor] setStroke];
         [p stroke];
         UIBezierPath *plus = [UIBezierPath bezierPath];
-        [plus moveToPoint:CGPointMake(8.0, 11.0)];
-        [plus addLineToPoint:CGPointMake(14.0, 11.0)];
-        [plus moveToPoint:CGPointMake(11.0, 8.0)];
-        [plus addLineToPoint:CGPointMake(11.0, 14.0)];
+        [plus moveToPoint:CGPointMake(9.0, 12.0)];
+        [plus addLineToPoint:CGPointMake(15.0, 12.0)];
+        [plus moveToPoint:CGPointMake(12.0, 9.0)];
+        [plus addLineToPoint:CGPointMake(12.0, 15.0)];
         plus.lineWidth = 1.6;
         [plus stroke];
     }
@@ -11351,7 +11404,201 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
 
 @end
 
-// --- Native Alight Motion Easing Graph Editor for Puppet Pin Segments ---
+// --- Shared Alight Motion CompactSideToolVC Keyframe Sidebar (60pt, #202332, #141620 border) ---
+
+@interface AMCompactKeyframeRailView : UIView
+@property (nonatomic, strong, readonly) UIButton *backBtn;
+@property (nonatomic, strong, readonly) UIButton *keyframeBtn;
+@property (nonatomic, strong, readonly) UIButton *graphBtn;
+@property (nonatomic, strong, readonly) UIButton *prevKfBtn;
+@property (nonatomic, strong, readonly) UIButton *nextKfBtn;
+@property (nonatomic, strong, readonly) UIButton *overflowBtn;
+@property (nonatomic, copy) void (^onBack)(void);
+@property (nonatomic, copy) void (^onToggleKeyframe)(void);
+@property (nonatomic, copy) void (^onLongPressKeyframe)(UIView *anchorView);
+@property (nonatomic, copy) void (^onPrevKeyframe)(void);
+@property (nonatomic, copy) void (^onNextKeyframe)(void);
+@property (nonatomic, copy) void (^onGraph)(void);
+@property (nonatomic, copy) void (^onOverflow)(UIView *anchorView);
+- (void)updateWithKeyframeEnabled:(BOOL)kfEnabled
+                      hasKeyframe:(BOOL)hasKf
+                          hasPrev:(BOOL)hasPrev
+                          hasNext:(BOOL)hasNext
+                         canGraph:(BOOL)canGraph
+                     keyframeTint:(UIColor *)tint;
+@end
+
+@implementation AMCompactKeyframeRailView
+
+- (UIButton *)makeIconBtn:(NSString *)asset fallback:(NSString *)sf width:(CGFloat)w height:(CGFloat)h action:(SEL)sel {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImage *img = asset ? [UIImage imageNamed:asset] : nil;
+    if (!img && sf.length > 0) {
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.0 weight:UIImageSymbolWeightMedium];
+            img = [UIImage systemImageNamed:sf withConfiguration:cfg];
+        }
+    }
+    if (img) [b setImage:[img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+    b.tintColor = [UIColor whiteColor];
+    [b.widthAnchor constraintEqualToConstant:w].active = YES;
+    [b.heightAnchor constraintEqualToConstant:h].active = YES;
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor colorWithRed:0.1255 green:0.1373 blue:0.1961 alpha:1.0]; // #202332
+
+        UIView *rightDivider = [[UIView alloc] init];
+        rightDivider.translatesAutoresizingMaskIntoConstraints = NO;
+        rightDivider.backgroundColor = [UIColor colorWithRed:0.0784 green:0.0863 blue:0.1255 alpha:1.0]; // #141620
+        [self addSubview:rightDivider];
+
+        _backBtn = [self makeIconBtn:@"ic_back" fallback:@"chevron.left" width:50.0 height:44.0 action:@selector(handleBack)];
+        _keyframeBtn = [self makeIconBtn:@"ic_add keyframe" fallback:nil width:50.0 height:46.0 action:@selector(handleToggleKf)];
+        if (![_keyframeBtn imageForState:UIControlStateNormal]) {
+            [_keyframeBtn setImage:AMPuppetDiamondIcon(NO) forState:UIControlStateNormal];
+        }
+        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleLongPressKf:)];
+        lp.minimumPressDuration = 0.45;
+        [_keyframeBtn addGestureRecognizer:lp];
+
+        _graphBtn = [self makeIconBtn:@"ic_easing curve" fallback:@"point.topleft.down.curvedto.point.bottomright.up" width:50.0 height:44.0 action:@selector(handleGraph)];
+
+        _prevKfBtn = [self makeIconBtn:@"ic_lh_expand_l" fallback:@"chevron.left" width:24.0 height:24.0 action:@selector(handlePrevKf)];
+        _nextKfBtn = [self makeIconBtn:@"ic_lh_expand_r" fallback:@"chevron.right" width:24.0 height:24.0 action:@selector(handleNextKf)];
+        UIStackView *stepRow = [[UIStackView alloc] initWithArrangedSubviews:@[_prevKfBtn, _nextKfBtn]];
+        stepRow.axis = UILayoutConstraintAxisHorizontal;
+        stepRow.distribution = UIStackViewDistributionFillEqually;
+        stepRow.spacing = 2.0;
+
+        UIStackView *midStack = [[UIStackView alloc] initWithArrangedSubviews:@[_keyframeBtn, _graphBtn, stepRow]];
+        midStack.translatesAutoresizingMaskIntoConstraints = NO;
+        midStack.axis = UILayoutConstraintAxisVertical;
+        midStack.alignment = UIStackViewAlignmentCenter;
+        midStack.spacing = 2.0;
+
+        _overflowBtn = [self makeIconBtn:@"ic_overflow" fallback:@"ellipsis" width:50.0 height:42.0 action:@selector(handleOverflow:)];
+
+        [self addSubview:_backBtn];
+        [self addSubview:midStack];
+        [self addSubview:_overflowBtn];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [rightDivider.topAnchor constraintEqualToAnchor:self.topAnchor],
+            [rightDivider.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+            [rightDivider.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+            [rightDivider.widthAnchor constraintEqualToConstant:0.5],
+
+            [_backBtn.topAnchor constraintEqualToAnchor:self.topAnchor constant:2.0],
+            [_backBtn.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+
+            [midStack.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+            [midStack.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+
+            [_overflowBtn.bottomAnchor constraintEqualToAnchor:self.safeAreaLayoutGuide.bottomAnchor constant:-2.0],
+            [_overflowBtn.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+        ]];
+    }
+    return self;
+}
+
+- (void)handleBack { if (self.onBack) self.onBack(); }
+- (void)handleToggleKf { if (self.onToggleKeyframe) self.onToggleKeyframe(); }
+- (void)handlePrevKf { if (self.onPrevKeyframe) self.onPrevKeyframe(); }
+- (void)handleNextKf { if (self.onNextKeyframe) self.onNextKeyframe(); }
+- (void)handleGraph { if (self.onGraph) self.onGraph(); }
+- (void)handleOverflow:(UIButton *)sender { if (self.onOverflow) self.onOverflow(sender); }
+- (void)handleLongPressKf:(UILongPressGestureRecognizer *)gr {
+    if (gr.state == UIGestureRecognizerStateBegan && self.onLongPressKeyframe) {
+        self.onLongPressKeyframe(_keyframeBtn);
+    }
+}
+
+- (void)updateWithKeyframeEnabled:(BOOL)kfEnabled
+                      hasKeyframe:(BOOL)hasKf
+                          hasPrev:(BOOL)hasPrev
+                          hasNext:(BOOL)hasNext
+                         canGraph:(BOOL)canGraph
+                     keyframeTint:(UIColor *)tint {
+    _keyframeBtn.enabled = kfEnabled;
+    _keyframeBtn.alpha = kfEnabled ? 1.0 : 0.35;
+    if (hasKf) {
+        UIImage *remImg = [UIImage imageNamed:@"ic_remove keyframe"] ?: AMPuppetDiamondIcon(YES);
+        [_keyframeBtn setImage:[remImg imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+        _keyframeBtn.tintColor = tint ?: AMNativeMintColor();
+    } else {
+        UIImage *addImg = [UIImage imageNamed:@"ic_add keyframe"] ?: AMPuppetDiamondIcon(NO);
+        [_keyframeBtn setImage:[addImg imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+        _keyframeBtn.tintColor = [UIColor whiteColor];
+    }
+    _prevKfBtn.enabled = hasPrev; _prevKfBtn.alpha = hasPrev ? 1.0 : 0.30;
+    _nextKfBtn.enabled = hasNext; _nextKfBtn.alpha = hasNext ? 1.0 : 0.30;
+    _graphBtn.enabled = canGraph; _graphBtn.alpha = canGraph ? 1.0 : 0.35;
+    _graphBtn.tintColor = canGraph ? [UIColor whiteColor] : [UIColor colorWithWhite:0.7 alpha:1.0];
+}
+
+@end
+
+static void AMPresentKeyframeActionMenu(UIViewController *vc,
+                                        UIView *anchor,
+                                        NSString *title,
+                                        BOOL hasKfAtPlayhead,
+                                        BOOL hasCopiedKf,
+                                        BOOL hasPrev,
+                                        BOOL hasNext,
+                                        BOOL hasAnyKf,
+                                        void (^onCopy)(void),
+                                        void (^onPaste)(void),
+                                        void (^onDelete)(void),
+                                        void (^onPrev)(void),
+                                        void (^onNext)(void),
+                                        void (^onClearAll)(void)) {
+    if (!vc) return;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    if (onCopy) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"Copy Keyframe Value" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            (void)a; onCopy();
+        }]];
+    }
+    if (hasCopiedKf && onPaste) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"Paste Keyframe Value" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            (void)a; onPaste();
+        }]];
+    }
+    if (hasPrev && onPrev) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"Jump to Previous Keyframe" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            (void)a; onPrev();
+        }]];
+    }
+    if (hasNext && onNext) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"Jump to Next Keyframe" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            (void)a; onNext();
+        }]];
+    }
+    if (hasKfAtPlayhead && onDelete) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"Delete Keyframe" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+            (void)a; onDelete();
+        }]];
+    }
+    if (hasAnyKf && onClearAll) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"Clear All Keyframes" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+            (void)a; onClearAll();
+        }]];
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    if (ac.popoverPresentationController && anchor) {
+        ac.popoverPresentationController.sourceView = anchor;
+        ac.popoverPresentationController.sourceRect = anchor.bounds;
+    }
+    [vc presentViewController:ac animated:YES completion:nil];
+}
+
+// --- Native Alight Motion EasingGraphView + EditEasingPanelVC Shared Implementation ---
 
 @interface AMPuppetGraphCanvasView : UIView
 @property (nonatomic, assign) int easingType; // 0=Cubic, 1=Step, 2=Elastic, 3=Bounce
@@ -11366,15 +11613,15 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
 @end
 
 @implementation AMPuppetGraphCanvasView {
-    int _dragHandle; // 0 = none, 1 = P1, 2 = P2
+    int _dragHandle; // 0=none, 1=P1 (or Physical P1), 2=P2
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
-        self.backgroundColor = AMInputSurfaceColor();
-        self.layer.cornerRadius = 8.0;
-        self.clipsToBounds = YES;
+        // EditEasingPanelVC lets the graph float directly on the #3F4361 canvas background
+        self.backgroundColor = [UIColor clearColor];
+        self.clipsToBounds = NO;
         _p1x = 0.42f; _p1y = 0.0f;
         _p2x = 0.58f; _p2y = 1.0f;
         _stepCount = 4.0f;
@@ -11384,41 +11631,53 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     return self;
 }
 
-- (CGRect)plotRect {
-    CGFloat padX = 18.0;
-    CGFloat padY = self.allowOvershoot ? 34.0 : 16.0;
-    return CGRectInset(self.bounds, padX, padY);
+- (CGRect)unitBoxRect {
+    // easingEditorMargin = 15.0 horizontally; Y covers minValue (-0.25) .. maxValue (1.25) when overshoot enabled
+    CGFloat w = MAX(20.0, self.bounds.size.width - 30.0);
+    CGFloat totalH = MAX(20.0, self.bounds.size.height - 20.0);
+    if (!self.allowOvershoot) {
+        return CGRectMake(15.0, 10.0, w, totalH);
+    }
+    // 0..1 occupies center 2/3 of [-0.25 .. 1.25] span
+    CGFloat unitH = totalH / 1.5;
+    CGFloat yTop1 = 10.0 + 0.25 * unitH;
+    return CGRectMake(15.0, yTop1, w, unitH);
 }
 
 - (CGPoint)ptForNormX:(float)nx y:(float)ny {
-    CGRect r = [self plotRect];
+    CGRect r = [self unitBoxRect];
     return CGPointMake(r.origin.x + nx * r.size.width,
                        r.origin.y + (1.0f - ny) * r.size.height);
 }
 
 - (CGPoint)normForPt:(CGPoint)pt {
-    CGRect r = [self plotRect];
+    CGRect r = [self unitBoxRect];
     float nx = (float)((pt.x - r.origin.x) / fmax(r.size.width, 1.0));
     float ny = (float)(1.0 - (pt.y - r.origin.y) / fmax(r.size.height, 1.0));
     nx = fminf(fmaxf(nx, 0.0f), 1.0f);
-    float yMin = self.allowOvershoot ? -0.55f : 0.0f;
-    float yMax = self.allowOvershoot ? 1.55f : 1.0f;
+    float yMin = self.allowOvershoot ? -0.25f : 0.0f;
+    float yMax = self.allowOvershoot ? 1.25f : 1.0f;
     ny = fminf(fmaxf(ny, yMin), yMax);
     return CGPointMake(nx, ny);
 }
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     (void)event;
-    if (self.easingType != 0 && self.easingType != 2) return;
+    if (self.easingType == 1) return; // Step mode has no bezier drag handle
     UITouch *t = [touches anyObject];
     if (!t) return;
     CGPoint pt = [t locationInView:self];
+    if (self.easingType == 2 || self.easingType == 3) {
+        _dragHandle = 1;
+        [self updateHandleFromPoint:pt ended:NO];
+        return;
+    }
     CGPoint h1 = [self ptForNormX:self.p1x y:self.p1y];
     CGPoint h2 = [self ptForNormX:self.p2x y:self.p2y];
     CGFloat d1 = hypot(pt.x - h1.x, pt.y - h1.y);
     CGFloat d2 = hypot(pt.x - h2.x, pt.y - h2.y);
-    if (d1 <= 32.0 && d1 <= d2) _dragHandle = 1;
-    else if (d2 <= 32.0) _dragHandle = 2;
+    if (d1 <= 36.0 && d1 <= d2) _dragHandle = 1;
+    else if (d2 <= 36.0) _dragHandle = 2;
     else _dragHandle = (d1 < d2) ? 1 : 2;
     [self updateHandleFromPoint:pt ended:NO];
 }
@@ -11437,16 +11696,21 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     UITouch *t = [touches anyObject];
     if (t) [self updateHandleFromPoint:[t locationInView:self] ended:YES];
     _dragHandle = 0;
+    [self setNeedsDisplay];
 }
 
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     (void)touches; (void)event;
     _dragHandle = 0;
+    [self setNeedsDisplay];
 }
 
 - (void)updateHandleFromPoint:(CGPoint)pt ended:(BOOL)ended {
     CGPoint n = [self normForPt:pt];
-    if (_dragHandle == 1) {
+    if (self.easingType == 2 || self.easingType == 3) {
+        self.p1x = (float)n.x;
+        self.p2x = fminf(fmaxf((float)n.y, 0.0f), 1.0f);
+    } else if (_dragHandle == 1) {
         self.p1x = (float)n.x;
         self.p1y = (float)n.y;
     } else if (_dragHandle == 2) {
@@ -11461,27 +11725,54 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     (void)rect;
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;
-    CGRect r = [self plotRect];
+    CGRect r = [self unitBoxRect];
+    CGFloat minYVal = self.allowOvershoot ? -0.25 : 0.0;
+    CGFloat maxYVal = self.allowOvershoot ? 1.25 : 1.0;
+    CGFloat topPx = r.origin.y + (1.0 - maxYVal) * r.size.height;
+    CGFloat botPx = r.origin.y + (1.0 - minYVal) * r.size.height;
 
-    // Gridlines (4x4 matching Alight Motion EasingGraphView)
-    [[UIColor colorWithWhite:1.0 alpha:0.08] setStroke];
-    CGContextSetLineWidth(ctx, 1.0);
-    for (int i = 0; i <= 4; ++i) {
-        CGFloat f = (CGFloat)i / 4.0;
+    // 32x32 Alight Motion gridlines (major every 8 cells = 1.0pt, minor = 0.5pt; white@0.06 main, white@0.03 overshoot)
+    CGContextSaveGState(ctx);
+    for (int i = 0; i <= 32; ++i) {
+        BOOL major = (i % 8 == 0);
+        CGFloat f = (CGFloat)i / 32.0;
         CGFloat x = r.origin.x + f * r.size.width;
-        CGFloat y = r.origin.y + f * r.size.height;
-        CGContextMoveToPoint(ctx, x, self.bounds.origin.y);
-        CGContextAddLineToPoint(ctx, x, CGRectGetMaxY(self.bounds));
+        [[UIColor colorWithWhite:1.0 alpha:0.06] setStroke];
+        CGContextSetLineWidth(ctx, major ? 1.0 : 0.5);
+        CGContextMoveToPoint(ctx, x, topPx);
+        CGContextAddLineToPoint(ctx, x, botPx);
+        CGContextStrokePath(ctx);
+
+        CGFloat yVal = 1.0 - f;
+        CGFloat y = r.origin.y + (1.0 - yVal) * r.size.height;
+        [[UIColor colorWithWhite:1.0 alpha:0.06] setStroke];
+        CGContextSetLineWidth(ctx, major ? 1.0 : 0.5);
         CGContextMoveToPoint(ctx, r.origin.x, y);
         CGContextAddLineToPoint(ctx, CGRectGetMaxX(r), y);
+        CGContextStrokePath(ctx);
     }
-    CGContextStrokePath(ctx);
+    if (self.allowOvershoot) {
+        [[UIColor colorWithWhite:1.0 alpha:0.03] setStroke];
+        for (int k = 1; k <= 8; ++k) {
+            BOOL major = (k % 8 == 0);
+            CGContextSetLineWidth(ctx, major ? 1.0 : 0.5);
+            CGFloat upY = r.origin.y - ((CGFloat)k / 32.0) * r.size.height;
+            CGFloat dnY = CGRectGetMaxY(r) + ((CGFloat)k / 32.0) * r.size.height;
+            CGContextMoveToPoint(ctx, r.origin.x, upY);
+            CGContextAddLineToPoint(ctx, CGRectGetMaxX(r), upY);
+            CGContextMoveToPoint(ctx, r.origin.x, dnY);
+            CGContextAddLineToPoint(ctx, CGRectGetMaxX(r), dnY);
+            CGContextStrokePath(ctx);
+        }
+    }
+    CGContextRestoreGState(ctx);
 
-    // Dashed y=0 and y=1 overshoot bounds
+    // Dashed y=0 and y=1 bounds (white @ 0.25)
     CGContextSaveGState(ctx);
     CGFloat dash[] = {4.0, 4.0};
     CGContextSetLineDash(ctx, 0.0, dash, 2);
     [[UIColor colorWithWhite:1.0 alpha:0.25] setStroke];
+    CGContextSetLineWidth(ctx, 1.0);
     CGContextMoveToPoint(ctx, r.origin.x, r.origin.y);
     CGContextAddLineToPoint(ctx, CGRectGetMaxX(r), r.origin.y);
     CGContextMoveToPoint(ctx, r.origin.x, CGRectGetMaxY(r));
@@ -11489,27 +11780,27 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     CGContextStrokePath(ctx);
     CGContextRestoreGState(ctx);
 
-    // Vertical playhead progress guide
+    // Vertical white dashed playhead line
     if (self.playheadU >= 0.0f && self.playheadU <= 1.0f) {
         CGFloat px = r.origin.x + self.playheadU * r.size.width;
         CGContextSaveGState(ctx);
-        CGFloat pdash[] = {3.0, 3.0};
+        CGFloat pdash[] = {4.0, 4.0};
         CGContextSetLineDash(ctx, 0.0, pdash, 2);
-        [[AMAccentGreenColor() colorWithAlphaComponent:0.85] setStroke];
-        CGContextSetLineWidth(ctx, 1.4);
-        CGContextMoveToPoint(ctx, px, 0.0);
-        CGContextAddLineToPoint(ctx, px, self.bounds.size.height);
+        [[UIColor colorWithWhite:1.0 alpha:0.65] setStroke];
+        CGContextSetLineWidth(ctx, 1.2);
+        CGContextMoveToPoint(ctx, px, topPx);
+        CGContextAddLineToPoint(ctx, px, botPx);
         CGContextStrokePath(ctx);
         CGContextRestoreGState(ctx);
     }
 
-    // Easing Curve
+    // Main Easing Curve in exact Alight Motion Y1 (#00FFA8) @ 3.0pt
     CGContextSaveGState(ctx);
-    [[UIColor whiteColor] setStroke];
-    CGContextSetLineWidth(ctx, 2.4);
+    [AMNativeMintColor() setStroke];
+    CGContextSetLineWidth(ctx, 3.0);
     CGContextSetLineCap(ctx, kCGLineCapRound);
     CGContextSetLineJoin(ctx, kCGLineJoinRound);
-    int steps = 72;
+    const int steps = 96;
     for (int i = 0; i <= steps; ++i) {
         float u = (float)i / (float)steps;
         float e = AMPuppetEvalEasing(self.easingType, self.p1x, self.p1y, self.p2x, self.p2y, self.stepCount, u);
@@ -11520,20 +11811,32 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     CGContextStrokePath(ctx);
     CGContextRestoreGState(ctx);
 
-    // Endpoints (mint green like Alight Motion EasingGraphView)
+    // Live playhead dot on the curve
+    if (self.playheadU >= 0.0f && self.playheadU <= 1.0f) {
+        float pe = AMPuppetEvalEasing(self.easingType, self.p1x, self.p1y, self.p2x, self.p2y, self.stepCount, self.playheadU);
+        CGPoint dotPt = [self ptForNormX:self.playheadU y:pe];
+        [[UIColor whiteColor] setFill];
+        CGContextFillEllipseInRect(ctx, CGRectMake(dotPt.x - 4.0, dotPt.y - 4.0, 8.0, 8.0));
+        [AMNativeMintColor() setStroke];
+        CGContextSetLineWidth(ctx, 1.5);
+        CGContextStrokeEllipseInRect(ctx, CGRectMake(dotPt.x - 4.0, dotPt.y - 4.0, 8.0, 8.0));
+    }
+
+    // Endpoints (6x6 white dots)
     CGPoint p0 = [self ptForNormX:0.0f y:0.0f];
     CGPoint p3 = [self ptForNormX:1.0f y:1.0f];
-    [AMAccentGreenColor() setFill];
-    CGContextFillEllipseInRect(ctx, CGRectMake(p0.x - 4.5, p0.y - 4.5, 9.0, 9.0));
-    CGContextFillEllipseInRect(ctx, CGRectMake(p3.x - 4.5, p3.y - 4.5, 9.0, 9.0));
+    [[UIColor whiteColor] setFill];
+    CGContextFillEllipseInRect(ctx, CGRectMake(p0.x - 3.0, p0.y - 3.0, 6.0, 6.0));
+    CGContextFillEllipseInRect(ctx, CGRectMake(p3.x - 3.0, p3.y - 3.0, 6.0, 6.0));
 
-    // Draggable P1/P2 Tangent Handles (for Cubic Bezier & Elastic modes)
-    if (self.easingType == 0 || self.easingType == 2) {
+    if (self.easingType == 0) {
+        // White tangent stems + exact 24pt (r=12) solid white tangent handle circles
         CGPoint h1 = [self ptForNormX:self.p1x y:self.p1y];
         CGPoint h2 = [self ptForNormX:self.p2x y:self.p2y];
 
-        [[AMAccentGreenColor() colorWithAlphaComponent:0.85] setStroke];
-        CGContextSetLineWidth(ctx, 1.6);
+        [[UIColor whiteColor] setStroke];
+        CGContextSetLineWidth(ctx, 2.5);
+        CGContextSetLineCap(ctx, kCGLineCapRound);
         CGContextMoveToPoint(ctx, p0.x, p0.y);
         CGContextAddLineToPoint(ctx, h1.x, h1.y);
         CGContextMoveToPoint(ctx, p3.x, p3.y);
@@ -11543,114 +11846,246 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
         for (int h = 1; h <= 2; ++h) {
             CGPoint hp = (h == 1) ? h1 : h2;
             BOOL active = (_dragHandle == h);
-            CGFloat rad = active ? 9.0 : 7.5;
+            CGFloat rad = active ? 13.0 : 12.0;
             [[UIColor whiteColor] setFill];
             CGContextFillEllipseInRect(ctx, CGRectMake(hp.x - rad, hp.y - rad, rad * 2.0, rad * 2.0));
-            [AMAccentGreenColor() setStroke];
-            CGContextSetLineWidth(ctx, 2.0);
-            CGContextStrokeEllipseInRect(ctx, CGRectMake(hp.x - rad, hp.y - rad, rad * 2.0, rad * 2.0));
+            if (active) {
+                [AMNativeMintColor() setStroke];
+                CGContextSetLineWidth(ctx, 2.0);
+                CGContextStrokeEllipseInRect(ctx, CGRectMake(hp.x - rad, hp.y - rad, rad * 2.0, rad * 2.0));
+            }
         }
+    } else if (self.easingType == 2 || self.easingType == 3) {
+        // Physical curve single draggable dot matching Alight Motion Bounce/Elastic UI
+        CGPoint hp = [self ptForNormX:self.p1x y:self.p2x];
+        CGFloat rad = (_dragHandle == 1) ? 11.5 : 10.0;
+        [[UIColor colorWithRed:1.0 green:0.84 blue:0.28 alpha:1.0] setFill];
+        CGContextFillEllipseInRect(ctx, CGRectMake(hp.x - rad, hp.y - rad, rad * 2.0, rad * 2.0));
+        [[UIColor whiteColor] setStroke];
+        CGContextSetLineWidth(ctx, 2.0);
+        CGContextStrokeEllipseInRect(ctx, CGRectMake(hp.x - rad, hp.y - rad, rad * 2.0, rad * 2.0));
     }
 }
 
 @end
 
-@interface AMPuppetGraphPanelVC : UIViewController
+// --- Shared EditEasingPanelVC Clone (used by Puppet Pins & 3D Rotate) ---
+
+@interface AMEasingCueTriangleView : UIView
+@end
+@implementation AMEasingCueTriangleView
+- (void)drawRect:(CGRect)rect {
+    (void)rect;
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) return;
+    CGRect b = self.bounds;
+    [AMNativeMintColor() setFill];
+    CGContextMoveToPoint(ctx, 0.0, b.size.height * 0.5);
+    CGContextAddLineToPoint(ctx, b.size.width, 0.0);
+    CGContextAddLineToPoint(ctx, b.size.width, b.size.height);
+    CGContextClosePath(ctx);
+    CGContextFillPath(ctx);
+}
+@end
+
+@interface AMEasingGraphPanelVC : UIViewController
 @property (nonatomic, assign) int slot;
-@property (nonatomic, assign) NSInteger pinIndex;
 @property (nonatomic, assign) NSInteger keyframeIndex;
 @property (nonatomic, assign) void *holder;
+@property (nonatomic, copy) NSString *subjectTitle;
+@property (nonatomic, copy) NSMutableArray * (^keyframesProvider)(void);
+@property (nonatomic, copy) void (^onPersistSave)(BOOL saveDisk);
 @property (nonatomic, copy) void (^onDidModify)(void);
 @property (nonatomic, copy) void (^onRequestSeekMs)(int64_t timeMs);
 @end
 
-@implementation AMPuppetGraphPanelVC {
+@implementation AMEasingGraphPanelVC {
     AMPuppetGraphCanvasView *_graphView;
     UILabel *_infoLabel;
     UIButton *_prevBtn;
     UIButton *_nextBtn;
-    UIStackView *_presetStack;
+    UIStackView *_detailStack;
+    UIButton *_catBtns[3]; // 0=Cubic, 1=Physical, 2=Step
+    AMEasingCueTriangleView *_catCues[3];
+    NSMutableArray<UIButton *> *_detailBtns;
+    NSInteger _activeCategory;
     NSTimer *_syncTimer;
 }
 
-- (NSMutableDictionary *)currentPinDict {
-    NSMutableDictionary *ld = [[AMPuppetStore shared] layerDictForSlot:self.slot create:NO elementId:0];
-    NSArray *pins = ld[@"pins"];
-    if (self.pinIndex >= 0 && self.pinIndex < (NSInteger)pins.count) {
-        return pins[self.pinIndex];
-    }
-    return nil;
+- (NSMutableArray *)keyframesArray {
+    return self.keyframesProvider ? self.keyframesProvider() : nil;
 }
 
 - (NSMutableDictionary *)currentKeyframeDict {
-    NSMutableDictionary *pd = [self currentPinDict];
-    NSArray *kfs = pd[@"keyframes"];
+    NSArray *kfs = [self keyframesArray];
     if (self.keyframeIndex >= 0 && self.keyframeIndex + 1 < (NSInteger)kfs.count) {
         return kfs[self.keyframeIndex];
     }
     return nil;
 }
 
+- (UIImage *)presetGlyphFallbackForKey:(NSString *)key {
+    CGSize sz = CGSizeMake(24.0, 20.0);
+    UIGraphicsBeginImageContextWithOptions(sz, NO, 0.0);
+    UIBezierPath *p = [UIBezierPath bezierPath];
+    p.lineWidth = 2.0;
+    p.lineCapStyle = kCGLineCapRound;
+    p.lineJoinStyle = kCGLineJoinRound;
+    if ([key isEqualToString:@"linear"]) {
+        [p moveToPoint:CGPointMake(3, 17)]; [p addLineToPoint:CGPointMake(21, 3)];
+    } else if ([key isEqualToString:@"easein"]) {
+        [p moveToPoint:CGPointMake(3, 17)];
+        [p addCurveToPoint:CGPointMake(21, 3) controlPoint1:CGPointMake(12, 17) controlPoint2:CGPointMake(21, 10)];
+    } else if ([key isEqualToString:@"easeout"]) {
+        [p moveToPoint:CGPointMake(3, 17)];
+        [p addCurveToPoint:CGPointMake(21, 3) controlPoint1:CGPointMake(3, 10) controlPoint2:CGPointMake(12, 3)];
+    } else if ([key isEqualToString:@"easeinout"]) {
+        [p moveToPoint:CGPointMake(3, 17)];
+        [p addCurveToPoint:CGPointMake(21, 3) controlPoint1:CGPointMake(12, 17) controlPoint2:CGPointMake(12, 3)];
+    } else if ([key isEqualToString:@"overshoot"]) {
+        [p moveToPoint:CGPointMake(3, 17)];
+        [p addCurveToPoint:CGPointMake(21, 6) controlPoint1:CGPointMake(10, 1) controlPoint2:CGPointMake(16, 4)];
+    } else if ([key isEqualToString:@"bounce"]) {
+        [p moveToPoint:CGPointMake(3, 17)];
+        [p addQuadCurveToPoint:CGPointMake(12, 17) controlPoint:CGPointMake(7.5, 4)];
+        [p addQuadCurveToPoint:CGPointMake(18, 17) controlPoint:CGPointMake(15, 10)];
+        [p addQuadCurveToPoint:CGPointMake(21, 17) controlPoint:CGPointMake(19.5, 14)];
+    } else {
+        [p moveToPoint:CGPointMake(3, 17)]; [p addLineToPoint:CGPointMake(9, 17)];
+        [p addLineToPoint:CGPointMake(9, 10)]; [p addLineToPoint:CGPointMake(15, 10)];
+        [p addLineToPoint:CGPointMake(15, 3)]; [p addLineToPoint:CGPointMake(21, 3)];
+    }
+    [[UIColor whiteColor] setStroke];
+    [p stroke];
+    UIImage *res = [UIGraphicsGetImageFromCurrentImageContext() imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    UIGraphicsEndImageContext();
+    return res;
+}
+
+- (UIButton *)makeIconBtn:(NSString *)asset sf:(NSString *)sf width:(CGFloat)w height:(CGFloat)h action:(SEL)sel {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImage *img = asset ? [UIImage imageNamed:asset] : nil;
+    if (!img && sf.length > 0) {
+        if (@available(iOS 13.0, *)) {
+            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:14.0 weight:UIImageSymbolWeightMedium];
+            img = [UIImage systemImageNamed:sf withConfiguration:cfg];
+        }
+    }
+    if (img) [b setImage:[img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+    b.tintColor = [UIColor whiteColor];
+    [b.widthAnchor constraintEqualToConstant:w].active = YES;
+    [b.heightAnchor constraintEqualToConstant:h].active = YES;
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (NSArray<NSDictionary *> *)presetsForCategory:(NSInteger)cat {
+    if (cat == 1) {
+        return @[
+            @{@"name": @"Elastic",  @"asset": @"ic_easingcurve_elastic",    @"glyph": @"overshoot", @"type": @2, @"p1x": @0.35, @"p1y": @0.0, @"p2x": @0.45, @"p2y": @1.0},
+            @{@"name": @"Bounce",   @"asset": @"ic_easingcurve_wave",       @"glyph": @"bounce",    @"type": @3, @"p1x": @0.0,  @"p1y": @0.0, @"p2x": @1.0,  @"p2y": @1.0},
+            @{@"name": @"Spring",   @"asset": @"ic_easingcurve_turbulence", @"glyph": @"overshoot", @"type": @2, @"p1x": @0.55, @"p1y": @0.0, @"p2x": @0.25, @"p2y": @1.0},
+            @{@"name": @"Snap",     @"asset": @"ic_easingcurve_easeout",    @"glyph": @"overshoot", @"type": @0, @"p1x": @0.16, @"p1y": @1.0, @"p2x": @0.30, @"p2y": @1.0},
+        ];
+    }
+    if (cat == 2) {
+        return @[
+            @{@"name": @"Hold",     @"asset": @"ic_easingcurve_elastic-step", @"glyph": @"step", @"type": @1, @"p1x": @0.0, @"p1y": @0.0, @"p2x": @1.0, @"p2y": @1.0, @"steps": @1.0},
+            @{@"name": @"Steps 4",  @"asset": @"ic_easingcurve_elastic-step", @"glyph": @"step", @"type": @1, @"p1x": @0.0, @"p1y": @0.0, @"p2x": @1.0, @"p2y": @1.0, @"steps": @4.0},
+            @{@"name": @"Steps 8",  @"asset": @"ic_easingcurve_elastic-step", @"glyph": @"step", @"type": @1, @"p1x": @0.0, @"p1y": @0.0, @"p2x": @1.0, @"p2y": @1.0, @"steps": @8.0},
+        ];
+    }
+    return @[
+        @{@"name": @"Linear",    @"asset": @"ic_easingcurve_linear",    @"glyph": @"linear",    @"type": @0, @"p1x": @0.0,  @"p1y": @0.0,  @"p2x": @1.0,  @"p2y": @1.0},
+        @{@"name": @"Ease In",   @"asset": @"ic_easingcurve_easein",    @"glyph": @"easein",    @"type": @0, @"p1x": @0.42, @"p1y": @0.0,  @"p2x": @1.0,  @"p2y": @1.0},
+        @{@"name": @"Ease Out",  @"asset": @"ic_easingcurve_easeout",   @"glyph": @"easeout",   @"type": @0, @"p1x": @0.0,  @"p1y": @0.0,  @"p2x": @0.58, @"p2y": @1.0},
+        @{@"name": @"In-Out",    @"asset": @"ic_easingcurve_easeinout", @"glyph": @"easeinout", @"type": @0, @"p1x": @0.42, @"p1y": @0.0,  @"p2x": @0.58, @"p2y": @1.0},
+        @{@"name": @"Overshoot", @"asset": @"ic_easingcurve_elastic",   @"glyph": @"overshoot", @"type": @0, @"p1x": @0.34, @"p1y": @1.45, @"p2x": @0.64, @"p2y": @1.0},
+    ];
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = AMBgColor();
+    _detailBtns = [NSMutableArray array];
+    // Exact EditEasingPanelVC root color #3F4361
+    self.view.backgroundColor = [UIColor colorWithRed:0.2471 green:0.2627 blue:0.3804 alpha:1.0];
 
-    // Left vertical tool rail (matching EditEasingPanelVC: Back, Reverse, Overflow)
+    // Left rail: 52pt wide, #333750 (Back at top; Reverse + Overflow at bottom)
     UIView *leftRail = [[UIView alloc] init];
     leftRail.translatesAutoresizingMaskIntoConstraints = NO;
-    leftRail.backgroundColor = [UIColor colorWithRed:0.114 green:0.122 blue:0.176 alpha:1.0];
+    leftRail.backgroundColor = [UIColor colorWithRed:0.2000 green:0.2157 blue:0.3137 alpha:1.0];
     [self.view addSubview:leftRail];
 
-    UIButton *backBtn = [self makeIconButton:@"ic_back" fallback:@"chevron.left" action:@selector(onTapBack)];
-    UIButton *revBtn = [self makeIconButton:@"ic_reverse" fallback:@"arrow.left.arrow.right" action:@selector(onTapReverse)];
-    UIButton *moreBtn = [self makeIconButton:@"ic_overflow" fallback:@"ellipsis" action:@selector(onTapOverflow:)];
+    UIButton *backBtn = [self makeIconBtn:@"ic_back" sf:@"chevron.left" width:52.0 height:50.0 action:@selector(onTapBack)];
+    UIButton *revBtn = [self makeIconBtn:@"ic_reverse" sf:@"arrow.left.arrow.right" width:40.0 height:45.0 action:@selector(onTapReverse)];
+    UIButton *moreBtn = [self makeIconBtn:@"ic_overflow" sf:@"ellipsis" width:52.0 height:50.0 action:@selector(onTapOverflow:)];
 
-    UIStackView *leftStack = [[UIStackView alloc] initWithArrangedSubviews:@[backBtn, revBtn, moreBtn]];
-    leftStack.translatesAutoresizingMaskIntoConstraints = NO;
-    leftStack.axis = UILayoutConstraintAxisVertical;
-    leftStack.distribution = UIStackViewDistributionEqualSpacing;
-    leftStack.alignment = UIStackViewAlignmentCenter;
-    [leftRail addSubview:leftStack];
+    UIStackView *leftBotStack = [[UIStackView alloc] initWithArrangedSubviews:@[revBtn, moreBtn]];
+    leftBotStack.translatesAutoresizingMaskIntoConstraints = NO;
+    leftBotStack.axis = UILayoutConstraintAxisVertical;
+    leftBotStack.alignment = UIStackViewAlignmentCenter;
+    leftBotStack.spacing = 2.0;
 
-    // Right preset column (Linear, Ease In, Ease Out, Ease In-Out, Overshoot, Bounce, Step)
-    UIScrollView *rightScroll = [[UIScrollView alloc] init];
-    rightScroll.translatesAutoresizingMaskIntoConstraints = NO;
-    rightScroll.showsVerticalScrollIndicator = NO;
-    [self.view addSubview:rightScroll];
+    [leftRail addSubview:backBtn];
+    [leftRail addSubview:leftBotStack];
 
-    _presetStack = [[UIStackView alloc] init];
-    _presetStack.translatesAutoresizingMaskIntoConstraints = NO;
-    _presetStack.axis = UILayoutConstraintAxisVertical;
-    _presetStack.spacing = 6.0;
-    [rightScroll addSubview:_presetStack];
+    // Right 2-column preset panel (94pt = 42pt detail + 52pt categories)
+    UIView *rightWrap = [[UIView alloc] init];
+    rightWrap.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:rightWrap];
 
-    NSArray<NSDictionary *> *presets = @[
-        @{@"t": @"Linear",   @"type": @0, @"p1x": @0.0,  @"p1y": @0.0,  @"p2x": @1.0,  @"p2y": @1.0},
-        @{@"t": @"Ease In",  @"type": @0, @"p1x": @0.42, @"p1y": @0.0,  @"p2x": @1.0,  @"p2y": @1.0},
-        @{@"t": @"Ease Out", @"type": @0, @"p1x": @0.0,  @"p1y": @0.0,  @"p2x": @0.58, @"p2y": @1.0},
-        @{@"t": @"In-Out",   @"type": @0, @"p1x": @0.42, @"p1y": @0.0,  @"p2x": @0.58, @"p2y": @1.0},
-        @{@"t": @"Snap",     @"type": @0, @"p1x": @0.16, @"p1y": @1.0,  @"p2x": @0.30, @"p2y": @1.0},
-        @{@"t": @"Overshoot",@"type": @0, @"p1x": @0.34, @"p1y": @1.45, @"p2x": @0.64, @"p2y": @1.0},
-        @{@"t": @"Elastic",  @"type": @2, @"p1x": @0.35, @"p1y": @0.0,  @"p2x": @0.45, @"p2y": @1.0},
-        @{@"t": @"Bounce",   @"type": @3, @"p1x": @0.0,  @"p1y": @0.0,  @"p2x": @1.0,  @"p2y": @1.0},
-        @{@"t": @"Hold",     @"type": @1, @"p1x": @0.0,  @"p1y": @0.0,  @"p2x": @1.0,  @"p2y": @1.0, @"steps": @1.0},
-        @{@"t": @"Steps 4",  @"type": @1, @"p1x": @0.0,  @"p1y": @0.0,  @"p2x": @1.0,  @"p2y": @1.0, @"steps": @4.0},
-    ];
-    for (NSUInteger i = 0; i < presets.count; ++i) {
-        UIButton *pb = [UIButton buttonWithType:UIButtonTypeSystem];
-        pb.tag = (NSInteger)i;
-        pb.backgroundColor = AMSurfaceColor();
-        pb.layer.cornerRadius = 6.0;
-        [pb setTitle:presets[i][@"t"] forState:UIControlStateNormal];
-        [pb setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        pb.titleLabel.font = AMThemeFont(11.0, UIFontWeightSemibold);
-        [pb.heightAnchor constraintEqualToConstant:28.0].active = YES;
-        objc_setAssociatedObject(pb, @selector(onTapPreset:), presets[i], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [pb addTarget:self action:@selector(onTapPreset:) forControlEvents:UIControlEventTouchUpInside];
-        [_presetStack addArrangedSubview:pb];
+    UIScrollView *detailCol = [[UIScrollView alloc] init];
+    detailCol.translatesAutoresizingMaskIntoConstraints = NO;
+    detailCol.backgroundColor = [UIColor colorWithRed:0.2000 green:0.2157 blue:0.3137 alpha:1.0]; // #333750
+    detailCol.showsVerticalScrollIndicator = NO;
+    [rightWrap addSubview:detailCol];
+
+    _detailStack = [[UIStackView alloc] init];
+    _detailStack.translatesAutoresizingMaskIntoConstraints = NO;
+    _detailStack.axis = UILayoutConstraintAxisVertical;
+    _detailStack.spacing = 0.0;
+    [detailCol addSubview:_detailStack];
+
+    UIView *catCol = [[UIView alloc] init];
+    catCol.translatesAutoresizingMaskIntoConstraints = NO;
+    catCol.backgroundColor = [UIColor colorWithRed:0.1255 green:0.1373 blue:0.1961 alpha:1.0]; // #202332
+    [rightWrap addSubview:catCol];
+
+    NSArray<NSString *> *catAssets = @[@"ic_easingcurve_category_cubic", @"ic_easingcurve_category_physical", @"ic_easingcurve_category_step"];
+    NSArray<NSString *> *catFallbackSF = @[@"point.topleft.down.curvedto.point.bottomright.up", @"waveform.path", @"chart.bar.xaxis"];
+    UIStackView *catStack = [[UIStackView alloc] init];
+    catStack.translatesAutoresizingMaskIntoConstraints = NO;
+    catStack.axis = UILayoutConstraintAxisVertical;
+    catStack.distribution = UIStackViewDistributionEqualSpacing;
+    catStack.alignment = UIStackViewAlignmentCenter;
+    [catCol addSubview:catStack];
+
+    for (int c = 0; c < 3; ++c) {
+        UIButton *cb = [self makeIconBtn:catAssets[c] sf:catFallbackSF[c] width:40.0 height:54.0 action:@selector(onTapCategory:)];
+        cb.tag = c;
+        cb.backgroundColor = [UIColor colorWithRed:0.0784 green:0.0863 blue:0.1255 alpha:1.0]; // #141620
+        cb.layer.cornerRadius = 5.28;
+        cb.clipsToBounds = YES;
+        _catBtns[c] = cb;
+        [catStack addArrangedSubview:cb];
+
+        AMEasingCueTriangleView *cue = [[AMEasingCueTriangleView alloc] init];
+        cue.translatesAutoresizingMaskIntoConstraints = NO;
+        cue.backgroundColor = [UIColor clearColor];
+        cue.userInteractionEnabled = NO;
+        [rightWrap addSubview:cue];
+        _catCues[c] = cue;
+
+        [NSLayoutConstraint activateConstraints:@[
+            [cue.widthAnchor constraintEqualToConstant:5.0],
+            [cue.heightAnchor constraintEqualToConstant:8.0],
+            [cue.trailingAnchor constraintEqualToAnchor:catCol.leadingAnchor],
+            [cue.centerYAnchor constraintEqualToAnchor:cb.centerYAnchor],
+        ]];
     }
 
-    // Center Graph Canvas + Bottom Segment Navigator (< Segment 1/2 >)
+    // Center EasingGraphView + bottom 39pt navigation bar (< info >)
     _graphView = [[AMPuppetGraphCanvasView alloc] init];
     _graphView.translatesAutoresizingMaskIntoConstraints = NO;
     __weak __typeof__(self) weakSelf = self;
@@ -11663,12 +12098,12 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     bottomBar.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:bottomBar];
 
-    _prevBtn = [self makeIconButton:nil fallback:@"chevron.left" action:@selector(onTapPrevSeg)];
-    _nextBtn = [self makeIconButton:nil fallback:@"chevron.right" action:@selector(onTapNextSeg)];
+    _prevBtn = [self makeIconBtn:@"ic_lh_expand_l" sf:@"chevron.left" width:42.0 height:39.0 action:@selector(onTapPrevSeg)];
+    _nextBtn = [self makeIconBtn:@"ic_lh_expand_r" sf:@"chevron.right" width:42.0 height:39.0 action:@selector(onTapNextSeg)];
     _infoLabel = [[UILabel alloc] init];
     _infoLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    _infoLabel.font = AMThemeFont(11.5, UIFontWeightSemibold);
-    _infoLabel.textColor = [UIColor colorWithWhite:0.88 alpha:1.0];
+    _infoLabel.font = AMThemeFont(12.0, UIFontWeightMedium);
+    _infoLabel.textColor = [UIColor colorWithRed:0.6157 green:0.6235 blue:0.6471 alpha:1.0]; // #9D9FA5
     _infoLabel.textAlignment = NSTextAlignmentCenter;
 
     [bottomBar addSubview:_prevBtn];
@@ -11679,43 +12114,108 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
         [leftRail.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [leftRail.topAnchor constraintEqualToAnchor:self.view.topAnchor],
         [leftRail.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
-        [leftRail.widthAnchor constraintEqualToConstant:46.0],
+        [leftRail.widthAnchor constraintEqualToConstant:52.0],
 
-        [leftStack.topAnchor constraintEqualToAnchor:leftRail.topAnchor constant:12.0],
-        [leftStack.bottomAnchor constraintEqualToAnchor:leftRail.bottomAnchor constant:-12.0],
-        [leftStack.centerXAnchor constraintEqualToAnchor:leftRail.centerXAnchor],
+        [backBtn.topAnchor constraintEqualToAnchor:leftRail.topAnchor],
+        [backBtn.centerXAnchor constraintEqualToAnchor:leftRail.centerXAnchor],
 
-        [rightScroll.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-8.0],
-        [rightScroll.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:8.0],
-        [rightScroll.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor constant:-8.0],
-        [rightScroll.widthAnchor constraintEqualToConstant:78.0],
+        [leftBotStack.bottomAnchor constraintEqualToAnchor:leftRail.safeAreaLayoutGuide.bottomAnchor],
+        [leftBotStack.centerXAnchor constraintEqualToAnchor:leftRail.centerXAnchor],
 
-        [_presetStack.topAnchor constraintEqualToAnchor:rightScroll.topAnchor],
-        [_presetStack.bottomAnchor constraintEqualToAnchor:rightScroll.bottomAnchor],
-        [_presetStack.leadingAnchor constraintEqualToAnchor:rightScroll.leadingAnchor],
-        [_presetStack.trailingAnchor constraintEqualToAnchor:rightScroll.trailingAnchor],
-        [_presetStack.widthAnchor constraintEqualToAnchor:rightScroll.widthAnchor],
+        [rightWrap.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [rightWrap.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [rightWrap.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [rightWrap.widthAnchor constraintEqualToConstant:94.0],
 
-        [_graphView.leadingAnchor constraintEqualToAnchor:leftRail.trailingAnchor constant:10.0],
-        [_graphView.trailingAnchor constraintEqualToAnchor:rightScroll.leadingAnchor constant:-10.0],
-        [_graphView.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:10.0],
-        [_graphView.bottomAnchor constraintEqualToAnchor:bottomBar.topAnchor constant:-6.0],
+        [catCol.trailingAnchor constraintEqualToAnchor:rightWrap.trailingAnchor],
+        [catCol.topAnchor constraintEqualToAnchor:rightWrap.topAnchor],
+        [catCol.bottomAnchor constraintEqualToAnchor:rightWrap.bottomAnchor],
+        [catCol.widthAnchor constraintEqualToConstant:52.0],
 
-        [bottomBar.leadingAnchor constraintEqualToAnchor:_graphView.leadingAnchor],
-        [bottomBar.trailingAnchor constraintEqualToAnchor:_graphView.trailingAnchor],
-        [bottomBar.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-4.0],
-        [bottomBar.heightAnchor constraintEqualToConstant:30.0],
+        [catStack.topAnchor constraintEqualToAnchor:catCol.topAnchor constant:12.0],
+        [catStack.bottomAnchor constraintEqualToAnchor:catCol.safeAreaLayoutGuide.bottomAnchor constant:-12.0],
+        [catStack.centerXAnchor constraintEqualToAnchor:catCol.centerXAnchor],
 
-        [_prevBtn.leadingAnchor constraintEqualToAnchor:bottomBar.leadingAnchor],
+        [detailCol.leadingAnchor constraintEqualToAnchor:rightWrap.leadingAnchor],
+        [detailCol.trailingAnchor constraintEqualToAnchor:catCol.leadingAnchor],
+        [detailCol.topAnchor constraintEqualToAnchor:rightWrap.topAnchor],
+        [detailCol.bottomAnchor constraintEqualToAnchor:rightWrap.bottomAnchor],
+
+        [_detailStack.topAnchor constraintEqualToAnchor:detailCol.topAnchor constant:4.0],
+        [_detailStack.bottomAnchor constraintEqualToAnchor:detailCol.bottomAnchor constant:-4.0],
+        [_detailStack.leadingAnchor constraintEqualToAnchor:detailCol.leadingAnchor],
+        [_detailStack.trailingAnchor constraintEqualToAnchor:detailCol.trailingAnchor],
+        [_detailStack.widthAnchor constraintEqualToAnchor:detailCol.widthAnchor],
+
+        [bottomBar.leadingAnchor constraintEqualToAnchor:leftRail.trailingAnchor],
+        [bottomBar.trailingAnchor constraintEqualToAnchor:rightWrap.leadingAnchor],
+        [bottomBar.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor],
+        [bottomBar.heightAnchor constraintEqualToConstant:39.0],
+
+        [_prevBtn.leadingAnchor constraintEqualToAnchor:bottomBar.leadingAnchor constant:4.0],
         [_prevBtn.centerYAnchor constraintEqualToAnchor:bottomBar.centerYAnchor],
-        [_nextBtn.trailingAnchor constraintEqualToAnchor:bottomBar.trailingAnchor],
+        [_nextBtn.trailingAnchor constraintEqualToAnchor:bottomBar.trailingAnchor constant:-4.0],
         [_nextBtn.centerYAnchor constraintEqualToAnchor:bottomBar.centerYAnchor],
-        [_infoLabel.leadingAnchor constraintEqualToAnchor:_prevBtn.trailingAnchor constant:4.0],
-        [_infoLabel.trailingAnchor constraintEqualToAnchor:_nextBtn.leadingAnchor constant:-4.0],
+        [_infoLabel.leadingAnchor constraintEqualToAnchor:_prevBtn.trailingAnchor constant:2.0],
+        [_infoLabel.trailingAnchor constraintEqualToAnchor:_nextBtn.leadingAnchor constant:-2.0],
         [_infoLabel.centerYAnchor constraintEqualToAnchor:bottomBar.centerYAnchor],
+
+        [_graphView.leadingAnchor constraintEqualToAnchor:leftRail.trailingAnchor],
+        [_graphView.trailingAnchor constraintEqualToAnchor:rightWrap.leadingAnchor],
+        [_graphView.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:6.0],
+        [_graphView.bottomAnchor constraintEqualToAnchor:bottomBar.topAnchor constant:-2.0],
     ]];
 
     [self loadCurrentKeyframeIntoGraph];
+}
+
+- (void)rebuildDetailColumn {
+    for (UIView *v in [_detailStack.arrangedSubviews copy]) {
+        [_detailStack removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
+    [_detailBtns removeAllObjects];
+
+    for (int c = 0; c < 3; ++c) {
+        BOOL sel = (c == _activeCategory);
+        _catBtns[c].tintColor = sel ? AMNativeMintColor() : [UIColor colorWithWhite:0.78 alpha:1.0];
+        _catBtns[c].layer.borderWidth = sel ? 1.0 : 0.0;
+        _catBtns[c].layer.borderColor = AMNativeMintColor().CGColor;
+        _catCues[c].hidden = !sel;
+    }
+
+    NSArray<NSDictionary *> *presets = [self presetsForCategory:_activeCategory];
+    for (NSDictionary *p in presets) {
+        UIImage *img = [UIImage imageNamed:p[@"asset"]] ?: [self presetGlyphFallbackForKey:p[@"glyph"]];
+        UIButton *pb = [self makeIconBtn:nil sf:nil width:42.0 height:49.0 action:@selector(onTapPreset:)];
+        [pb setImage:[img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+        objc_setAssociatedObject(pb, @selector(onTapPreset:), p, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [_detailBtns addObject:pb];
+        [_detailStack addArrangedSubview:pb];
+    }
+    [self highlightMatchingPreset];
+}
+
+- (void)highlightMatchingPreset {
+    for (UIButton *pb in _detailBtns) {
+        NSDictionary *p = objc_getAssociatedObject(pb, @selector(onTapPreset:));
+        int t = [p[@"type"] intValue];
+        BOOL match = (t == _graphView.easingType);
+        if (match && t == 0) {
+            match = fabsf(_graphView.p1x - [p[@"p1x"] floatValue]) < 0.03f &&
+                    fabsf(_graphView.p1y - [p[@"p1y"] floatValue]) < 0.05f &&
+                    fabsf(_graphView.p2x - [p[@"p2x"] floatValue]) < 0.03f &&
+                    fabsf(_graphView.p2y - [p[@"p2y"] floatValue]) < 0.05f;
+        } else if (match && t == 1) {
+            float st = p[@"steps"] ? [p[@"steps"] floatValue] : 4.0f;
+            match = fabsf(_graphView.stepCount - st) < 0.5f;
+        } else if (match && t == 2) {
+            match = fabsf(_graphView.p1x - [p[@"p1x"] floatValue]) < 0.06f &&
+                    fabsf(_graphView.p2x - [p[@"p2x"] floatValue]) < 0.06f;
+        }
+        pb.tintColor = match ? AMNativeMintColor() : [UIColor colorWithWhite:0.86 alpha:1.0];
+        pb.backgroundColor = match ? [UIColor colorWithRed:0.1255 green:0.1373 blue:0.1961 alpha:0.6] : [UIColor clearColor];
+    }
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -11731,32 +12231,14 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     _syncTimer = nil;
 }
 
-- (UIButton *)makeIconButton:(NSString *)assetName fallback:(NSString *)sfName action:(SEL)sel {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.translatesAutoresizingMaskIntoConstraints = NO;
-    UIImage *img = assetName ? [UIImage imageNamed:assetName] : nil;
-    if (!img && sfName) {
-        if (@available(iOS 13.0, *)) {
-            UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:15.0 weight:UIImageSymbolWeightMedium];
-            img = [UIImage systemImageNamed:sfName withConfiguration:cfg];
-        }
-    }
-    if (img) [b setImage:[img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
-    b.tintColor = [UIColor whiteColor];
-    [b.widthAnchor constraintEqualToConstant:34.0].active = YES;
-    [b.heightAnchor constraintEqualToConstant:34.0].active = YES;
-    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
-    return b;
-}
-
 - (void)loadCurrentKeyframeIntoGraph {
-    NSMutableDictionary *pd = [self currentPinDict];
-    NSArray *kfs = pd[@"keyframes"];
+    NSArray *kfs = [self keyframesArray];
     NSInteger segCount = MAX(0, (NSInteger)kfs.count - 1);
     if (segCount == 0) {
         _infoLabel.text = @"Add 2+ Keyframes";
-        _prevBtn.enabled = NO;
-        _nextBtn.enabled = NO;
+        _prevBtn.enabled = NO; _prevBtn.alpha = 0.30;
+        _nextBtn.enabled = NO; _nextBtn.alpha = 0.30;
+        [self rebuildDetailColumn];
         return;
     }
     if (self.keyframeIndex < 0) self.keyframeIndex = 0;
@@ -11770,34 +12252,45 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     _graphView.p2y = kf[@"p2y"] ? [kf[@"p2y"] floatValue] : 1.0f;
     _graphView.stepCount = kf[@"stepCount"] ? [kf[@"stepCount"] floatValue] : 4.0f;
 
+    if (_graphView.easingType == 1) _activeCategory = 2;
+    else if (_graphView.easingType == 2 || _graphView.easingType == 3) _activeCategory = 1;
+    else _activeCategory = 0;
+
     _prevBtn.enabled = (self.keyframeIndex > 0);
     _nextBtn.enabled = (self.keyframeIndex + 1 < segCount);
-    _prevBtn.alpha = _prevBtn.enabled ? 1.0 : 0.35;
-    _nextBtn.alpha = _nextBtn.enabled ? 1.0 : 0.35;
+    _prevBtn.alpha = _prevBtn.enabled ? 1.0 : 0.30;
+    _nextBtn.alpha = _nextBtn.enabled ? 1.0 : 0.30;
 
+    [self rebuildDetailColumn];
     [self updateInfoLabel];
     [self onSyncTick];
     [_graphView setNeedsDisplay];
 }
 
 - (void)updateInfoLabel {
-    NSMutableDictionary *pd = [self currentPinDict];
-    NSArray *kfs = pd[@"keyframes"];
+    NSArray *kfs = [self keyframesArray];
     NSInteger segCount = MAX(0, (NSInteger)kfs.count - 1);
+    NSString *prefix = self.subjectTitle.length > 0 ? self.subjectTitle : @"Segment";
     NSString *modeName = @"Cubic";
-    if (_graphView.easingType == 1) modeName = (_graphView.stepCount <= 1.0f) ? @"Hold" : @"Step";
-    else if (_graphView.easingType == 2) modeName = @"Elastic";
-    else if (_graphView.easingType == 3) modeName = @"Bounce";
-    _infoLabel.text = [NSString stringWithFormat:@"Pin %ld • %@ (%ld/%ld)",
-                       (long)(self.pinIndex + 1), modeName, (long)(self.keyframeIndex + 1), (long)segCount];
+    if (_graphView.easingType == 0) {
+        modeName = [NSString stringWithFormat:@"%.2f, %.2f, %.2f, %.2f",
+                    _graphView.p1x, _graphView.p1y, _graphView.p2x, _graphView.p2y];
+    } else if (_graphView.easingType == 1) {
+        modeName = (_graphView.stepCount <= 1.0f) ? @"Hold" : [NSString stringWithFormat:@"%.0f Steps", _graphView.stepCount];
+    } else if (_graphView.easingType == 2) {
+        modeName = @"Elastic";
+    } else if (_graphView.easingType == 3) {
+        modeName = @"Bounce";
+    }
+    _infoLabel.text = [NSString stringWithFormat:@"%@ • %@ (%ld/%ld)",
+                       prefix, modeName, (long)(self.keyframeIndex + 1), (long)segCount];
 }
 
 - (void)onSyncTick {
     if (!self.holder) return;
     int64_t tMs = AMReadHolderCurrentTime(self.holder, AMMainBinarySlide());
     gAMPuppetEditorCurrentTimeMs = tMs;
-    NSMutableDictionary *pd = [self currentPinDict];
-    NSArray *kfs = pd[@"keyframes"];
+    NSArray *kfs = [self keyframesArray];
     if (self.keyframeIndex >= 0 && self.keyframeIndex + 1 < (NSInteger)kfs.count) {
         int64_t t0 = [kfs[self.keyframeIndex][@"t"] longLongValue];
         int64_t t1 = [kfs[self.keyframeIndex + 1][@"t"] longLongValue];
@@ -11819,14 +12312,16 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     kf[@"p2x"] = @(_graphView.p2x);
     kf[@"p2y"] = @(_graphView.p2y);
     kf[@"stepCount"] = @(_graphView.stepCount);
-    if (saveDisk) {
-        [[AMPuppetStore shared] save];
-    } else {
-        [[AMPuppetStore shared] syncAllToRuntime];
-    }
+    if (self.onPersistSave) self.onPersistSave(saveDisk);
+    [self highlightMatchingPreset];
     [self updateInfoLabel];
     AMRequestCoalescedPreviewRedraw();
     if (self.onDidModify) self.onDidModify();
+}
+
+- (void)onTapCategory:(UIButton *)sender {
+    _activeCategory = sender.tag;
+    [self rebuildDetailColumn];
 }
 
 - (void)onTapPreset:(UIButton *)sender {
@@ -11854,15 +12349,7 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
 }
 
 - (void)onTapOverflow:(UIButton *)sender {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Puppet Easing Curve" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Reset to Linear" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        (void)a;
-        self->_graphView.easingType = 0;
-        self->_graphView.p1x = 0.0f; self->_graphView.p1y = 0.0f;
-        self->_graphView.p2x = 1.0f; self->_graphView.p2y = 1.0f;
-        [self->_graphView setNeedsDisplay];
-        [self persistGraphToCurrentKeyframe:YES];
-    }]];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Easing Curve" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"Copy Curve" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         (void)a;
         gAMPuppetCopiedEasingType = self->_graphView.easingType;
@@ -11882,6 +12369,32 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
             [self persistGraphToCurrentKeyframe:YES];
         }]];
     }
+    [ac addAction:[UIAlertAction actionWithTitle:@"Apply Curve to All Segments" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        (void)a;
+        NSMutableArray *kfs = [self keyframesArray];
+        for (NSInteger i = 0; i + 1 < (NSInteger)kfs.count; ++i) {
+            NSMutableDictionary *k = kfs[i];
+            k[@"easingType"] = @(self->_graphView.easingType);
+            k[@"p1x"] = @(self->_graphView.p1x);
+            k[@"p1y"] = @(self->_graphView.p1y);
+            k[@"p2x"] = @(self->_graphView.p2x);
+            k[@"p2y"] = @(self->_graphView.p2y);
+            k[@"stepCount"] = @(self->_graphView.stepCount);
+        }
+        if (self.onPersistSave) self.onPersistSave(YES);
+        AMRequestCoalescedPreviewRedraw();
+        if (self.onDidModify) self.onDidModify();
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Reset to Linear" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        (void)a;
+        self->_activeCategory = 0;
+        self->_graphView.easingType = 0;
+        self->_graphView.p1x = 0.0f; self->_graphView.p1y = 0.0f;
+        self->_graphView.p2x = 1.0f; self->_graphView.p2y = 1.0f;
+        [self rebuildDetailColumn];
+        [self->_graphView setNeedsDisplay];
+        [self persistGraphToCurrentKeyframe:YES];
+    }]];
     [ac addAction:[UIAlertAction actionWithTitle:(self->_graphView.allowOvershoot ? @"Clamp Overshoot (0..1)" : @"Allow Overshoot")
                                           style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         (void)a;
@@ -11905,8 +12418,7 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
 }
 
 - (void)onTapNextSeg {
-    NSMutableDictionary *pd = [self currentPinDict];
-    NSArray *kfs = pd[@"keyframes"];
+    NSArray *kfs = [self keyframesArray];
     if (self.keyframeIndex + 2 < (NSInteger)kfs.count) {
         self.keyframeIndex += 1;
         [self loadCurrentKeyframeIntoGraph];
@@ -11915,8 +12427,7 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
 }
 
 - (void)seekToSegmentMidpoint {
-    NSMutableDictionary *pd = [self currentPinDict];
-    NSArray *kfs = pd[@"keyframes"];
+    NSArray *kfs = [self keyframesArray];
     if (self.keyframeIndex >= 0 && self.keyframeIndex + 1 < (NSInteger)kfs.count) {
         int64_t t0 = [kfs[self.keyframeIndex][@"t"] longLongValue];
         int64_t t1 = [kfs[self.keyframeIndex + 1][@"t"] longLongValue];
@@ -11986,11 +12497,12 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     NSTimer *_syncTimer;
     int64_t _lastPolledTimeMs;
 
-    // Left rail controls (CompactSideToolVC style)
-    UIButton *_keyframeBtn;
-    UIButton *_prevKfBtn;
-    UIButton *_nextKfBtn;
-    UIButton *_graphBtn;
+static float gAMPuppetCopiedPinX = 0.5f;
+static float gAMPuppetCopiedPinY = 0.5f;
+static BOOL gAMPuppetHasCopiedPinKf = NO;
+
+    // Left rail controls (CompactSideToolVC exact 60pt style)
+    AMCompactKeyframeRailView *_rail;
 
     // Top pin chips & tools
     UIScrollView *_pinScroll;
@@ -12167,6 +12679,7 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     }
 
     int64_t t = [self currentTimeMs];
+    gAMPuppetEditorCurrentTimeMs = t;
     if (_canvasOverlay) {
         _canvasOverlay.currentTimeMs = t;
         if (t != _lastPolledTimeMs) {
@@ -12226,33 +12739,17 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
 
 - (void)buildUI {
     // Left vertical keyframe sidebar (identical layout & dimensions to CompactSideToolVC)
-    UIView *rail = [[UIView alloc] init];
-    rail.translatesAutoresizingMaskIntoConstraints = NO;
-    rail.backgroundColor = AMInputSurfaceColor();
-    [self.view addSubview:rail];
-
-    UIButton *backBtn = [self makeRailButton:@"ic_back" fallback:@"chevron.left" action:@selector(onTapBack)];
-    _keyframeBtn = [self makeRailButton:@"ic_add keyframe" fallback:nil action:@selector(onTapToggleKeyframe)];
-    if (![_keyframeBtn imageForState:UIControlStateNormal]) {
-        [_keyframeBtn setImage:AMPuppetDiamondIcon(NO) forState:UIControlStateNormal];
-    }
-    _prevKfBtn = [self makeRailButton:nil fallback:@"chevron.left.to.line" action:@selector(onTapPrevKeyframe)];
-    _nextKfBtn = [self makeRailButton:nil fallback:@"chevron.right.to.line" action:@selector(onTapNextKeyframe)];
-    _graphBtn = [self makeRailButton:@"ic_easing curve" fallback:@"point.topleft.down.curvedto.point.bottomright.up" action:@selector(onTapGraph)];
-
-    UIStackView *kfNav = [[UIStackView alloc] initWithArrangedSubviews:@[_prevKfBtn, _nextKfBtn]];
-    kfNav.axis = UILayoutConstraintAxisHorizontal;
-    kfNav.distribution = UIStackViewDistributionFillEqually;
-    kfNav.spacing = 0.0;
-    [_prevKfBtn.widthAnchor constraintEqualToConstant:22.0].active = YES;
-    [_nextKfBtn.widthAnchor constraintEqualToConstant:22.0].active = YES;
-
-    UIStackView *railStack = [[UIStackView alloc] initWithArrangedSubviews:@[backBtn, _keyframeBtn, kfNav, _graphBtn]];
-    railStack.translatesAutoresizingMaskIntoConstraints = NO;
-    railStack.axis = UILayoutConstraintAxisVertical;
-    railStack.distribution = UIStackViewDistributionEqualSpacing;
-    railStack.alignment = UIStackViewAlignmentCenter;
-    [rail addSubview:railStack];
+    __weak __typeof__(self) weakSelf = self;
+    _rail = [[AMCompactKeyframeRailView alloc] init];
+    _rail.translatesAutoresizingMaskIntoConstraints = NO;
+    _rail.onBack = ^{ [weakSelf onTapBack]; };
+    _rail.onToggleKeyframe = ^{ [weakSelf onTapToggleKeyframe]; };
+    _rail.onPrevKeyframe = ^{ [weakSelf onTapPrevKeyframe]; };
+    _rail.onNextKeyframe = ^{ [weakSelf onTapNextKeyframe]; };
+    _rail.onGraph = ^{ [weakSelf onTapGraph]; };
+    _rail.onLongPressKeyframe = ^(UIView *anchor) { [weakSelf showPuppetKeyframeMenuFrom:anchor]; };
+    _rail.onOverflow = ^(UIView *anchor) { [weakSelf showPuppetKeyframeMenuFrom:anchor]; };
+    [self.view addSubview:_rail];
 
     // Right main content container
     UIView *content = [[UIView alloc] init];
@@ -12286,7 +12783,6 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     // Row 2 Left: Compact Alight Motion Touch Control Pad (fine pin nudge + X/Y readout)
     _touchPad = [[AMPuppetTouchPadView alloc] init];
     _touchPad.translatesAutoresizingMaskIntoConstraints = NO;
-    __weak __typeof__(self) weakSelf = self;
     _touchPad.onDeltaNorm = ^(CGPoint d, BOOL ended) {
         [weakSelf nudgeSelectedPinByDelta:d ended:ended];
     };
@@ -12356,16 +12852,12 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     [rightCtrl addSubview:_stiffnessSlider];
 
     [NSLayoutConstraint activateConstraints:@[
-        [rail.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [rail.topAnchor constraintEqualToAnchor:self.view.topAnchor],
-        [rail.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
-        [rail.widthAnchor constraintEqualToConstant:46.0],
+        [_rail.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_rail.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_rail.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [_rail.widthAnchor constraintEqualToConstant:60.0],
 
-        [railStack.topAnchor constraintEqualToAnchor:rail.topAnchor constant:10.0],
-        [railStack.bottomAnchor constraintEqualToAnchor:rail.safeAreaLayoutGuide.bottomAnchor constant:-10.0],
-        [railStack.centerXAnchor constraintEqualToAnchor:rail.centerXAnchor],
-
-        [content.leadingAnchor constraintEqualToAnchor:rail.trailingAnchor constant:8.0],
+        [content.leadingAnchor constraintEqualToAnchor:_rail.trailingAnchor constant:8.0],
         [content.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-8.0],
         [content.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:8.0],
         [content.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-6.0],
@@ -12505,16 +12997,12 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
     if (!pd) {
         _coordLabel.text = @"Puppet Tool";
         _hintLabel.text = @"Tap media on canvas to drop pins.\nDrag any pin to deform.";
-        _keyframeBtn.enabled = NO; _keyframeBtn.alpha = 0.35;
-        _prevKfBtn.enabled = NO; _prevKfBtn.alpha = 0.35;
-        _nextKfBtn.enabled = NO; _nextKfBtn.alpha = 0.35;
-        _graphBtn.enabled = NO; _graphBtn.alpha = 0.35;
+        [_rail updateWithKeyframeEnabled:NO hasKeyframe:NO hasPrev:NO hasNext:NO canGraph:NO keyframeTint:AMNativeMintColor()];
         _resetPinBtn.enabled = NO; _resetPinBtn.alpha = 0.35;
         _delPinBtn.enabled = NO; _delPinBtn.alpha = 0.35;
         return;
     }
 
-    _keyframeBtn.enabled = YES; _keyframeBtn.alpha = 1.0;
     _resetPinBtn.enabled = YES; _resetPinBtn.alpha = 1.0;
     _delPinBtn.enabled = YES; _delPinBtn.alpha = 1.0;
 
@@ -12525,29 +13013,19 @@ static CGPoint AMPuppetMulRowMat4(CGPoint pt, const float m[16]) {
 
     NSArray *kfs = pd[@"keyframes"];
     NSInteger onKf = [self keyframeIndexAtTimeMs:tMs forPin:pd];
-    if (onKf >= 0) {
-        UIImage *remImg = [UIImage imageNamed:@"ic_remove keyframe"] ?: AMPuppetDiamondIcon(YES);
-        [_keyframeBtn setImage:[remImg imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
-        _keyframeBtn.tintColor = AMAccentGreenColor();
-    } else {
-        UIImage *addImg = [UIImage imageNamed:@"ic_add keyframe"] ?: AMPuppetDiamondIcon(NO);
-        [_keyframeBtn setImage:[addImg imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
-        _keyframeBtn.tintColor = [UIColor whiteColor];
-    }
-
     BOOL hasPrev = NO, hasNext = NO;
     for (NSDictionary *kf in kfs) {
         int64_t kt = [kf[@"t"] longLongValue];
         if (kt < tMs - 20) hasPrev = YES;
         if (kt > tMs + 20) hasNext = YES;
     }
-    _prevKfBtn.enabled = hasPrev; _prevKfBtn.alpha = hasPrev ? 1.0 : 0.35;
-    _nextKfBtn.enabled = hasNext; _nextKfBtn.alpha = hasNext ? 1.0 : 0.35;
-
     BOOL canGraph = (kfs.count >= 2);
-    _graphBtn.enabled = canGraph;
-    _graphBtn.alpha = canGraph ? 1.0 : 0.35;
-    _graphBtn.tintColor = canGraph ? AMAccentGreenColor() : [UIColor whiteColor];
+    [_rail updateWithKeyframeEnabled:YES
+                         hasKeyframe:(onKf >= 0)
+                             hasPrev:hasPrev
+                             hasNext:hasNext
+                            canGraph:canGraph
+                        keyframeTint:AMNativeMintColor()];
 
     _hintLabel.text = (kfs.count > 0)
         ? [NSString stringWithFormat:@"Swipe pad to nudge • %lu keyframe%@", (unsigned long)kfs.count, kfs.count == 1 ? @"" : @"s"]
@@ -12815,6 +13293,54 @@ static void AMPuppetFastUpdateRigidityInRuntime(int slot, float rigidity) {
     }
 }
 
+- (void)showPuppetKeyframeMenuFrom:(UIView *)anchor {
+    NSMutableDictionary *pd = [self selectedPinDict];
+    if (!pd) return;
+    int64_t tMs = [self currentTimeMs];
+    NSArray *kfs = pd[@"keyframes"];
+    NSInteger onKf = [self keyframeIndexAtTimeMs:tMs forPin:pd];
+    BOOL hasPrev = NO, hasNext = NO;
+    for (NSDictionary *kf in kfs) {
+        int64_t kt = [kf[@"t"] longLongValue];
+        if (kt < tMs - 20) hasPrev = YES;
+        if (kt > tMs + 20) hasNext = YES;
+    }
+    __weak __typeof__(self) weakSelf = self;
+    NSString *title = [NSString stringWithFormat:@"Pin %ld Keyframes", (long)(_selectedPinIndex + 1)];
+    AMPresentKeyframeActionMenu(self, anchor, title, (onKf >= 0), gAMPuppetHasCopiedPinKf, hasPrev, hasNext, (kfs.count > 0), ^{
+        CGPoint cur;
+        [weakSelf evalCurrentPin:&cur];
+        gAMPuppetCopiedPinX = (float)cur.x;
+        gAMPuppetCopiedPinY = (float)cur.y;
+        gAMPuppetHasCopiedPinKf = YES;
+    }, ^{
+        NSMutableDictionary *p = [weakSelf selectedPinDict];
+        if (!p) return;
+        int64_t ct = [weakSelf currentTimeMs];
+        [weakSelf upsertKeyframeOnPin:p timeMs:ct x:gAMPuppetCopiedPinX y:gAMPuppetCopiedPinY];
+        [[AMPuppetStore shared] save];
+        [weakSelf rebuildPinChips];
+        [weakSelf refreshControls];
+        AMForceImmediatePreviewRedraw();
+        AMPuppetRedrawAllKeyframeViews();
+    }, ^{
+        [weakSelf onTapToggleKeyframe];
+    }, ^{
+        [weakSelf onTapPrevKeyframe];
+    }, ^{
+        [weakSelf onTapNextKeyframe];
+    }, ^{
+        NSMutableDictionary *p = [weakSelf selectedPinDict];
+        if (!p) return;
+        p[@"keyframes"] = [NSMutableArray array];
+        [[AMPuppetStore shared] save];
+        [weakSelf rebuildPinChips];
+        [weakSelf refreshControls];
+        AMForceImmediatePreviewRedraw();
+        AMPuppetRedrawAllKeyframeViews();
+    });
+}
+
 - (void)onTapGraph {
     NSMutableDictionary *pd = [self selectedPinDict];
     NSArray *kfs = pd[@"keyframes"];
@@ -12829,11 +13355,25 @@ static void AMPuppetFastUpdateRigidityInRuntime(int slot, float rigidity) {
         if (tMs > t1) segIdx = i;
     }
 
-    AMPuppetGraphPanelVC *gvc = [[AMPuppetGraphPanelVC alloc] init];
-    gvc.slot = _slot;
-    gvc.pinIndex = _selectedPinIndex;
+    int slotCopy = _slot;
+    NSInteger pinIdxCopy = _selectedPinIndex;
+    AMEasingGraphPanelVC *gvc = [[AMEasingGraphPanelVC alloc] init];
+    gvc.slot = slotCopy;
     gvc.keyframeIndex = segIdx;
     gvc.holder = _holder;
+    gvc.subjectTitle = [NSString stringWithFormat:@"Pin %ld", (long)(pinIdxCopy + 1)];
+    gvc.keyframesProvider = ^NSMutableArray * {
+        NSMutableDictionary *ld = [[AMPuppetStore shared] layerDictForSlot:slotCopy create:NO elementId:0];
+        NSArray *pins = ld[@"pins"];
+        if (pinIdxCopy >= 0 && pinIdxCopy < (NSInteger)pins.count) {
+            return pins[pinIdxCopy][@"keyframes"];
+        }
+        return nil;
+    };
+    gvc.onPersistSave = ^(BOOL saveDisk) {
+        if (saveDisk) [[AMPuppetStore shared] save];
+        else [[AMPuppetStore shared] syncAllToRuntime];
+    };
     __weak __typeof__(self) weakSelf = self;
     gvc.onDidModify = ^{
         [weakSelf refreshControls];
@@ -16702,277 +17242,6 @@ static UIImage *AMRot3DTabIcon(void) {
 
 @end
 
-// --- Per-Axis Easing Graph Editor for 3D Rotation (reuses AMPuppetGraphCanvasView!) ---
-
-@interface AMRot3DGraphPanelVC : UIViewController
-@property (nonatomic, assign) int slot;
-@property (nonatomic, assign) int trackIndex;
-@property (nonatomic, assign) NSInteger keyframeIndex;
-@property (nonatomic, assign) void *holder;
-@property (nonatomic, copy) void (^onDidModify)(void);
-@property (nonatomic, copy) void (^onRequestSeekMs)(int64_t targetMs);
-@end
-
-@implementation AMRot3DGraphPanelVC {
-    AMPuppetGraphCanvasView *_canvas;
-    UILabel *_titleLabel;
-    UILabel *_segmentLabel;
-    UIButton *_pasteBtn;
-    UISegmentedControl *_modeSeg;
-}
-
-- (NSMutableArray *)keyframesArray {
-    NSMutableDictionary *ld = [[AMRot3DStore shared] layerDictForSlot:self.slot create:NO elementId:0];
-    NSMutableDictionary *td = ld[@"tracks"][AMRot3DTrackKey(self.trackIndex)];
-    return [td[@"keyframes"] isKindOfClass:[NSMutableArray class]] ? td[@"keyframes"] : nil;
-}
-
-- (NSMutableDictionary *)currentKeyframeDict {
-    NSMutableArray *kfs = [self keyframesArray];
-    if (self.keyframeIndex >= 0 && self.keyframeIndex + 1 < (NSInteger)kfs.count) {
-        return kfs[self.keyframeIndex];
-    }
-    return nil;
-}
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = AMBgColor();
-
-    UIView *header = [[UIView alloc] init];
-    header.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:header];
-
-    UIButton *backBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    backBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    UIImage *backImg = [UIImage imageNamed:@"ic_back"];
-    if (!backImg) {
-        if (@available(iOS 13.0, *)) backImg = [UIImage systemImageNamed:@"chevron.left"];
-    }
-    if (backImg) [backBtn setImage:[backImg imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
-    backBtn.tintColor = [UIColor whiteColor];
-    [backBtn addTarget:self action:@selector(onTapBack) forControlEvents:UIControlEventTouchUpInside];
-    [header addSubview:backBtn];
-
-    _titleLabel = [[UILabel alloc] init];
-    _titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    _titleLabel.font = AMThemeFont(12.5, UIFontWeightBold);
-    _titleLabel.textColor = [UIColor whiteColor];
-    [header addSubview:_titleLabel];
-
-    UIButton *prevSeg = [self makePill:@"◀" action:@selector(onPrevSegment)];
-    _segmentLabel = [[UILabel alloc] init];
-    _segmentLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    _segmentLabel.font = AMThemeFont(10.5, UIFontWeightSemibold);
-    _segmentLabel.textColor = AMRot3DAxisColor(self.trackIndex);
-    UIButton *nextSeg = [self makePill:@"▶" action:@selector(onNextSegment)];
-    UIButton *copyBtn = [self makePill:@"Copy" action:@selector(onCopyCurve)];
-    _pasteBtn = [self makePill:@"Paste" action:@selector(onPasteCurve)];
-
-    UIStackView *rightBar = [[UIStackView alloc] initWithArrangedSubviews:@[prevSeg, _segmentLabel, nextSeg, copyBtn, _pasteBtn]];
-    rightBar.translatesAutoresizingMaskIntoConstraints = NO;
-    rightBar.axis = UILayoutConstraintAxisHorizontal;
-    rightBar.spacing = 4.0;
-    rightBar.alignment = UIStackViewAlignmentCenter;
-    [header addSubview:rightBar];
-
-    _canvas = [[AMPuppetGraphCanvasView alloc] init];
-    _canvas.translatesAutoresizingMaskIntoConstraints = NO;
-    __weak __typeof__(self) weakSelf = self;
-    _canvas.onCurveChanged = ^(BOOL ended) {
-        [weakSelf commitCanvasToKeyframeSave:ended];
-    };
-    [self.view addSubview:_canvas];
-
-    _modeSeg = [[UISegmentedControl alloc] initWithItems:@[@"Cubic", @"Step", @"Elastic", @"Bounce"]];
-    _modeSeg.translatesAutoresizingMaskIntoConstraints = NO;
-    _modeSeg.backgroundColor = AMSurfaceColor();
-    if (@available(iOS 13.0, *)) _modeSeg.selectedSegmentTintColor = AMRot3DAxisColor(self.trackIndex);
-    [_modeSeg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.82 alpha:1.0],
-                                       NSFontAttributeName: AMThemeFont(10.0, UIFontWeightSemibold)} forState:UIControlStateNormal];
-    [_modeSeg setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithRed:0.06 green:0.08 blue:0.12 alpha:1.0],
-                                       NSFontAttributeName: AMThemeFont(10.0, UIFontWeightBold)} forState:UIControlStateSelected];
-    [_modeSeg addTarget:self action:@selector(onModeChanged:) forControlEvents:UIControlEventValueChanged];
-    [self.view addSubview:_modeSeg];
-
-    UIStackView *presets = [[UIStackView alloc] initWithArrangedSubviews:@[
-        [self makePreset:@"Linear" tag:0],
-        [self makePreset:@"Ease In" tag:1],
-        [self makePreset:@"Ease Out" tag:2],
-        [self makePreset:@"Ease I/O" tag:3],
-        [self makePreset:@"Snap" tag:4],
-        [self makePreset:@"Overshoot" tag:5]
-    ]];
-    presets.translatesAutoresizingMaskIntoConstraints = NO;
-    presets.axis = UILayoutConstraintAxisVertical;
-    presets.distribution = UIStackViewDistributionFillEqually;
-    presets.spacing = 4.0;
-    [self.view addSubview:presets];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [header.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:6.0],
-        [header.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:10.0],
-        [header.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-10.0],
-        [header.heightAnchor constraintEqualToConstant:28.0],
-
-        [backBtn.leadingAnchor constraintEqualToAnchor:header.leadingAnchor],
-        [backBtn.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
-        [backBtn.widthAnchor constraintEqualToConstant:28.0],
-        [backBtn.heightAnchor constraintEqualToConstant:28.0],
-
-        [_titleLabel.leadingAnchor constraintEqualToAnchor:backBtn.trailingAnchor constant:6.0],
-        [_titleLabel.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
-
-        [rightBar.trailingAnchor constraintEqualToAnchor:header.trailingAnchor],
-        [rightBar.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
-
-        [_modeSeg.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:6.0],
-        [_modeSeg.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:10.0],
-        [_modeSeg.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-10.0],
-        [_modeSeg.heightAnchor constraintEqualToConstant:24.0],
-
-        [_canvas.topAnchor constraintEqualToAnchor:_modeSeg.bottomAnchor constant:6.0],
-        [_canvas.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:10.0],
-        [_canvas.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-8.0],
-        [_canvas.trailingAnchor constraintEqualToAnchor:presets.leadingAnchor constant:-8.0],
-
-        [presets.topAnchor constraintEqualToAnchor:_modeSeg.bottomAnchor constant:6.0],
-        [presets.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-10.0],
-        [presets.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-8.0],
-        [presets.widthAnchor constraintEqualToConstant:82.0],
-    ]];
-
-    [self loadCurrentSegment];
-}
-
-- (UIButton *)makePill:(NSString *)title action:(SEL)sel {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.backgroundColor = AMSurfaceColor();
-    b.layer.cornerRadius = 5.0;
-    [b setTitle:title forState:UIControlStateNormal];
-    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    b.titleLabel.font = AMThemeFont(10.0, UIFontWeightSemibold);
-    b.contentEdgeInsets = UIEdgeInsetsMake(3.0, 6.0, 3.0, 6.0);
-    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
-    return b;
-}
-
-- (UIButton *)makePreset:(NSString *)title tag:(NSInteger)tag {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.tag = tag;
-    b.backgroundColor = AMSurfaceColor();
-    b.layer.cornerRadius = 5.0;
-    [b setTitle:title forState:UIControlStateNormal];
-    [b setTitleColor:[UIColor colorWithWhite:0.90 alpha:1.0] forState:UIControlStateNormal];
-    b.titleLabel.font = AMThemeFont(10.0, UIFontWeightSemibold);
-    [b addTarget:self action:@selector(onTapPreset:) forControlEvents:UIControlEventTouchUpInside];
-    return b;
-}
-
-- (void)loadCurrentSegment {
-    NSMutableArray *kfs = [self keyframesArray];
-    if (kfs.count < 2) { [self onTapBack]; return; }
-    if (self.keyframeIndex < 0) self.keyframeIndex = 0;
-    if (self.keyframeIndex >= (NSInteger)kfs.count - 1) self.keyframeIndex = (NSInteger)kfs.count - 2;
-    NSMutableDictionary *kf = kfs[self.keyframeIndex];
-    _titleLabel.text = [NSString stringWithFormat:@"%@ Graph", AMRot3DTrackName(self.trackIndex)];
-    _segmentLabel.text = [NSString stringWithFormat:@"Seg %ld/%lu", (long)(self.keyframeIndex + 1), (unsigned long)(kfs.count - 1)];
-    _canvas.easingType = [kf[@"easingType"] intValue];
-    _canvas.p1x = kf[@"p1x"] ? [kf[@"p1x"] floatValue] : 0.42f;
-    _canvas.p1y = kf[@"p1y"] ? [kf[@"p1y"] floatValue] : 0.0f;
-    _canvas.p2x = kf[@"p2x"] ? [kf[@"p2x"] floatValue] : 0.58f;
-    _canvas.p2y = kf[@"p2y"] ? [kf[@"p2y"] floatValue] : 1.0f;
-    _canvas.stepCount = kf[@"stepCount"] ? [kf[@"stepCount"] floatValue] : 4.0f;
-    _modeSeg.selectedSegmentIndex = MIN(MAX(_canvas.easingType, 0), 3);
-    _pasteBtn.alpha = gAMPuppetHasCopiedCurve ? 1.0 : 0.4;
-    [_canvas setNeedsDisplay];
-}
-
-- (void)commitCanvasToKeyframeSave:(BOOL)save {
-    NSMutableDictionary *kf = [self currentKeyframeDict];
-    if (!kf) return;
-    kf[@"easingType"] = @(_canvas.easingType);
-    kf[@"p1x"] = @(_canvas.p1x);
-    kf[@"p1y"] = @(_canvas.p1y);
-    kf[@"p2x"] = @(_canvas.p2x);
-    kf[@"p2y"] = @(_canvas.p2y);
-    kf[@"stepCount"] = @(_canvas.stepCount);
-    if (save) {
-        [[AMRot3DStore shared] save];
-    } else {
-        [[AMRot3DStore shared] syncAllToRuntime];
-    }
-    AMRequestCoalescedPreviewRedraw();
-    if (self.onDidModify) self.onDidModify();
-}
-
-- (void)onModeChanged:(UISegmentedControl *)seg {
-    _canvas.easingType = (int)seg.selectedSegmentIndex;
-    [_canvas setNeedsDisplay];
-    [self commitCanvasToKeyframeSave:YES];
-}
-
-- (void)onTapPreset:(UIButton *)btn {
-    _canvas.easingType = 0;
-    _modeSeg.selectedSegmentIndex = 0;
-    switch (btn.tag) {
-        case 0: _canvas.p1x = 0.0f;  _canvas.p1y = 0.0f;  _canvas.p2x = 1.0f;  _canvas.p2y = 1.0f;  break; // Linear
-        case 1: _canvas.p1x = 0.42f; _canvas.p1y = 0.0f;  _canvas.p2x = 1.0f;  _canvas.p2y = 1.0f;  break; // Ease In
-        case 2: _canvas.p1x = 0.0f;  _canvas.p1y = 0.0f;  _canvas.p2x = 0.58f; _canvas.p2y = 1.0f;  break; // Ease Out
-        case 3: _canvas.p1x = 0.42f; _canvas.p1y = 0.0f;  _canvas.p2x = 0.58f; _canvas.p2y = 1.0f;  break; // Ease InOut
-        case 4: _canvas.p1x = 0.80f; _canvas.p1y = 0.0f;  _canvas.p2x = 0.15f; _canvas.p2y = 1.0f;  break; // Snap (AM favorite!)
-        case 5: _canvas.p1x = 0.34f; _canvas.p1y = 1.45f; _canvas.p2x = 0.64f; _canvas.p2y = 1.0f;  break; // Overshoot
-        default: break;
-    }
-    [_canvas setNeedsDisplay];
-    [self commitCanvasToKeyframeSave:YES];
-}
-
-- (void)onPrevSegment {
-    if (self.keyframeIndex > 0) {
-        self.keyframeIndex--;
-        [self loadCurrentSegment];
-        NSMutableDictionary *kf = [self currentKeyframeDict];
-        if (kf && self.onRequestSeekMs) self.onRequestSeekMs([kf[@"t"] longLongValue]);
-    }
-}
-
-- (void)onNextSegment {
-    NSMutableArray *kfs = [self keyframesArray];
-    if (self.keyframeIndex + 2 < (NSInteger)kfs.count) {
-        self.keyframeIndex++;
-        [self loadCurrentSegment];
-        NSMutableDictionary *kf = [self currentKeyframeDict];
-        if (kf && self.onRequestSeekMs) self.onRequestSeekMs([kf[@"t"] longLongValue]);
-    }
-}
-
-- (void)onCopyCurve {
-    gAMPuppetCopiedEasingType = _canvas.easingType;
-    gAMPuppetCopiedP1X = _canvas.p1x; gAMPuppetCopiedP1Y = _canvas.p1y;
-    gAMPuppetCopiedP2X = _canvas.p2x; gAMPuppetCopiedP2Y = _canvas.p2y;
-    gAMPuppetCopiedStepCount = _canvas.stepCount;
-    gAMPuppetHasCopiedCurve = YES;
-    _pasteBtn.alpha = 1.0;
-}
-
-- (void)onPasteCurve {
-    if (!gAMPuppetHasCopiedCurve) return;
-    _canvas.easingType = gAMPuppetCopiedEasingType;
-    _canvas.p1x = gAMPuppetCopiedP1X; _canvas.p1y = gAMPuppetCopiedP1Y;
-    _canvas.p2x = gAMPuppetCopiedP2X; _canvas.p2y = gAMPuppetCopiedP2Y;
-    _canvas.stepCount = gAMPuppetCopiedStepCount;
-    _modeSeg.selectedSegmentIndex = MIN(MAX(_canvas.easingType, 0), 3);
-    [_canvas setNeedsDisplay];
-    [self commitCanvasToKeyframeSave:YES];
-}
-
-- (void)onTapBack {
-    [self.navigationController popViewControllerAnimated:YES];
-}
-
-@end
-
 // --- Native Alight Motion 3D Rotation Panel VC (Jex Motion 3D Rotation Port) ---
 
 @interface AMRot3DPanelVC : UIViewController <AMRot3DCanvasOverlayDelegate>
@@ -16995,11 +17264,11 @@ static UIImage *AMRot3DTabIcon(void) {
     NSTimer *_syncTimer;
     int64_t _lastPolledTimeMs;
 
-    // Left keyframe rail (CompactSideToolVC style)
-    UIButton *_keyframeBtn;
-    UIButton *_prevKfBtn;
-    UIButton *_nextKfBtn;
-    UIButton *_graphBtn;
+static float gAMRot3DCopiedVal = 0.0f;
+static BOOL gAMRot3DHasCopiedKf = NO;
+
+    // Left keyframe rail (CompactSideToolVC exact 60pt style)
+    AMCompactKeyframeRailView *_rail;
 
     // Top chips + tools
     UIButton *_tabBtns[5]; // X, Y, Z, Pivot, Lens
@@ -17207,6 +17476,7 @@ static UIImage *AMRot3DTabIcon(void) {
         AMRot3DRefreshHierarchyFromHolder(_holder, 0, NULL);
     }
     int64_t t = [self currentTimeMs];
+    gAMPuppetEditorCurrentTimeMs = t;
     if (_canvasOverlay) {
         _canvasOverlay.currentTimeMs = t;
         if (t != _lastPolledTimeMs) [_canvasOverlay setNeedsDisplay];
@@ -17263,32 +17533,17 @@ static UIImage *AMRot3DTabIcon(void) {
 }
 
 - (void)buildUI {
-    UIView *rail = [[UIView alloc] init];
-    rail.translatesAutoresizingMaskIntoConstraints = NO;
-    rail.backgroundColor = AMInputSurfaceColor();
-    [self.view addSubview:rail];
-
-    UIButton *backBtn = [self makeRailBtn:@"ic_back" sf:@"chevron.left" action:@selector(onTapBack)];
-    _keyframeBtn = [self makeRailBtn:@"ic_add keyframe" sf:nil action:@selector(onTapToggleKeyframe)];
-    if (![_keyframeBtn imageForState:UIControlStateNormal]) {
-        [_keyframeBtn setImage:AMPuppetDiamondIcon(NO) forState:UIControlStateNormal];
-    }
-    _prevKfBtn = [self makeRailBtn:nil sf:@"chevron.left.to.line" action:@selector(onTapPrevKeyframe)];
-    _nextKfBtn = [self makeRailBtn:nil sf:@"chevron.right.to.line" action:@selector(onTapNextKeyframe)];
-    _graphBtn = [self makeRailBtn:@"ic_easing curve" sf:@"point.topleft.down.curvedto.point.bottomright.up" action:@selector(onTapGraph)];
-
-    UIStackView *kfNav = [[UIStackView alloc] initWithArrangedSubviews:@[_prevKfBtn, _nextKfBtn]];
-    kfNav.axis = UILayoutConstraintAxisHorizontal;
-    kfNav.distribution = UIStackViewDistributionFillEqually;
-    [_prevKfBtn.widthAnchor constraintEqualToConstant:22.0].active = YES;
-    [_nextKfBtn.widthAnchor constraintEqualToConstant:22.0].active = YES;
-
-    UIStackView *railStack = [[UIStackView alloc] initWithArrangedSubviews:@[backBtn, _keyframeBtn, kfNav, _graphBtn]];
-    railStack.translatesAutoresizingMaskIntoConstraints = NO;
-    railStack.axis = UILayoutConstraintAxisVertical;
-    railStack.distribution = UIStackViewDistributionEqualSpacing;
-    railStack.alignment = UIStackViewAlignmentCenter;
-    [rail addSubview:railStack];
+    __weak __typeof__(self) weakSelf = self;
+    _rail = [[AMCompactKeyframeRailView alloc] init];
+    _rail.translatesAutoresizingMaskIntoConstraints = NO;
+    _rail.onBack = ^{ [weakSelf onTapBack]; };
+    _rail.onToggleKeyframe = ^{ [weakSelf onTapToggleKeyframe]; };
+    _rail.onPrevKeyframe = ^{ [weakSelf onTapPrevKeyframe]; };
+    _rail.onNextKeyframe = ^{ [weakSelf onTapNextKeyframe]; };
+    _rail.onGraph = ^{ [weakSelf onTapGraph]; };
+    _rail.onLongPressKeyframe = ^(UIView *anchor) { [weakSelf showRot3DKeyframeMenuFrom:anchor]; };
+    _rail.onOverflow = ^(UIView *anchor) { [weakSelf showRot3DKeyframeMenuFrom:anchor]; };
+    [self.view addSubview:_rail];
 
     UIView *content = [[UIView alloc] init];
     content.translatesAutoresizingMaskIntoConstraints = NO;
@@ -17319,7 +17574,6 @@ static UIImage *AMRot3DTabIcon(void) {
     // Row 2 Left: Jex 3D Rotation Trackpad (1-finger X/Y, 2-finger Z)
     _touchPad = [[AMRot3DTouchPadView alloc] init];
     _touchPad.translatesAutoresizingMaskIntoConstraints = NO;
-    __weak __typeof__(self) weakSelf = self;
     _touchPad.onDragDelta = ^(float dx, float dy, BOOL twoZ, BOOL ended) {
         [weakSelf handleTrackpadDx:dx dy:dy twoFingerZ:twoZ ended:ended];
     };
@@ -17428,16 +17682,12 @@ static UIImage *AMRot3DTabIcon(void) {
     [lensStack addArrangedSubview:_backfaceSeg];
 
     [NSLayoutConstraint activateConstraints:@[
-        [rail.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [rail.topAnchor constraintEqualToAnchor:self.view.topAnchor],
-        [rail.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
-        [rail.widthAnchor constraintEqualToConstant:46.0],
+        [_rail.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_rail.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_rail.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [_rail.widthAnchor constraintEqualToConstant:60.0],
 
-        [railStack.topAnchor constraintEqualToAnchor:rail.topAnchor constant:10.0],
-        [railStack.bottomAnchor constraintEqualToAnchor:rail.safeAreaLayoutGuide.bottomAnchor constant:-10.0],
-        [railStack.centerXAnchor constraintEqualToAnchor:rail.centerXAnchor],
-
-        [content.leadingAnchor constraintEqualToAnchor:rail.trailingAnchor constant:8.0],
+        [content.leadingAnchor constraintEqualToAnchor:_rail.trailingAnchor constant:8.0],
         [content.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-8.0],
         [content.topAnchor constraintEqualToAnchor:self.view.topAnchor constant:8.0],
         [content.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-6.0],
@@ -17695,29 +17945,20 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
     // Keyframe rail state for active track
     NSArray *kfs = [self trackDictForIndex:tr][@"keyframes"];
     NSInteger onKf = [self keyframeIndexAtTimeMs:tMs forTrack:tr];
-    if (onKf >= 0) {
-        UIImage *remImg = [UIImage imageNamed:@"ic_remove keyframe"] ?: AMPuppetDiamondIcon(YES);
-        [_keyframeBtn setImage:[remImg imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
-        _keyframeBtn.tintColor = (tr <= 2) ? AMRot3DAxisColor(tr) : AMAccentGreenColor();
-    } else {
-        UIImage *addImg = [UIImage imageNamed:@"ic_add keyframe"] ?: AMPuppetDiamondIcon(NO);
-        [_keyframeBtn setImage:[addImg imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
-        _keyframeBtn.tintColor = [UIColor whiteColor];
-    }
-
     BOOL hasPrev = NO, hasNext = NO;
     for (NSDictionary *kf in kfs) {
         int64_t kt = [kf[@"t"] longLongValue];
         if (kt < tMs - 20) hasPrev = YES;
         if (kt > tMs + 20) hasNext = YES;
     }
-    _prevKfBtn.enabled = hasPrev; _prevKfBtn.alpha = hasPrev ? 1.0 : 0.35;
-    _nextKfBtn.enabled = hasNext; _nextKfBtn.alpha = hasNext ? 1.0 : 0.35;
-
     BOOL canGraph = (kfs.count >= 2);
-    _graphBtn.enabled = canGraph;
-    _graphBtn.alpha = canGraph ? 1.0 : 0.35;
-    _graphBtn.tintColor = canGraph ? AMAccentGreenColor() : [UIColor whiteColor];
+    UIColor *kfTint = (tr <= 2) ? AMRot3DAxisColor(tr) : AMNativeMintColor();
+    [_rail updateWithKeyframeEnabled:YES
+                         hasKeyframe:(onKf >= 0)
+                             hasPrev:hasPrev
+                             hasNext:hasNext
+                            canGraph:canGraph
+                        keyframeTint:kfTint];
 
     if (_canvasOverlay) {
         _canvasOverlay.activeAxis = (_activeTab <= 2) ? _activeTab : 0;
@@ -17942,6 +18183,46 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
     }
 }
 
+- (void)showRot3DKeyframeMenuFrom:(UIView *)anchor {
+    int tr = [self activeTrackIndex];
+    int64_t tMs = [self currentTimeMs];
+    NSMutableDictionary *td = [self trackDictForIndex:tr];
+    NSArray *kfs = td[@"keyframes"];
+    NSInteger onKf = [self keyframeIndexAtTimeMs:tMs forTrack:tr];
+    BOOL hasPrev = NO, hasNext = NO;
+    for (NSDictionary *kf in kfs) {
+        int64_t kt = [kf[@"t"] longLongValue];
+        if (kt < tMs - 20) hasPrev = YES;
+        if (kt > tMs + 20) hasNext = YES;
+    }
+    __weak __typeof__(self) weakSelf = self;
+    NSString *title = [NSString stringWithFormat:@"%@ Keyframes", AMRot3DTrackName(tr)];
+    AMPresentKeyframeActionMenu(self, anchor, title, (onKf >= 0), gAMRot3DHasCopiedKf, hasPrev, hasNext, (kfs.count > 0), ^{
+        gAMRot3DCopiedVal = [weakSelf evalTrack:tr atMs:[weakSelf currentTimeMs]];
+        gAMRot3DHasCopiedKf = YES;
+    }, ^{
+        int curTr = [weakSelf activeTrackIndex];
+        [weakSelf upsertKeyframeOnTrack:curTr timeMs:[weakSelf currentTimeMs] value:gAMRot3DCopiedVal];
+        [[AMRot3DStore shared] save];
+        [weakSelf refreshControls];
+        AMForceImmediatePreviewRedraw();
+        AMPuppetRedrawAllKeyframeViews();
+    }, ^{
+        [weakSelf onTapToggleKeyframe];
+    }, ^{
+        [weakSelf onTapPrevKeyframe];
+    }, ^{
+        [weakSelf onTapNextKeyframe];
+    }, ^{
+        int curTr = [weakSelf activeTrackIndex];
+        [weakSelf trackDictForIndex:curTr][@"keyframes"] = [NSMutableArray array];
+        [[AMRot3DStore shared] save];
+        [weakSelf refreshControls];
+        AMForceImmediatePreviewRedraw();
+        AMPuppetRedrawAllKeyframeViews();
+    });
+}
+
 - (void)onTapGraph {
     int tr = [self activeTrackIndex];
     NSArray *kfs = [self trackDictForIndex:tr][@"keyframes"];
@@ -17954,11 +18235,21 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
         if (tMs >= t0 && tMs <= t1) { segIdx = i; break; }
         if (tMs > t1) segIdx = i;
     }
-    AMRot3DGraphPanelVC *gvc = [[AMRot3DGraphPanelVC alloc] init];
-    gvc.slot = _slot;
-    gvc.trackIndex = tr;
+    int slotCopy = _slot;
+    AMEasingGraphPanelVC *gvc = [[AMEasingGraphPanelVC alloc] init];
+    gvc.slot = slotCopy;
     gvc.keyframeIndex = segIdx;
     gvc.holder = _holder;
+    gvc.subjectTitle = AMRot3DTrackName(tr);
+    gvc.keyframesProvider = ^NSMutableArray * {
+        NSMutableDictionary *ld = [[AMRot3DStore shared] layerDictForSlot:slotCopy create:NO elementId:0];
+        NSMutableDictionary *td = ld[@"tracks"][AMRot3DTrackKey(tr)];
+        return [td[@"keyframes"] isKindOfClass:[NSMutableArray class]] ? td[@"keyframes"] : nil;
+    };
+    gvc.onPersistSave = ^(BOOL saveDisk) {
+        if (saveDisk) [[AMRot3DStore shared] save];
+        else [[AMRot3DStore shared] syncAllToRuntime];
+    };
     __weak __typeof__(self) weakSelf = self;
     gvc.onDidModify = ^{ [weakSelf refreshControls]; };
     gvc.onRequestSeekMs = ^(int64_t targetMs) {
@@ -18199,34 +18490,39 @@ static void AMHook_keyframeViewDrawRect(id self, SEL _cmd, CGRect rect) {
     CGFloat w = v.bounds.size.width;
     CGFloat cy = v.bounds.size.height * 0.5;
     double dur = (double)(endMs - startMs);
+    UIColor *colW1 = AMColorNamedOrFallback(@"W1", [UIColor whiteColor]);
+    UIColor *colY1 = AMNativeMintColor();
+    UIColor *colP6 = AMNativeP6DarkColor();
+    UIColor *colBl1 = AMColorNamedOrFallback(@"Bl1", [UIColor blackColor]);
 
     CGContextSaveGState(ctx);
     for (int i = 0; i < kfTotal; ++i) {
         float tNorm = (float)((double)(kfTimes[i] - startMs) / dur);
         CGFloat x = (CGFloat)(tNorm * scaleF + offsetF) * w;
-        if (x < -8.0 || x > w + 8.0) continue;
+        if (x < -10.0 || x > w + 10.0) continue;
 
         uint8_t st = kfStyle[i];
-        CGFloat r = (st > 0) ? 5.2 : 4.2;
-        UIBezierPath *d = [UIBezierPath bezierPath];
-        [d moveToPoint:CGPointMake(x, cy - r)];
-        [d addLineToPoint:CGPointMake(x + r, cy)];
-        [d addLineToPoint:CGPointMake(x, cy + r)];
-        [d addLineToPoint:CGPointMake(x - r, cy)];
-        [d closePath];
+        BOOL atPlayhead = (llabs(kfTimes[i] - gAMPuppetEditorCurrentTimeMs) <= 20);
+        // Exact KeyframeView scale formula: bounds.height * 0.40 * (active ? 0.75 : 0.65)
+        CGFloat diamondH = MAX(10.0, v.bounds.size.height * 0.40 * (atPlayhead ? 0.75 : 0.65));
+        UIBezierPath *d = AMNativeKeyframeDiamondPathCentered(diamondH, CGPointMake(x, cy));
 
         if (st > 0) {
-            UIColor *fillCol = (st >= 2 && st <= 4) ? AMRot3DAxisColor(st - 2) : AMAccentGreenColor();
-            [fillCol setFill];
+            [colW1 setFill];
             [d fill];
-            [[UIColor whiteColor] setStroke];
-            d.lineWidth = 1.2;
+            if (atPlayhead) {
+                [(st >= 2 && st <= 4 ? AMRot3DAxisColor(st - 2) : colY1) setStroke];
+                d.lineWidth = 2.0;
+            } else {
+                [(st >= 2 && st <= 4 ? AMRot3DAxisColor(st - 2) : colBl1) setStroke];
+                d.lineWidth = 0.7;
+            }
             [d stroke];
         } else {
-            [[UIColor colorWithRed:0.14 green:0.16 blue:0.24 alpha:0.95] setFill];
+            [colP6 setFill];
             [d fill];
-            [[UIColor whiteColor] setStroke];
-            d.lineWidth = 1.3;
+            [(atPlayhead ? colY1 : colW1) setStroke];
+            d.lineWidth = atPlayhead ? 1.8 : 0.8;
             [d stroke];
         }
     }
@@ -19271,7 +19567,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-6";
+                static NSString *const kAMModBuildVersion = @"2026.11.27-7";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
