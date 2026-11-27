@@ -12485,6 +12485,10 @@ static void AMPresentKeyframeActionMenu(UIViewController *vc,
 @property (nonatomic, assign) uint64_t elementId;
 @end
 
+static float gAMPuppetCopiedPinX = 0.5f;
+static float gAMPuppetCopiedPinY = 0.5f;
+static BOOL gAMPuppetHasCopiedPinKf = NO;
+
 @implementation AMPuppetPanelVC {
     int _slot;
     int64_t _startTimeMs;
@@ -12496,10 +12500,6 @@ static void AMPresentKeyframeActionMenu(UIViewController *vc,
     AMPuppetCanvasOverlayView *_canvasOverlay;
     NSTimer *_syncTimer;
     int64_t _lastPolledTimeMs;
-
-static float gAMPuppetCopiedPinX = 0.5f;
-static float gAMPuppetCopiedPinY = 0.5f;
-static BOOL gAMPuppetHasCopiedPinKf = NO;
 
     // Left rail controls (CompactSideToolVC exact 60pt style)
     AMCompactKeyframeRailView *_rail;
@@ -17250,6 +17250,9 @@ static UIImage *AMRot3DTabIcon(void) {
 @property (nonatomic, assign) BOOL isNullLayer;
 @end
 
+static float gAMRot3DCopiedVal = 0.0f;
+static BOOL gAMRot3DHasCopiedKf = NO;
+
 @implementation AMRot3DPanelVC {
     int _slot;
     int _linkedChildCount;
@@ -17263,9 +17266,6 @@ static UIImage *AMRot3DTabIcon(void) {
     AMRot3DCanvasOverlayView *_canvasOverlay;
     NSTimer *_syncTimer;
     int64_t _lastPolledTimeMs;
-
-static float gAMRot3DCopiedVal = 0.0f;
-static BOOL gAMRot3DHasCopiedKf = NO;
 
     // Left keyframe rail (CompactSideToolVC exact 60pt style)
     AMCompactKeyframeRailView *_rail;
