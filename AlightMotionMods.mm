@@ -9608,8 +9608,11 @@ static void AMHook_layerParentingDidSelectRow(id self, SEL _cmd, UITableView *ta
         Ivar hIv = class_getInstanceVariable([self class], "holder");
         void *holder = hIv ? *(void **)((uint8_t *)(__bridge void *)self + ivar_getOffset(hIv)) : NULL;
         if (holder) {
+            intptr_t slide = AMMainBinarySlide();
+            AMSwiftRetain(holder, slide);
             dispatch_async(dispatch_get_main_queue(), ^{
                 AMRot3DSyncAfterParentingChange(holder);
+                AMSwiftRelease(holder, slide);
             });
         }
         return;
@@ -15484,7 +15487,7 @@ static void AMRot3DCaptureHierarchyFromScenePtr(void *scenePtr, intptr_t slide) 
 
 static BOOL AMRot3DRefreshHierarchyFromHolder(void *holder, uint64_t queryElementId, uint8_t *outType) {
     if (outType) *outType = 0xFF;
-    if (!holder) return NO;
+    if (!holder || ((uintptr_t)holder >> 56) != 0) return NO;
     intptr_t slide = AMMainBinarySlide();
     typedef void *(*MetaFn)(uintptr_t);
     typedef void (*DestroyFn)(void *, void *);
@@ -15848,27 +15851,31 @@ static int AMRot3DSyncOrAttachEffect(void *holder, uint64_t elementId, BOOL atta
     return slot;
 }
 
-static BOOL gAMRot3DLiveSyncQueued = NO;
-static uint64_t gAMRot3DLastSyncNs = 0;
+static volatile int32_t gAMRot3DLiveSyncQueued = 0;
+static volatile uint64_t gAMRot3DLastSyncNs = 0;
 
-static void *AMRot3DFindActiveHolderOnMain(void) {
+static void *AMRot3DCopyActiveHolderOnMain(intptr_t slide) {
     UIView *pv = AMPuppetFindProjectPreviewView(nil);
     if (!pv) return NULL;
-    Ivar iv = class_getInstanceVariable([pv class], "holder");
-    return iv ? *(void **)((uint8_t *)(__bridge void *)pv + ivar_getOffset(iv)) : NULL;
+    // ProjectPreviewView.holder is a Swift weak reference (`weak var holder: ProjectHolder?` / SgXw).
+    // Must be loaded via swift_weakLoadStrong (returns +1 owned ref) instead of raw ivar dereference.
+    return AMSwiftWeakLoadHolder(pv, slide);
 }
 
 static void AMRot3DScheduleLiveHierarchySync(void) {
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    if (gAMRot3DLiveSyncQueued || (now - gAMRot3DLastSyncNs < 300000000ULL)) return;
-    gAMRot3DLiveSyncQueued = YES;
+    uint64_t last = __atomic_load_n(&gAMRot3DLastSyncNs, __ATOMIC_RELAXED);
+    if (now - last < 300000000ULL) return;
+    if (__atomic_exchange_n(&gAMRot3DLiveSyncQueued, 1, __ATOMIC_ACQ_REL) != 0) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        gAMRot3DLiveSyncQueued = NO;
-        gAMRot3DLastSyncNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        void *holder = AMRot3DFindActiveHolderOnMain();
+        __atomic_store_n(&gAMRot3DLastSyncNs, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_RELAXED);
+        __atomic_store_n(&gAMRot3DLiveSyncQueued, 0, __ATOMIC_RELEASE);
+        intptr_t slide = AMMainBinarySlide();
+        void *holder = AMRot3DCopyActiveHolderOnMain(slide);
         if (!holder) return;
         BOOL prevCam = gAMRot3DHasActiveCamera;
         AMRot3DRefreshHierarchyFromHolder(holder, 0, NULL);
+        AMSwiftRelease(holder, slide);
         if (prevCam != gAMRot3DHasActiveCamera) {
             AMForceImmediatePreviewRedraw();
         }
@@ -18810,7 +18817,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-1";
+                static NSString *const kAMModBuildVersion = @"2026.11.27-2";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
