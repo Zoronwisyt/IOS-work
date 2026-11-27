@@ -14731,8 +14731,10 @@ static void AMHook_appAttestAttestKey(id self, SEL _cmd, NSString *keyId, NSData
 static void AMPurgeSideStoreMemoryCaches(BOOL isCritical) {
     gAMLastMemoryPressureEpoch = [[NSDate date] timeIntervalSince1970];
     [[NSURLCache sharedURLCache] removeAllCachedResponses];
-    [AMCategoryThumbCache() removeAllObjects];
-    [[AMHomepageSearchOverlayManager shared] purgeTransientCaches];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [AMCategoryThumbCache() removeAllObjects];
+        [[AMHomepageSearchOverlayManager shared] purgeTransientCaches];
+    });
     if (isCritical) {
         malloc_zone_pressure_relief(NULL, 0);
     }
@@ -15115,7 +15117,9 @@ static void AlightMotionModsInit(void) {
 
     // Module 7: Puppet Tool (EditingPanelVC native card, Timeline KeyframeView diamonds, Metal uniform hook)
     [AMPuppetStore shared];
-    AMInstallPuppetMetalHook();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AMInstallPuppetMetalHook();
+    });
     AMSwizzleMethod(@"_TtC12AlightMotion14EditingPanelVC",
                     @"collectionView:numberOfItemsInSection:",
                     (IMP)AMHook_editingPanelNumItems,

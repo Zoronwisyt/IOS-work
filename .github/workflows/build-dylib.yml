@@ -34,7 +34,12 @@ jobs:
             -framework Accelerate \
             -o AlightMotionMods.dylib \
             AlightMotionMods.mm
-          codesign -f -s - AlightMotionMods.dylib
+          if command -v ldid >/dev/null 2>&1 || brew install ldid; then
+            codesign --remove-signature AlightMotionMods.dylib || true
+            ldid -S AlightMotionMods.dylib
+          else
+            codesign -f -s - -i AlightMotionMods.dylib AlightMotionMods.dylib
+          fi
           file AlightMotionMods.dylib
           otool -L AlightMotionMods.dylib
 
