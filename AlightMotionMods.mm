@@ -828,63 +828,11 @@ static void AMHandleUserLinkFromVC(UIViewController *vc, NSURL *u, BOOL directBy
 }
 
 static const void *kAMSettingsBackupBtnKey = &kAMSettingsBackupBtnKey;
-static const void *kAMSettingsImportIPABtnKey = &kAMSettingsImportIPABtnKey;
-static const void *kAMImportIPAPickerHelperKey = &kAMImportIPAPickerHelperKey;
 static void AMPresentBackupVaultFromVC(UIViewController *vc);
-
-@interface AMImportIPAPickerHelper : NSObject <UIDocumentPickerDelegate>
-@property (nonatomic, weak) UIViewController *hostVC;
-@end
-
-@implementation AMImportIPAPickerHelper
-
-- (void)shareIPAURL:(NSURL *)fileURL fromVC:(UIViewController *)vc {
-    if (!fileURL || !vc) return;
-    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[fileURL] applicationActivities:nil];
-    if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
-        avc.popoverPresentationController.sourceView = vc.view;
-        avc.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(vc.view.bounds), CGRectGetMidY(vc.view.bounds), 1, 1);
-    }
-    [vc presentViewController:avc animated:YES completion:nil];
-}
-
-- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
-    (void)controller;
-    NSURL *picked = urls.firstObject;
-    UIViewController *vc = self.hostVC;
-    if (!picked || !vc) return;
-
-    BOOL scoped = [picked startAccessingSecurityScopedResource];
-    NSString *tmpDir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"AMImportIPA"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:tmpDir withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *name = picked.lastPathComponent.length ? picked.lastPathComponent : @"Imported.ipa";
-    if (![name.pathExtension.lowercaseString isEqualToString:@"ipa"]) {
-        name = [name stringByAppendingPathExtension:@"ipa"];
-    }
-    NSString *destPath = [tmpDir stringByAppendingPathComponent:name];
-    [[NSFileManager defaultManager] removeItemAtPath:destPath error:nil];
-    NSError *cpErr = nil;
-    BOOL ok = [[NSFileManager defaultManager] copyItemAtURL:picked toURL:[NSURL fileURLWithPath:destPath] error:&cpErr];
-    if (scoped) [picked stopAccessingSecurityScopedResource];
-
-    if (!ok) {
-        UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Import IPA Failed"
-                                                                          message:cpErr.localizedDescription ?: @"Could not read selected IPA."
-                                                                   preferredStyle:UIAlertControllerStyleAlert];
-        [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [vc presentViewController:errAlert animated:YES completion:nil];
-        return;
-    }
-
-    [self shareIPAURL:[NSURL fileURLWithPath:destPath] fromVC:vc];
-}
-
-@end
 
 @interface AMSettingsLinkHandler : NSObject
 + (void)onTapOpenLink:(UIButton *)btn;
 + (void)onTapOpenBackupVault:(UIButton *)btn;
-+ (void)onTapImportIPA:(UIButton *)btn;
 @end
 
 @implementation AMSettingsLinkHandler
@@ -893,130 +841,6 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc);
     UIViewController *vc = objc_getAssociatedObject(btn, kAMSettingsBackupBtnKey);
     if (!vc) return;
     AMPresentBackupVaultFromVC(vc);
-}
-
-+ (void)openIPAInstallURLString:(NSString *)urlStr fromVC:(UIViewController *)vc {
-    NSString *trimmed = [urlStr stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (!trimmed.length) return;
-    NSURL *rawURL = [NSURL URLWithString:trimmed];
-    if (!rawURL || !rawURL.scheme.length) return;
-
-    UIApplication *app = [UIApplication sharedApplication];
-    BOOL hasSideStore = [app canOpenURL:[NSURL URLWithString:@"sidestore://"]];
-    BOOL hasAltStore = !hasSideStore && [app canOpenURL:[NSURL URLWithString:@"altstore://"]];
-    if (hasSideStore || hasAltStore) {
-        NSString *encoded = [trimmed stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
-        encoded = [encoded stringByReplacingOccurrencesOfString:@"&" withString:@"%26"];
-        NSString *scheme = hasSideStore ? @"sidestore" : @"altstore";
-        NSURL *installURL = [NSURL URLWithString:[NSString stringWithFormat:@"%@://install?url=%@", scheme, encoded]];
-        if (installURL) {
-            [app openURL:installURL options:@{} completionHandler:nil];
-            return;
-        }
-    }
-
-    UIAlertController *loading = [UIAlertController alertControllerWithTitle:@"Downloading IPA..."
-                                                                     message:@"Fetching package for sideload share sheet."
-                                                              preferredStyle:UIAlertControllerStyleAlert];
-    [vc presentViewController:loading animated:YES completion:^{
-        NSURLRequest *req = [NSURLRequest requestWithURL:rawURL cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:60.0];
-        [[[NSURLSession sharedSession] downloadTaskWithRequest:req completionHandler:^(NSURL *loc, NSURLResponse *resp, NSError *err) {
-            (void)resp;
-            NSString *destPath = nil;
-            if (!err && loc) {
-                NSString *tmpDir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"AMImportIPA"];
-                [[NSFileManager defaultManager] createDirectoryAtPath:tmpDir withIntermediateDirectories:YES attributes:nil error:nil];
-                NSString *fn = rawURL.lastPathComponent.length ? rawURL.lastPathComponent : @"Imported.ipa";
-                if (![fn.pathExtension.lowercaseString isEqualToString:@"ipa"]) fn = [fn stringByAppendingPathExtension:@"ipa"];
-                destPath = [tmpDir stringByAppendingPathComponent:fn];
-                [[NSFileManager defaultManager] removeItemAtPath:destPath error:nil];
-                if (![[NSFileManager defaultManager] moveItemAtURL:loc toURL:[NSURL fileURLWithPath:destPath] error:nil]) {
-                    destPath = nil;
-                }
-            }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [loading dismissViewControllerAnimated:YES completion:^{
-                    if (!destPath) {
-                        UIAlertController *fail = [UIAlertController alertControllerWithTitle:@"Download Failed"
-                                                                                    message:err.localizedDescription ?: @"Could not download IPA."
-                                                                             preferredStyle:UIAlertControllerStyleAlert];
-                        [fail addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-                        [vc presentViewController:fail animated:YES completion:nil];
-                        return;
-                    }
-                    AMImportIPAPickerHelper *helper = objc_getAssociatedObject(vc, kAMImportIPAPickerHelperKey);
-                    if (!helper) {
-                        helper = [[AMImportIPAPickerHelper alloc] init];
-                        helper.hostVC = vc;
-                        objc_setAssociatedObject(vc, kAMImportIPAPickerHelperKey, helper, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                    }
-                    [helper shareIPAURL:[NSURL fileURLWithPath:destPath] fromVC:vc];
-                }];
-            });
-        }] resume];
-    }];
-}
-
-+ (void)onTapImportIPA:(UIButton *)btn {
-    UIViewController *vc = objc_getAssociatedObject(btn, kAMSettingsImportIPABtnKey);
-    if (!vc) return;
-
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Import IPA"
-                                                                 message:@"Pick a local .ipa file or enter a direct .ipa URL to send to SideStore, AltStore, or Share Sheet."
-                                                          preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Pick .ipa File (Files)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        (void)a;
-        AMImportIPAPickerHelper *helper = [[AMImportIPAPickerHelper alloc] init];
-        helper.hostVC = vc;
-        objc_setAssociatedObject(vc, kAMImportIPAPickerHelperKey, helper, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-        UIDocumentPickerViewController *picker = nil;
-        if (@available(iOS 14.0, *)) {
-            UTType *ipaType = [UTType typeWithFilenameExtension:@"ipa"] ?: UTTypeData;
-            picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[ipaType, UTTypeData, UTTypeArchive] asCopy:YES];
-        } else {
-            picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"com.apple.itunes.ipa", @"public.data", @"public.zip-archive"] inMode:UIDocumentPickerModeImport];
-        }
-        picker.delegate = helper;
-        picker.allowsMultipleSelection = NO;
-        [vc presentViewController:picker animated:YES completion:nil];
-    }]];
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Import IPA from URL" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        (void)a;
-        NSString *clip = [[UIPasteboard generalPasteboard].string stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] ?: @"";
-        UIAlertController *prompt = [UIAlertController alertControllerWithTitle:@"Import IPA from URL"
-                                                                        message:@"Paste a direct .ipa download URL."
-                                                                 preferredStyle:UIAlertControllerStyleAlert];
-        [prompt addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-            tf.placeholder = @"https://.../app.ipa";
-            tf.keyboardType = UIKeyboardTypeURL;
-            tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
-            tf.autocorrectionType = UITextAutocorrectionTypeNo;
-            tf.clearButtonMode = UITextFieldViewModeWhileEditing;
-            if ([clip.lowercaseString hasPrefix:@"http://"] || [clip.lowercaseString hasPrefix:@"https://"]) {
-                tf.text = clip;
-            }
-        }];
-        [prompt addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-        [prompt addAction:[UIAlertAction actionWithTitle:@"Import" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
-            (void)act;
-            [self openIPAInstallURLString:prompt.textFields.firstObject.text ?: @"" fromVC:vc];
-        }]];
-        [vc presentViewController:prompt animated:YES completion:nil];
-    }]];
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Update Latest Rock Motion IPA" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        (void)a;
-        [self openIPAInstallURLString:@"https://github.com/Zoronwisyt/Very-Good-IPA/releases/latest/download/AlightMotion_Modded.ipa" fromVC:vc];
-    }]];
-
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
-        sheet.popoverPresentationController.sourceView = btn;
-        sheet.popoverPresentationController.sourceRect = btn.bounds;
-    }
-    [vc presentViewController:sheet animated:YES completion:nil];
 }
 
 + (void)onTapOpenLink:(UIButton *)btn {
@@ -1078,7 +902,7 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     CGFloat w = tv.bounds.size.width > 0 ? tv.bounds.size.width : 280.0;
     UIView *existingHdr = tv.tableHeaderView;
     CGFloat existingH = existingHdr ? existingHdr.frame.size.height : 0.0;
-    CGFloat pillContainerH = 150.0;
+    CGFloat pillContainerH = 100.0;
 
     UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, existingH + pillContainerH)];
     header.backgroundColor = [UIColor clearColor];
@@ -1139,31 +963,6 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     backupIcon.tintColor = AMSettingsTextColor();
     [backupPill addSubview:backupIcon];
 
-    UIButton *importIPAPill = [UIButton buttonWithType:UIButtonTypeSystem];
-    importIPAPill.translatesAutoresizingMaskIntoConstraints = NO;
-    importIPAPill.backgroundColor = AMSettingsPillColor();
-    importIPAPill.layer.cornerRadius = 14.0;
-    importIPAPill.clipsToBounds = YES;
-    [header addSubview:importIPAPill];
-
-    UILabel *importIPALbl = [[UILabel alloc] init];
-    importIPALbl.translatesAutoresizingMaskIntoConstraints = NO;
-    importIPALbl.text = @"Import IPA";
-    importIPALbl.font = AMThemeFont(14.0, UIFontWeightMedium);
-    importIPALbl.textColor = AMSettingsTextColor();
-    importIPALbl.userInteractionEnabled = NO;
-    [importIPAPill addSubview:importIPALbl];
-
-    UIImageView *importIPAIcon = [[UIImageView alloc] init];
-    importIPAIcon.translatesAutoresizingMaskIntoConstraints = NO;
-    importIPAIcon.userInteractionEnabled = NO;
-    if (@available(iOS 13.0, *)) {
-        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:13.0 weight:UIImageSymbolWeightMedium];
-        importIPAIcon.image = [UIImage systemImageNamed:@"square.and.arrow.down.on.square" withConfiguration:cfg];
-    }
-    importIPAIcon.tintColor = AMSettingsTextColor();
-    [importIPAPill addSubview:importIPAIcon];
-
     [NSLayoutConstraint activateConstraints:@[
         [pill.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16.0],
         [pill.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16.0],
@@ -1186,17 +985,6 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
 
         [backupIcon.trailingAnchor constraintEqualToAnchor:backupPill.trailingAnchor constant:-15.0],
         [backupIcon.centerYAnchor constraintEqualToAnchor:backupPill.centerYAnchor],
-
-        [importIPAPill.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16.0],
-        [importIPAPill.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16.0],
-        [importIPAPill.topAnchor constraintEqualToAnchor:backupPill.bottomAnchor constant:8.0],
-        [importIPAPill.heightAnchor constraintEqualToConstant:42.0],
-
-        [importIPALbl.leadingAnchor constraintEqualToAnchor:importIPAPill.leadingAnchor constant:16.0],
-        [importIPALbl.centerYAnchor constraintEqualToAnchor:importIPAPill.centerYAnchor],
-
-        [importIPAIcon.trailingAnchor constraintEqualToAnchor:importIPAPill.trailingAnchor constant:-15.0],
-        [importIPAIcon.centerYAnchor constraintEqualToAnchor:importIPAPill.centerYAnchor],
     ]];
 
     objc_setAssociatedObject(pill, kAMSettingsLinkBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
@@ -1208,11 +996,6 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     [backupPill addTarget:[AMSettingsLinkHandler class]
                    action:@selector(onTapOpenBackupVault:)
          forControlEvents:UIControlEventTouchUpInside];
-
-    objc_setAssociatedObject(importIPAPill, kAMSettingsImportIPABtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
-    [importIPAPill addTarget:[AMSettingsLinkHandler class]
-                      action:@selector(onTapImportIPA:)
-            forControlEvents:UIControlEventTouchUpInside];
 
     tv.tableHeaderView = header;
     objc_setAssociatedObject(vc, kAMSettingsLinkBtnKey, pill, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -19034,7 +18817,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-4";
+                static NSString *const kAMModBuildVersion = @"2026.11.27-5";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
