@@ -12638,7 +12638,8 @@ struct AMAutoBeatCandidate {
     float highEnergy;    // hi-hat/transient energy
     uint8_t tier;        // 1=light/in-between, 2=mid/snare, 3=strong/kick, 4=downbeat/drop
     bool isGridBeat;
-    bool isHalfBeat;
+    bool isHalfNote;     // true for consistent 1/2-note beats (beats 1 & 3 of 4/4 bar)
+    bool isHalfBeat;     // true for 1/8-note in-between subdivisions
     bool isPercussiveHit;
 };
 
@@ -13249,130 +13250,305 @@ static AMAutoBeatsAnalysisResult AMAutoBeatsAnalyzeAudio(const AMAutoBeatsAudioI
         c.highEnergy = hE;
         c.tier = tier;
         c.isGridBeat = false;
+        c.isHalfNote = false;
         c.isHalfBeat = false;
         c.isPercussiveHit = true;
         res.percussiveHits.push_back(c);
     }
 
     // ------------------------------------------------------------------------
-    // Stage 2: Building a Consistent Rhythmic Grid (Autocorrelation + DP Tracker)
+    // Stage 2: 3-Stage Multi-Resolution Comb Pyramid + PCM Attack Alignment
     // ------------------------------------------------------------------------
-    int lagMin = std::max(8, (int)floor(60.0 / (190.0 * hopSec)));  // 190 BPM
-    int lagMax = std::min((int)numFrames / 2, (int)ceil(60.0 / (60.0 * hopSec))); // 60 BPM
-    if (lagMax <= lagMin + 2) {
-        lagMin = 24;
-        lagMax = 86;
+    // Slightly dilated onset (+/- 1 hop) for robust comb scoring
+    std::vector<float> onsetDil(numFrames, 0.0f);
+    for (size_t i = 0; i < numFrames; ++i) {
+        float nb = 0.0f;
+        if (i > 0) nb = fmaxf(nb, onset[i - 1]);
+        if (i + 1 < numFrames) nb = fmaxf(nb, onset[i + 1]);
+        onsetDil[i] = fmaxf(onset[i], 0.70f * nb);
     }
 
-    std::vector<double> ac(lagMax + 1, 0.0);
-    // Use up to first 90s (~7750 frames) for tempo autocorrelation to stay ultra-fast
-    size_t acFrames = std::min<size_t>(numFrames, 7750);
-    for (int lag = lagMin / 2; lag <= std::min((int)acFrames - 1, lagMax * 2); ++lag) {
-        if (lag > lagMax) break;
-        double sum = 0.0;
-        size_t cnt = acFrames - (size_t)lag;
-        for (size_t i = 0; i < cnt; ++i) {
-            sum += (double)onset[i] * (double)onset[i + (size_t)lag];
+    auto combScoreWindow = [&](double bpmVal, size_t fStart, size_t fEnd, int nPhases, double *outPhi) -> double {
+        double periodF = 60.0 / (bpmVal * hopSec);
+        if (periodF < 4.0 || fEnd <= fStart || (double)(fEnd - fStart) < periodF * 2.5) {
+            if (outPhi) *outPhi = 0.0;
+            return 0.0;
         }
-        ac[lag] = sum / (double)std::max<size_t>(1, cnt);
-    }
-
-    // Apply perceptual tempo prior (~120 BPM) + harmonic reinforcement to avoid half/double-time errors
-    int bestLag = (lagMin + lagMax) / 2;
-    double bestScore = -1.0;
-    const double targetLag = 60.0 / (120.0 * hopSec);
-    for (int lag = lagMin; lag <= lagMax; ++lag) {
-        double logRatio = log((double)lag / targetLag);
-        double prior = exp(-0.5 * (logRatio / 0.55) * (logRatio / 0.55));
-        double harm = ac[lag];
-        if (lag * 2 <= lagMax) harm += 0.45 * ac[lag * 2];
-        if (lag / 2 >= lagMin / 2) harm += 0.25 * ac[lag / 2];
-        double score = harm * prior;
-        if (score > bestScore) {
-            bestScore = score;
-            bestLag = lag;
-        }
-    }
-
-    // Refine beat period with parabolic interpolation
-    double exactPeriod = (double)bestLag;
-    if (bestLag > lagMin && bestLag < lagMax) {
-        double y0 = ac[bestLag - 1], y1 = ac[bestLag], y2 = ac[bestLag + 1];
-        double denom = y0 - 2.0 * y1 + y2;
-        if (fabs(denom) > 1e-9) {
-            double d = fmax(-0.5, fmin(0.5, 0.5 * (y0 - y2) / denom));
-            exactPeriod += d;
-        }
-    }
-    res.estimatedBPM = (60.0 / (exactPeriod * hopSec)) * speed;
-
-    // Ellis Dynamic Programming Beat Tracking: builds a consistent grid even across quiet transitions
-    std::vector<float> dpScore(numFrames, 0.0f);
-    std::vector<int> backlink(numFrames, -1);
-    const int dMin = std::max(4, (int)round(exactPeriod * 0.5));
-    const int dMax = std::max(dMin + 1, (int)round(exactPeriod * 2.0));
-    const float kAlpha = 18.0f;
-
-    std::vector<float> penalty(dMax + 1, 0.0f);
-    for (int d = dMin; d <= dMax; ++d) {
-        float lr = logf((float)d / (float)exactPeriod);
-        penalty[d] = -kAlpha * lr * lr;
-    }
-
-    for (size_t t = 0; t < numFrames; ++t) {
-        float localObs = onset[t];
-        float bestPrev = 0.0f;
-        int bestIdx = -1;
-        if ((int)t >= dMin) {
-            int maxLook = std::min((int)t, dMax);
-            bestPrev = -1e9f;
-            for (int d = dMin; d <= maxLook; ++d) {
-                float cand = dpScore[t - (size_t)d] + penalty[d];
-                if (cand > bestPrev) {
-                    bestPrev = cand;
-                    bestIdx = (int)t - d;
+        double bestSc = -1.0;
+        double bestPhi = 0.0;
+        for (int pi = 0; pi < nPhases; ++pi) {
+            double phi = ((double)pi / (double)nPhases) * periodF;
+            double sum = 0.0;
+            int cnt = 0;
+            for (double gf = (double)fStart + phi; gf < (double)(fEnd - 1); gf += periodF) {
+                size_t idx = (size_t)llround(gf);
+                if (idx < numFrames) {
+                    sum += (double)onsetDil[idx];
+                    cnt++;
                 }
             }
-            if (bestPrev < 0.0f) {
-                bestPrev = 0.0f;
-                bestIdx = -1;
+            double sc = (cnt > 0) ? (sum / (double)cnt) : 0.0;
+            if (sc > bestSc) {
+                bestSc = sc;
+                bestPhi = phi;
             }
         }
-        dpScore[t] = localObs + bestPrev;
-        backlink[t] = bestIdx;
-    }
+        if (outPhi) *outPhi = bestPhi;
+        return (bestSc > 0.0) ? bestSc : 0.0;
+    };
 
-    // Backtrack from best ending beat
-    int endWindow = std::min((int)numFrames, (int)round(exactPeriod * 1.5));
-    int cur = (int)numFrames - 1;
-    float maxEnd = -1e9f;
-    for (int t = (int)numFrames - endWindow; t < (int)numFrames; ++t) {
-        if (t >= 0 && dpScore[t] > maxEnd) {
-            maxEnd = dpScore[t];
-            cur = t;
+    // Stage 2A: Coarse scan on up to 4 evenly-spaced 16s windows (65..185 BPM, step 0.5 BPM)
+    size_t winLen = std::min<size_t>(numFrames, (size_t)(16.0 / hopSec));
+    size_t nWins = std::min<size_t>(4, std::max<size_t>(1, numFrames / std::max<size_t>(1, winLen)));
+    std::vector<std::pair<size_t, size_t>> coarseWins;
+    if (nWins <= 1) {
+        coarseWins.push_back({0, numFrames});
+    } else {
+        for (size_t w = 0; w < nWins; ++w) {
+            size_t s = (size_t)((double)w * (double)(numFrames - winLen) / (double)(nWins - 1));
+            coarseWins.push_back({s, s + winLen});
         }
     }
 
-    std::vector<int> beatFrames;
-    while (cur >= 0) {
-        beatFrames.push_back(cur);
-        cur = backlink[cur];
+    std::vector<std::pair<double, double>> coarseList;
+    coarseList.reserve(245);
+    for (int bi = 130; bi <= 370; ++bi) { // 65.0 .. 185.0 BPM in 0.5 BPM steps
+        double b = (double)bi * 0.5;
+        double sumSc = 0.0;
+        for (const auto &w : coarseWins) {
+            sumSc += combScoreWindow(b, w.first, w.second, 20, NULL);
+        }
+        coarseList.push_back({sumSc / (double)coarseWins.size(), b});
     }
-    std::reverse(beatFrames.begin(), beatFrames.end());
+    std::sort(coarseList.begin(), coarseList.end(), [](const std::pair<double, double> &a, const std::pair<double, double> &b) {
+        return a.first > b.first;
+    });
 
-    // Extend grid smoothly to the very start if DP started after > 1.25 beats
-    while (!beatFrames.empty() && beatFrames.front() > (int)round(exactPeriod * 1.15)) {
-        int prevF = beatFrames.front() - (int)round(exactPeriod);
-        if (prevF < 0) break;
-        beatFrames.insert(beatFrames.begin(), prevF);
+    std::vector<double> coarseCands;
+    for (const auto &item : coarseList) {
+        bool distinct = true;
+        for (double cb : coarseCands) {
+            if (fabs(item.second - cb) < 2.5) { distinct = false; break; }
+        }
+        if (distinct) {
+            coarseCands.push_back(item.second);
+            if (coarseCands.size() >= 6) break;
+        }
+    }
+    if (coarseCands.empty()) coarseCands.push_back(120.0);
+
+    // Stage 2B: Medium scan on 45s window (+/- 0.6 BPM in 0.05 BPM steps)
+    size_t medLen = std::min<size_t>(numFrames, (size_t)(45.0 / hopSec));
+    size_t medStart = (numFrames > medLen) ? ((numFrames - medLen) / 3) : 0;
+    std::vector<std::pair<double, double>> medList;
+    for (double cb : coarseCands) {
+        double bestSc = -1.0;
+        double bestB = cb;
+        for (int step = -12; step <= 12; ++step) {
+            double b = cb + (double)step * 0.05;
+            if (b < 60.0 || b > 195.0) continue;
+            double sc = combScoreWindow(b, medStart, medStart + medLen, 32, NULL);
+            if (sc > bestSc) {
+                bestSc = sc;
+                bestB = b;
+            }
+        }
+        medList.push_back({bestSc, bestB});
+    }
+    std::sort(medList.begin(), medList.end(), [](const std::pair<double, double> &a, const std::pair<double, double> &b) {
+        return a.first > b.first;
+    });
+
+    // Stage 2C: Fine scan across FULL track (+/- 0.12 BPM in 0.005 BPM steps) for top 3
+    double bestBPM = medList[0].second;
+    double bestRawComb = 0.0;
+    double bestWeightedComb = -1.0;
+    double bestPhi = 0.0;
+    size_t topK = std::min<size_t>(3, medList.size());
+    for (size_t ci = 0; ci < topK; ++ci) {
+        double mb = medList[ci].second;
+        double localBestSc = -1.0;
+        double localBestB = mb;
+        double localBestPhi = 0.0;
+        for (int step = -24; step <= 24; ++step) {
+            double b = mb + (double)step * 0.005;
+            double phi = 0.0;
+            double sc = combScoreWindow(b, 0, numFrames, 40, &phi);
+            if (sc > localBestSc) {
+                localBestSc = sc;
+                localBestB = b;
+                localBestPhi = phi;
+            }
+        }
+        double lr = log(localBestB / 115.0);
+        double prior = 0.92 + 0.08 * exp(-0.5 * (lr / 0.55) * (lr / 0.55));
+        double weighted = localBestSc * prior;
+        if (weighted > bestWeightedComb) {
+            bestWeightedComb = weighted;
+            bestRawComb = localBestSc;
+            bestBPM = localBestB;
+            bestPhi = localBestPhi;
+        }
+    }
+
+    // Octave disambiguation on full track (prevent half-time / double-time mistakes)
+    if (bestBPM > 142.0) {
+        double phiH = 0.0;
+        double scH = combScoreWindow(bestBPM * 0.5, 0, numFrames, 48, &phiH);
+        if (scH >= bestRawComb * 0.93) {
+            bestBPM *= 0.5;
+            bestPhi = phiH;
+            bestRawComb = scH;
+        }
+    } else if (bestBPM < 80.0) {
+        double phiD = 0.0;
+        double scD = combScoreWindow(bestBPM * 2.0, 0, numFrames, 48, &phiD);
+        if (scD >= bestRawComb * 0.90) {
+            bestBPM *= 2.0;
+            bestPhi = phiD;
+            bestRawComb = scD;
+        }
+    }
+
+    double exactPeriod = 60.0 / (bestBPM * hopSec);
+    res.estimatedBPM = bestBPM * speed;
+
+    // Sub-hop spectral phase refinement (+/- 1.5 hops in 0.05-hop steps)
+    double bestRefPhi = bestPhi;
+    double bestRefSc = -1.0;
+    for (int sp = -30; sp <= 30; ++sp) {
+        double phi = bestPhi + (double)sp * 0.05;
+        while (phi < 0.0) phi += exactPeriod;
+        while (phi >= exactPeriod) phi -= exactPeriod;
+        double sum = 0.0;
+        int cnt = 0;
+        for (double gf = phi; gf < (double)(numFrames - 2); gf += exactPeriod) {
+            size_t gi = (size_t)floor(gf);
+            double frac = gf - (double)gi;
+            if (gi + 1 < numFrames) {
+                sum += (double)onset[gi] * (1.0 - frac) + (double)onset[gi + 1] * frac;
+                cnt++;
+            }
+        }
+        double sc = (cnt > 0) ? (sum / (double)cnt) : 0.0;
+        if (sc > bestRefSc) {
+            bestRefSc = sc;
+            bestRefPhi = phi;
+        }
+    }
+
+    // Build quarter-note beat positions (in fractional hop units):
+    // Steady/quantized tracks (combScore >= 0.42) use the pure phase-locked comb grid (0ms drift!).
+    // Live/rubato tracks (combScore < 0.42) use stiff Ellis DP anchored to exactPeriod.
+    std::vector<double> beatPosFrames;
+    if (bestRawComb >= 0.42) {
+        for (double gf = bestRefPhi; gf < (double)(numFrames - 1); gf += exactPeriod) {
+            beatPosFrames.push_back(gf);
+        }
+    } else {
+        std::vector<float> dpScore(numFrames, 0.0f);
+        std::vector<int> backlink(numFrames, -1);
+        const int dMin = std::max(4, (int)round(exactPeriod * 0.65));
+        const int dMax = std::max(dMin + 1, (int)round(exactPeriod * 1.50));
+        const float kAlpha = 45.0f;
+
+        std::vector<float> penalty(dMax + 1, 0.0f);
+        for (int d = dMin; d <= dMax; ++d) {
+            float lr = logf((float)d / (float)exactPeriod);
+            penalty[d] = -kAlpha * lr * lr;
+        }
+        for (size_t t = 0; t < numFrames; ++t) {
+            float localObs = onset[t];
+            float bestPrev = 0.0f;
+            int bestIdx = -1;
+            if ((int)t >= dMin) {
+                int maxLook = std::min((int)t, dMax);
+                bestPrev = -1e9f;
+                for (int d = dMin; d <= maxLook; ++d) {
+                    float cand = dpScore[t - (size_t)d] + penalty[d];
+                    if (cand > bestPrev) {
+                        bestPrev = cand;
+                        bestIdx = (int)t - d;
+                    }
+                }
+                if (bestPrev < 0.0f) { bestPrev = 0.0f; bestIdx = -1; }
+            }
+            dpScore[t] = localObs + bestPrev;
+            backlink[t] = bestIdx;
+        }
+        int endWindow = std::min((int)numFrames, (int)round(exactPeriod * 1.5));
+        int cur = (int)numFrames - 1;
+        float maxEnd = -1e9f;
+        for (int t = (int)numFrames - endWindow; t < (int)numFrames; ++t) {
+            if (t >= 0 && dpScore[t] > maxEnd) { maxEnd = dpScore[t]; cur = t; }
+        }
+        std::vector<int> rev;
+        while (cur >= 0) { rev.push_back(cur); cur = backlink[cur]; }
+        std::reverse(rev.begin(), rev.end());
+        while (!rev.empty() && rev.front() > (int)round(exactPeriod * 1.15)) {
+            int prevF = rev.front() - (int)round(exactPeriod);
+            if (prevF < 0) break;
+            rev.insert(rev.begin(), prevF);
+        }
+        for (int f : rev) beatPosFrames.push_back((double)f);
+    }
+
+    // PCM Attack Phase Alignment: eliminates the ~35-44ms 1024-sample FFT lookahead bias
+    // so beat markers land on the EXACT millisecond the kick/snare physically strikes!
+    double pcmAttackShiftSec = 0.036; // safe fallback (~0.78 * FFT_SIZE / sr)
+    {
+        const size_t kRmsStep = 110; // ~5.0 ms @ 22050 Hz
+        size_t nRms = pcm.size() / kRmsStep;
+        if (nRms > 20 && !beatPosFrames.empty()) {
+            std::vector<float> rms(nRms, 0.0f);
+            for (size_t k = 0; k < nRms; ++k) {
+                const float *p = pcm.data() + k * kRmsStep;
+                float s2 = 0.0f;
+                vDSP_svesq(p, 1, &s2, kRmsStep);
+                rms[k] = sqrtf(s2 / (float)kRmsStep);
+            }
+            std::vector<float> attack(nRms, 0.0f);
+            for (size_t k = 1; k < nRms; ++k) {
+                float d = rms[k] - rms[k - 1];
+                attack[k] = (d > 0.0f) ? d : 0.0f;
+            }
+            double bestShiftSec = 0.036;
+            double bestAtkScore = -1.0;
+            // Sweep +15ms .. +46ms in 1ms steps
+            for (int ms = 15; ms <= 46; ++ms) {
+                double shiftSec = (double)ms / 1000.0;
+                double sum = 0.0;
+                int cnt = 0;
+                for (double gf : beatPosFrames) {
+                    double tSec = gf * hopSec + shiftSec;
+                    size_t idx = (size_t)llround((tSec * kSampleRate) / (double)kRmsStep);
+                    if (idx >= 1 && idx + 1 < nRms) {
+                        sum += (double)attack[idx] + 0.5 * (double)attack[idx + 1];
+                        cnt++;
+                    }
+                }
+                double sc = (cnt > 0) ? (sum / (double)cnt) : 0.0;
+                if (sc > bestAtkScore) {
+                    bestAtkScore = sc;
+                    bestShiftSec = shiftSec;
+                }
+            }
+            pcmAttackShiftSec = bestShiftSec;
+        }
+    }
+
+    // Apply the same PCM attack shift to percussiveHits so Hits mode is equally tight
+    int64_t attackShiftTimelineMs = llround((pcmAttackShiftSec * 1000.0) / speed);
+    for (auto &h : res.percussiveHits) {
+        h.timelineMs += attackShiftTimelineMs;
     }
 
     // ------------------------------------------------------------------------
-    // Stage 3: Classifying Beat Strength (Downbeat Phase + Energy Hierarchy)
+    // Stage 3: Classifying Beat Strength (Downbeat Phase + 1/2, 1/4, 1/8 Grid)
     // ------------------------------------------------------------------------
     double phaseScore[4] = {0, 0, 0, 0};
-    for (size_t i = 0; i < beatFrames.size(); ++i) {
-        int f = beatFrames[i];
+    for (size_t i = 0; i < beatPosFrames.size(); ++i) {
+        int f = std::min((int)numFrames - 1, std::max(0, (int)llround(beatPosFrames[i])));
         float lowPeak = lowFlux[f];
         if (f > 0) lowPeak = fmaxf(lowPeak, lowFlux[f - 1]);
         if (f + 1 < (int)numFrames) lowPeak = fmaxf(lowPeak, lowFlux[f + 1]);
@@ -13391,31 +13567,13 @@ static AMAutoBeatsAnalysisResult AMAutoBeatsAnalyzeAudio(const AMAutoBeatsAudioI
         return mx;
     };
 
-    // Helper to refine a grid beat frame to the sharpest nearby transient (+/- 2 hops)
-    auto refineFrame = [&](int f) -> double {
-        int bestF = f;
-        float bestV = onset[f];
-        for (int d = -2; d <= 2; ++d) {
-            int nf = f + d;
-            if (nf >= 1 && nf + 1 < (int)numFrames && onset[nf] > bestV) {
-                bestV = onset[nf];
-                bestF = nf;
-            }
-        }
-        if (bestV > 0.12f && bestF >= 1 && bestF + 1 < (int)numFrames) {
-            float y0 = onset[bestF - 1], y1 = onset[bestF], y2 = onset[bestF + 1];
-            float denom = y0 - 2.0f * y1 + y2;
-            float delta = (fabsf(denom) > 1e-6f) ? fmaxf(-0.5f, fminf(0.5f, 0.5f * (y0 - y2) / denom)) : 0.0f;
-            return (double)bestF + (double)delta;
-        }
-        return (double)f;
-    };
-
-    for (size_t i = 0; i < beatFrames.size(); ++i) {
-        int f = beatFrames[i];
-        double rf = refineFrame(f);
-        int64_t tMs = srcSecToTimelineMs(rf * hopSec);
-        bool isDownbeat = ((int)(i % 4) == downbeatPhase);
+    for (size_t i = 0; i < beatPosFrames.size(); ++i) {
+        double gf = beatPosFrames[i];
+        int f = std::min((int)numFrames - 1, std::max(0, (int)llround(gf)));
+        int64_t tMs = srcSecToTimelineMs(gf * hopSec + pcmAttackShiftSec);
+        int barPos = ((int)i - downbeatPhase + 400000) % 4;
+        bool isDownbeat = (barPos == 0);
+        bool isHalfNote = (barPos == 0 || barPos == 2); // beats 1 & 3 of every 4/4 bar
 
         float lE = sampleWindowMax(lowFlux, f, 2);
         float mE = sampleWindowMax(midFlux, f, 2);
@@ -13425,9 +13583,9 @@ static AMAutoBeatsAnalysisResult AMAutoBeatsAnalyzeAudio(const AMAutoBeatsAudioI
         float rawStr = 0.45f * fminf(1.0f, oE) + 0.35f * fminf(1.0f, lE) + 0.12f * fminf(1.0f, mE) + (isDownbeat ? 0.22f : 0.0f);
         float strength = fminf(1.0f, fmaxf(0.18f, rawStr));
         uint8_t tier = 2;
-        if (isDownbeat && (lE >= 0.32f || oE >= 0.38f)) tier = 4;
-        else if (isDownbeat || strength >= 0.60f || lE >= 0.48f) tier = 3;
-        else if (strength >= 0.34f || mE >= 0.32f) tier = 2;
+        if (isDownbeat && (lE >= 0.28f || oE >= 0.34f)) tier = 4;
+        else if (isHalfNote || strength >= 0.56f || lE >= 0.45f) tier = 3;
+        else if (strength >= 0.32f || mE >= 0.30f) tier = 2;
         else tier = 1;
 
         if (tMs >= info.startTimeMs && tMs <= info.endTimeMs) {
@@ -13439,38 +13597,37 @@ static AMAutoBeatsAnalysisResult AMAutoBeatsAnalyzeAudio(const AMAutoBeatsAudioI
             c.highEnergy = hE;
             c.tier = tier;
             c.isGridBeat = true;
+            c.isHalfNote = isHalfNote;
             c.isHalfBeat = false;
             c.isPercussiveHit = (oE >= 0.25f);
             res.gridBeats.push_back(c);
         }
 
-        // Consistent in-between 8th-note beat evenly placed across the bar
-        if (i + 1 < beatFrames.size()) {
-            int fNext = beatFrames[i + 1];
-            int fMid = (f + fNext) / 2;
-            if (fMid > f + 3 && fMid < fNext - 3 && fMid < (int)numFrames) {
-                double rfMid = refineFrame(fMid);
-                int64_t tMidMs = srcSecToTimelineMs(rfMid * hopSec);
-                if (tMidMs >= info.startTimeMs && tMidMs <= info.endTimeMs) {
-                    float mlE = sampleWindowMax(lowFlux, fMid, 2);
-                    float mmE = sampleWindowMax(midFlux, fMid, 2);
-                    float mhE = sampleWindowMax(highFlux, fMid, 2);
-                    float moE = sampleWindowMax(onset, fMid, 2);
-                    float mStr = fminf(0.88f, 0.40f * fminf(1.0f, moE) + 0.25f * fminf(1.0f, mmE) + 0.20f * fminf(1.0f, mhE) + 0.15f * fminf(1.0f, mlE));
-                    uint8_t mTier = (mStr >= 0.48f || mmE >= 0.45f) ? 2 : 1;
+        // Consistent in-between 1/8-note beat placed evenly halfway between consecutive quarter notes
+        if (i + 1 < beatPosFrames.size()) {
+            double gfMid = 0.5 * (gf + beatPosFrames[i + 1]);
+            int fMid = std::min((int)numFrames - 1, std::max(0, (int)llround(gfMid)));
+            int64_t tMidMs = srcSecToTimelineMs(gfMid * hopSec + pcmAttackShiftSec);
+            if (tMidMs >= info.startTimeMs && tMidMs <= info.endTimeMs) {
+                float mlE = sampleWindowMax(lowFlux, fMid, 2);
+                float mmE = sampleWindowMax(midFlux, fMid, 2);
+                float mhE = sampleWindowMax(highFlux, fMid, 2);
+                float moE = sampleWindowMax(onset, fMid, 2);
+                float mStr = fminf(0.88f, 0.40f * fminf(1.0f, moE) + 0.25f * fminf(1.0f, mmE) + 0.20f * fminf(1.0f, mhE) + 0.15f * fminf(1.0f, mlE));
+                uint8_t mTier = (mStr >= 0.48f || mmE >= 0.45f) ? 2 : 1;
 
-                    AMAutoBeatCandidate hc;
-                    hc.timelineMs = tMidMs;
-                    hc.strength = mStr;
-                    hc.lowEnergy = mlE;
-                    hc.midEnergy = mmE;
-                    hc.highEnergy = mhE;
-                    hc.tier = mTier;
-                    hc.isGridBeat = true;
-                    hc.isHalfBeat = true;
-                    hc.isPercussiveHit = (moE >= 0.22f);
-                    res.gridBeats.push_back(hc);
-                }
+                AMAutoBeatCandidate hc;
+                hc.timelineMs = tMidMs;
+                hc.strength = mStr;
+                hc.lowEnergy = mlE;
+                hc.midEnergy = mmE;
+                hc.highEnergy = mhE;
+                hc.tier = mTier;
+                hc.isGridBeat = true;
+                hc.isHalfNote = false;
+                hc.isHalfBeat = true;
+                hc.isPercussiveHit = (moE >= 0.22f);
+                res.gridBeats.push_back(hc);
             }
         }
     }
@@ -13499,7 +13656,7 @@ static AMAutoBeatsAnalysisResult AMAutoBeatsAnalyzeAudio(const AMAutoBeatsAudioI
     return res;
 }
 
-// Mode: 0 = Beats I (Main Rhythms), 1 = Beats II (Full Grid + In-Between), 2 = Hits Only (Percussive)
+// Mode: 0 = 1/2 Half Notes, 1 = 1/4 Quarter Notes, 2 = 1/8 Eighth Notes, 3 = Hits Only
 static std::vector<AMAutoBeatCandidate> AMAutoBeatsFilterCandidates(const AMAutoBeatsAnalysisResult &res,
                                                                     NSInteger mode,
                                                                     float density,
@@ -13508,26 +13665,40 @@ static std::vector<AMAutoBeatCandidate> AMAutoBeatsFilterCandidates(const AMAuto
     if (!res.ok) return out;
     density = fmaxf(0.0f, fminf(1.0f, density));
 
-    const std::vector<AMAutoBeatCandidate> &src = (mode == 2) ? res.percussiveHits : res.gridBeats;
+    const std::vector<AMAutoBeatCandidate> &src = (mode == 3) ? res.percussiveHits : res.gridBeats;
     for (const auto &c : src) {
         bool keep = false;
         if (mode == 0) {
-            // Beats I: quarter-note rhythmic grid weighted by energy
-            if (!c.isHalfBeat) {
-                float minStrength = 0.80f - density * 0.72f; // 0% -> 0.80 (drops only), 55% -> 0.40, 100% -> 0.08 (all)
-                if (c.tier == 4 && density >= 0.05f) keep = true;
-                else if (c.strength >= minStrength) keep = true;
-            } else if (density > 0.82f && c.tier >= 2 && c.strength >= (1.0f - density) * 2.5f) {
-                keep = true;
+            // 1/2 Half Notes: rock-solid consistent beats 1 & 3 of every bar
+            if (!c.isHalfBeat && c.isHalfNote) {
+                if (density >= 0.85f) {
+                    keep = true; // 100% consistent half notes with zero dropped beats
+                } else {
+                    float minStrength = 0.78f - (density / 0.85f) * 0.72f;
+                    keep = (c.tier == 4 && density >= 0.10f) || (c.strength >= minStrength);
+                }
             }
         } else if (mode == 1) {
-            // Beats II: full rhythmic grid including snares/claps/in-between beats
+            // 1/4 Quarter Notes: rock-solid consistent beats 1, 2, 3, 4
             if (!c.isHalfBeat) {
-                float minStrength = 0.65f - density * 0.65f;
-                keep = (c.tier >= 3 || c.strength >= minStrength);
+                if (density >= 0.85f) {
+                    keep = true; // 100% consistent quarter notes with zero dropped beats
+                } else {
+                    float minStrength = 0.76f - (density / 0.85f) * 0.70f;
+                    keep = (c.tier == 4 && density >= 0.10f) || (c.strength >= minStrength);
+                }
+            }
+        } else if (mode == 2) {
+            // 1/8 Eighth Notes: consistent quarter notes + in-between 8th-note subdivisions
+            if (!c.isHalfBeat) {
+                keep = (density >= 0.40f) || (c.tier >= 3);
             } else {
-                float minHalf = 0.78f - density * 0.72f;
-                keep = (c.strength >= minHalf);
+                if (density >= 0.90f) {
+                    keep = true; // Full consistent 8th-note grid
+                } else {
+                    float minHalf = 0.80f - (density / 0.90f) * 0.75f;
+                    keep = (c.strength >= minHalf);
+                }
             }
         } else {
             // Hits Only: pure spectral-flux percussive hits ranked by classified energy
@@ -13802,8 +13973,8 @@ static UIImage *AMAutoBeatsTabIcon(void) {
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _mode = 0;
-        _density = 0.55f;
+        _mode = 1;       // Default: 1/4 Quarter Notes (rock-solid consistent beat grid)
+        _density = 1.0f; // Default: 100% consistent grid (no dropped beats)
         _offsetMs = 0;
     }
     return self;
@@ -13903,8 +14074,8 @@ static UIImage *AMAutoBeatsTabIcon(void) {
     _statusLabel.textAlignment = NSTextAlignmentCenter;
     [_waveformView addSubview:_statusLabel];
 
-    // Mode Segmented Control (Beats I | Beats II | Hits Only)
-    _modeControl = [[UISegmentedControl alloc] initWithItems:@[@"Beats I", @"Beats II", @"Hits Only"]];
+    // Mode Segmented Control (1/2 Half | 1/4 Quarter | 1/8 Eighth | Hits)
+    _modeControl = [[UISegmentedControl alloc] initWithItems:@[@"1/2 Half", @"1/4 Quarter", @"1/8 Eighth", @"Hits"]];
     _modeControl.translatesAutoresizingMaskIntoConstraints = NO;
     _modeControl.selectedSegmentIndex = _mode;
     _modeControl.backgroundColor = AMInputSurfaceColor();
@@ -13942,7 +14113,7 @@ static UIImage *AMAutoBeatsTabIcon(void) {
 
     _densityValueLabel = [[UILabel alloc] init];
     _densityValueLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    _densityValueLabel.text = @"55%";
+    _densityValueLabel.text = @"100%";
     _densityValueLabel.textColor = [UIColor whiteColor];
     _densityValueLabel.font = AMThemeFont(11.0, UIFontWeightSemibold);
     _densityValueLabel.textAlignment = NSTextAlignmentRight;
