@@ -143,12 +143,112 @@ static id AMHook_initWithPlayerItem(id self, SEL _cmd, AVPlayerItem *item) {
     return res;
 }
 
+static volatile int64_t gAMCompositorStartCount = 0;
+static volatile BOOL gAMPreviewPlayerPaused = YES;
+static IMP gOrigAVCompReqFinishFrame = NULL;
+static IMP gOrigAVCompReqFinishCancel = NULL;
+static IMP gOrigAVCompReqFinishError = NULL;
+
+static AVPlayer *AMFindPlayerInViewHierarchy(UIView *v, Class pvCls) {
+    if (!v) return nil;
+    if ([v isKindOfClass:pvCls]) {
+        AVPlayerLayer *pl = nil;
+        SEL plSel = NSSelectorFromString(@"playerLayer");
+        if ([v respondsToSelector:plSel]) {
+            id obj = ((id (*)(id, SEL))objc_msgSend)(v, plSel);
+            if ([obj isKindOfClass:[AVPlayerLayer class]]) pl = (AVPlayerLayer *)obj;
+        }
+        if (!pl) {
+            for (CALayer *sub in v.layer.sublayers) {
+                if ([sub isKindOfClass:[AVPlayerLayer class]]) { pl = (AVPlayerLayer *)sub; break; }
+            }
+        }
+        if (pl && pl.player) return pl.player;
+    }
+    for (UIView *sub in v.subviews) {
+        AVPlayer *found = AMFindPlayerInViewHierarchy(sub, pvCls);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static AVPlayer *AMResolveActivePreviewPlayer(void) {
+    AVPlayer *cached = gActivePreviewPlayer;
+    if (cached && AMItemUsesAMCompositor(cached.currentItem)) {
+        gAMPreviewPlayerPaused = (cached.rate == 0.0f);
+        return cached;
+    }
+    Class pvCls = NSClassFromString(@"_TtC12AlightMotion18ProjectPreviewView");
+    if (pvCls) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                if (w.hidden) continue;
+                AVPlayer *found = AMFindPlayerInViewHierarchy(w, pvCls);
+                if (found && found.currentItem) {
+                    gActivePreviewPlayer = found;
+                    gAMPreviewPlayerPaused = (found.rate == 0.0f);
+                    return found;
+                }
+            }
+        }
+    }
+    if (cached) {
+        gAMPreviewPlayerPaused = (cached.rate == 0.0f);
+    }
+    return cached;
+}
+
+static BOOL gAMLiveRedrawInFlight = NO;
+static BOOL gAMLiveRedrawPending = NO;
+static uint64_t gAMLiveRedrawSeq = 0;
+
+static void AMRequestCoalescedPreviewRedraw(void);
+
+static void AMNotifyCompositorRequestFinished(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!gAMLiveRedrawInFlight) return;
+        gAMLiveRedrawInFlight = NO;
+        if (gAMLiveRedrawPending) {
+            gAMLiveRedrawPending = NO;
+            AMRequestCoalescedPreviewRedraw();
+        }
+    });
+}
+
+static void AMHook_avCompReqFinishFrame(id self, SEL _cmd, CVPixelBufferRef frame) {
+    if (gOrigAVCompReqFinishFrame) {
+        ((void (*)(id, SEL, CVPixelBufferRef))gOrigAVCompReqFinishFrame)(self, _cmd, frame);
+    }
+    AMNotifyCompositorRequestFinished();
+}
+
+static void AMHook_avCompReqFinishCancel(id self, SEL _cmd) {
+    if (gOrigAVCompReqFinishCancel) {
+        ((void (*)(id, SEL))gOrigAVCompReqFinishCancel)(self, _cmd);
+    }
+    // Do not clear gAMLiveRedrawInFlight on cancel: a cancelled stale request must not
+    // interrupt the newer in-flight frame (the 85ms safety watchdog handles any dropped frame).
+}
+
+static void AMHook_avCompReqFinishError(id self, SEL _cmd, NSError *err) {
+    if (gOrigAVCompReqFinishError) {
+        ((void (*)(id, SEL, NSError *))gOrigAVCompReqFinishError)(self, _cmd, err);
+    }
+    AMNotifyCompositorRequestFinished();
+}
+
 static void AMForceImmediatePreviewRedraw(void) {
-    AVPlayer *player = gActivePreviewPlayer;
+    AVPlayer *player = AMResolveActivePreviewPlayer();
     if (!player) return;
     AVPlayerItem *item = player.currentItem;
     if (!item) return;
 
+    gAMLiveRedrawInFlight = NO;
+    gAMLiveRedrawPending = NO;
+    ++gAMLiveRedrawSeq;
+
+    int64_t reqBefore = __atomic_load_n(&gAMCompositorStartCount, __ATOMIC_RELAXED);
     AVVideoComposition *vc = item.videoComposition;
     if (vc) {
         AVVideoComposition *copied = [vc copy];
@@ -159,22 +259,22 @@ static void AMForceImmediatePreviewRedraw(void) {
     if (player.rate == 0.0f) {
         CMTime cur = player.currentTime;
         if (CMTIME_IS_NUMERIC(cur)) {
-            [player seekToTime:cur toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+                if (__atomic_load_n(&gAMCompositorStartCount, __ATOMIC_RELAXED) == reqBefore && player.rate == 0.0f) {
+                    [player seekToTime:cur toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+                }
+            });
         }
     }
 }
 
-static BOOL gAMLiveRedrawInFlight = NO;
-static BOOL gAMLiveRedrawPending = NO;
-static uint64_t gAMLiveRedrawSeq = 0;
-
 static void AMRequestCoalescedPreviewRedraw(void) {
-    AVPlayer *player = gActivePreviewPlayer;
+    AVPlayer *player = AMResolveActivePreviewPlayer();
     if (!player) return;
     AVPlayerItem *item = player.currentItem;
     if (!item) return;
 
-    // If playing, AVPlayer already pulls new frames continuously (no seek needed).
+    // If playing, AVPlayer already pulls new frames continuously (no manual kick needed).
     if (player.rate != 0.0f) return;
 
     if (gAMLiveRedrawInFlight) {
@@ -185,7 +285,10 @@ static void AMRequestCoalescedPreviewRedraw(void) {
     gAMLiveRedrawInFlight = YES;
     gAMLiveRedrawPending = NO;
     uint64_t seq = ++gAMLiveRedrawSeq;
+    int64_t reqBefore = __atomic_load_n(&gAMCompositorStartCount, __ATOMIC_RELAXED);
 
+    // Match Alight Motion's native 0x100228d28 live refresh: swap videoComposition to trigger
+    // AMCompositor.startVideoCompositionRequest: WITHOUT a premature seekToTime: completion cancelling it!
     AVVideoComposition *vc = item.videoComposition;
     if (vc) {
         AVVideoComposition *copied = [vc copy];
@@ -194,14 +297,25 @@ static void AMRequestCoalescedPreviewRedraw(void) {
         }
     }
 
+    // Fallback kick ONLY if setVideoComposition: did not wake AMCompositor within 20ms
     CMTime cur = player.currentTime;
-    if (!CMTIME_IS_NUMERIC(cur)) {
-        gAMLiveRedrawInFlight = NO;
-        return;
-    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        if (!gAMLiveRedrawInFlight || gAMLiveRedrawSeq != seq) return;
+        if (__atomic_load_n(&gAMCompositorStartCount, __ATOMIC_RELAXED) == reqBefore) {
+            if (player.rate == 0.0f && CMTIME_IS_NUMERIC(cur)) {
+                [player seekToTime:cur toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
+            } else {
+                gAMLiveRedrawInFlight = NO;
+                if (gAMLiveRedrawPending) {
+                    gAMLiveRedrawPending = NO;
+                    AMRequestCoalescedPreviewRedraw();
+                }
+            }
+        }
+    });
 
-    // Safety timeout so in-flight gate can never stall if AVPlayer drops a callback
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+    // Hard safety timeout so in-flight gate can never stall if AVFoundation drops a request
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(85 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
         if (gAMLiveRedrawInFlight && gAMLiveRedrawSeq == seq) {
             gAMLiveRedrawInFlight = NO;
             if (gAMLiveRedrawPending) {
@@ -210,21 +324,6 @@ static void AMRequestCoalescedPreviewRedraw(void) {
             }
         }
     });
-
-    [player seekToTime:cur
-       toleranceBefore:kCMTimeZero
-        toleranceAfter:kCMTimeZero
-     completionHandler:^(BOOL finished) {
-        (void)finished;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (gAMLiveRedrawSeq != seq) return;
-            gAMLiveRedrawInFlight = NO;
-            if (gAMLiveRedrawPending) {
-                gAMLiveRedrawPending = NO;
-                AMRequestCoalescedPreviewRedraw();
-            }
-        });
-    }];
 }
 
 static IMP gOrigStartVideoCompReq = NULL;
@@ -249,6 +348,7 @@ static void AMResolveCompositorOffsets(Class compClass) {
 }
 
 static void AMHook_startVideoCompositionRequest(id self, SEL _cmd, id request) {
+    __atomic_add_fetch(&gAMCompositorStartCount, 1, __ATOMIC_RELAXED);
     AMResolveCompositorOffsets(object_getClass(self));
     if (gCompImplOffset >= 0 && gDynaResOffset >= 0 && gAccumValOffset >= 0 && gCompositorMetalClass != Nil) {
         void *compImplPtr = *(void **)((uint8_t *)(__bridge void *)self + gCompImplOffset);
@@ -14891,6 +14991,12 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
     if (tr->timeMode != 2 && rt->startTimeMs > 0) {
         evalTimeMs = rt->startTimeMs + (int64_t)llround((double)shaderTimeSec * 1000.0);
     }
+    if (gAMRot3DPanelVisible && rt->active && rt->elementId == gAMRot3DActiveElementId && gAMPreviewPlayerPaused) {
+        int64_t edMs = gAMRot3DEditorCurrentTimeMs;
+        if (llabs(evalTimeMs - edMs) <= 60) {
+            evalTimeMs = edMs;
+        }
+    }
 
     if (rt->active && rt->enabled) {
         float rx = AMRot3DEvalTrackAtMs(&rt->tracks[0], evalTimeMs);
@@ -15532,7 +15638,7 @@ static UIImage *AMRot3DTabIcon(void) {
     if (outPivot) *outPivot = pivView;
 
     int bestAxis = -1;
-    CGFloat bestDist = 22.0;
+    CGFloat bestDist = 28.0;
     const int steps = 40;
     for (int axis = 0; axis < 3; ++axis) {
         for (int i = 0; i < steps; ++i) {
@@ -15562,6 +15668,36 @@ static UIImage *AMRot3DTabIcon(void) {
     return bestAxis;
 }
 
+- (BOOL)pointInsideProjectedQuad:(CGPoint)pt {
+    AMPuppetTransformSnapshot snap;
+    AMRot3DSlotRuntime rt;
+    if (![self getSnapshot:&snap runtime:&rt] || !rt.active || !snap.valid) return NO;
+    float euler[3], piv[3], R[16];
+    [self evalCurrentState:&rt euler:euler pivot:piv];
+    AMRot3DMat4Angles(R, euler[0], euler[1], euler[2]);
+    float asp = (snap.layerSize[1] > 1.0f) ? (snap.layerSize[0] / snap.layerSize[1]) : 1.0f;
+    float fov = fminf(fmaxf(rt.fov, 15.0f), 140.0f);
+    float cd = 0.5f / tanf(fov * (float)(M_PI / 360.0));
+    float zOff = rt.zOffset / 500.0f;
+    float qx[4] = { (0.0f - piv[0]) * asp, (1.0f - piv[0]) * asp, (1.0f - piv[0]) * asp, (0.0f - piv[0]) * asp };
+    float qy[4] = { (0.0f - piv[1]),       (0.0f - piv[1]),       (1.0f - piv[1]),       (1.0f - piv[1]) };
+    CGPoint quad[4];
+    for (int i = 0; i < 4; ++i) {
+        if (![self projectLocal3D:qx[i] y:qy[i] z:-piv[2] R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&quad[i] outZ:NULL]) {
+            return NO;
+        }
+    }
+    // Winding-agnostic point-in-polygon ray cast
+    BOOL inside = NO;
+    for (int i = 0, j = 3; i < 4; j = i++) {
+        if (((quad[i].y > pt.y) != (quad[j].y > pt.y)) &&
+            (pt.x < (quad[j].x - quad[i].x) * (pt.y - quad[i].y) / (quad[j].y - quad[i].y + 1e-6) + quad[i].x)) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     if (self.hidden || self.alpha < 0.01 || !self.userInteractionEnabled) return nil;
     if (!CGRectContainsPoint(self.bounds, point)) return nil;
@@ -15569,6 +15705,7 @@ static UIImage *AMRot3DTabIcon(void) {
     if (CGRectContainsPoint(_viewCubeRect, point)) return self;
     if (self.showGizmo) {
         if ([self hitTestRingAtPoint:point outRingSign:NULL outPivot:NULL] >= 0) return self;
+        if ([self pointInsideProjectedQuad:point]) return self;
     }
     return nil;
 }
@@ -15586,12 +15723,12 @@ static UIImage *AMRot3DTabIcon(void) {
     float sign = 1.0f;
     CGPoint pivPt = CGPointZero;
     int axis = [self hitTestRingAtPoint:pt outRingSign:&sign outPivot:&pivPt];
+    AMRot3DSlotRuntime rt;
+    [self getSnapshot:NULL runtime:&rt];
+    float piv[3];
+    [self evalCurrentState:&rt euler:_startEuler pivot:piv];
+    memcpy(_lastEuler, _startEuler, sizeof(_lastEuler));
     if (axis >= 0) {
-        AMRot3DSlotRuntime rt;
-        [self getSnapshot:NULL runtime:&rt];
-        float piv[3];
-        [self evalCurrentState:&rt euler:_startEuler pivot:piv];
-        memcpy(_lastEuler, _startEuler, sizeof(_lastEuler));
         _dragAxis = axis;
         _ringSign = sign;
         _pivotViewPt = pivPt;
@@ -15601,14 +15738,29 @@ static UIImage *AMRot3DTabIcon(void) {
         self.activeAxis = axis;
         [self.delegate rot3DCanvasDidSelectAxis:axis];
         [self setNeedsDisplay];
+    } else if (self.showGizmo && [self pointInsideProjectedQuad:pt]) {
+        _dragAxis = 3; // Free 3D trackball drag directly on layer
+        _lastTouchPt = pt;
+        _ringDeltaDeg = 0.0f;
+        [self setNeedsDisplay];
     }
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    if (event.allTouches.count >= 2 || _dragAxis < 0 || _dragAxis > 2) return;
+    if (event.allTouches.count >= 2 || _dragAxis < 0 || _dragAxis > 3) return;
     UITouch *t = [touches anyObject];
     if (!t) return;
     CGPoint pt = [t locationInView:self];
+    if (_dragAxis == 3) {
+        float dx = (float)(pt.x - _lastTouchPt.x);
+        float dy = (float)(pt.y - _lastTouchPt.y);
+        _lastTouchPt = pt;
+        _lastEuler[0] += dy * 0.45f;
+        _lastEuler[1] -= dx * 0.45f;
+        [self.delegate rot3DCanvasDidUpdateEulerX:_lastEuler[0] y:_lastEuler[1] z:_lastEuler[2] ended:NO];
+        [self setNeedsDisplay];
+        return;
+    }
     float curAngle = atan2f((float)(pt.y - _pivotViewPt.y), (float)(pt.x - _pivotViewPt.x));
     float dRad = curAngle - _startAngle;
     while (dRad > (float)M_PI) dRad -= (float)(2.0 * M_PI);
@@ -15625,7 +15777,7 @@ static UIImage *AMRot3DTabIcon(void) {
 
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     (void)touches; (void)event;
-    if (_dragAxis >= 0 && _dragAxis <= 2) {
+    if (_dragAxis >= 0 && _dragAxis <= 3) {
         [self.delegate rot3DCanvasDidUpdateEulerX:_lastEuler[0] y:_lastEuler[1] z:_lastEuler[2] ended:YES];
     }
     _dragAxis = -1;
@@ -16909,49 +17061,59 @@ static UIImage *AMRot3DTabIcon(void) {
     }
 }
 
-static void AMRot3DFastUpdateTrackInRuntime(int slot, int track, float val, int64_t timeMs) {
-    if (slot < 1 || slot > kAMRot3DMaxSlots || track < 0 || track >= kAMRot3DTrackCount) return;
+static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const float *vals, int count, int64_t timeMs) {
+    if (slot < 1 || slot > kAMRot3DMaxSlots || !tracks || !vals || count <= 0) return;
     os_unfair_lock_lock(&gAMRot3DRuntimeLock);
     AMRot3DSlotRuntime *rt = &gAMRot3DSlots[slot];
     if (rt->active) {
-        AMRot3DTrackC *tc = &rt->tracks[track];
-        tc->currentValue = val;
-        if (tc->keyframeCount > 0) {
-            int match = -1;
-            for (int k = 0; k < tc->keyframeCount; ++k) {
-                if (llabs(tc->keyframes[k].timeMs - timeMs) <= 20) { match = k; break; }
-            }
-            if (match >= 0) {
-                tc->keyframes[match].value = val;
-            } else if (tc->keyframeCount < kAMRot3DMaxKeyframesPerTrack) {
-                int ins = tc->keyframeCount;
-                while (ins > 0 && tc->keyframes[ins - 1].timeMs > timeMs) {
-                    tc->keyframes[ins] = tc->keyframes[ins - 1];
-                    ins--;
+        for (int i = 0; i < count; ++i) {
+            int track = tracks[i];
+            float val = vals[i];
+            if (track < 0 || track >= kAMRot3DTrackCount) continue;
+            AMRot3DTrackC *tc = &rt->tracks[track];
+            tc->currentValue = val;
+            if (tc->keyframeCount > 0) {
+                int match = -1;
+                for (int k = 0; k < tc->keyframeCount; ++k) {
+                    if (llabs(tc->keyframes[k].timeMs - timeMs) <= 20) { match = k; break; }
                 }
-                AMRot3DKeyframeC kf = { timeMs, val, 0, 0.42f, 0.0f, 0.58f, 1.0f, 4.0f };
-                tc->keyframes[ins] = kf;
-                tc->keyframeCount++;
+                if (match >= 0) {
+                    tc->keyframes[match].value = val;
+                } else if (tc->keyframeCount < kAMRot3DMaxKeyframesPerTrack) {
+                    int ins = tc->keyframeCount;
+                    while (ins > 0 && tc->keyframes[ins - 1].timeMs > timeMs) {
+                        tc->keyframes[ins] = tc->keyframes[ins - 1];
+                        ins--;
+                    }
+                    AMRot3DKeyframeC kf = { timeMs, val, 0, 0.42f, 0.0f, 0.58f, 1.0f, 4.0f };
+                    tc->keyframes[ins] = kf;
+                    tc->keyframeCount++;
+                }
             }
         }
     }
     os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
 }
 
-- (void)setTrack:(int)track value:(float)val ended:(BOOL)ended {
-    NSMutableDictionary *td = [self trackDictForIndex:track];
+- (void)setTracks:(const int *)tracks values:(const float *)vals count:(int)count ended:(BOOL)ended {
+    if (!tracks || !vals || count <= 0) return;
     int64_t tMs = [self currentTimeMs];
-    td[@"v"] = @(val);
-    if (((NSArray *)td[@"keyframes"]).count > 0) {
-        [self upsertKeyframeOnTrack:track timeMs:tMs value:val];
+    for (int i = 0; i < count; ++i) {
+        int track = tracks[i];
+        float val = vals[i];
+        NSMutableDictionary *td = [self trackDictForIndex:track];
+        td[@"v"] = @(val);
+        if (((NSArray *)td[@"keyframes"]).count > 0) {
+            [self upsertKeyframeOnTrack:track timeMs:tMs value:val];
+        }
     }
     if (ended) {
         [[AMRot3DStore shared] save];
         AMPuppetRedrawAllKeyframeViews();
         [self refreshControls];
-        AMRequestCoalescedPreviewRedraw();
+        AMForceImmediatePreviewRedraw();
     } else {
-        AMRot3DFastUpdateTrackInRuntime(_slot, track, val, tMs);
+        AMRot3DFastUpdateTracksInRuntime(_slot, tracks, vals, count, tMs);
         [self updateReadoutLabelsOnly];
         if (_canvasOverlay) {
             _canvasOverlay.currentTimeMs = tMs;
@@ -16959,6 +17121,10 @@ static void AMRot3DFastUpdateTrackInRuntime(int slot, int track, float val, int6
         }
         AMRequestCoalescedPreviewRedraw();
     }
+}
+
+- (void)setTrack:(int)track value:(float)val ended:(BOOL)ended {
+    [self setTracks:&track values:&val count:1 ended:ended];
 }
 
 - (void)updateReadoutLabelsOnly {
@@ -17077,8 +17243,9 @@ static void AMRot3DFastUpdateTrackInRuntime(int slot, int track, float val, int6
         } else {
             float px = fminf(fmaxf([self evalTrack:3 atMs:tMs] + dx * 0.003f, -0.5f), 1.5f);
             float py = fminf(fmaxf([self evalTrack:4 atMs:tMs] - dy * 0.003f, -0.5f), 1.5f);
-            [self setTrack:3 value:px ended:NO];
-            [self setTrack:4 value:py ended:ended];
+            int trs[2] = { 3, 4 };
+            float vals[2] = { px, py };
+            [self setTracks:trs values:vals count:2 ended:ended];
         }
         return;
     }
@@ -17089,8 +17256,9 @@ static void AMRot3DFastUpdateTrackInRuntime(int slot, int track, float val, int6
     } else {
         float rx = [self evalTrack:0 atMs:tMs] + dy * 0.4f;
         float ry = [self evalTrack:1 atMs:tMs] - dx * 0.4f;
-        [self setTrack:0 value:rx ended:NO];
-        [self setTrack:1 value:ry ended:ended];
+        int trs[2] = { 0, 1 };
+        float vals[2] = { rx, ry };
+        [self setTracks:trs values:vals count:2 ended:ended];
     }
 }
 
@@ -17111,9 +17279,9 @@ static void AMRot3DFastUpdateTrackInRuntime(int slot, int track, float val, int6
 }
 
 - (void)rot3DCanvasDidUpdateEulerX:(float)rx y:(float)ry z:(float)rz ended:(BOOL)ended {
-    [self setTrack:0 value:rx ended:NO];
-    [self setTrack:1 value:ry ended:NO];
-    [self setTrack:2 value:rz ended:ended];
+    int trs[3] = { 0, 1, 2 };
+    float vals[3] = { rx, ry, rz };
+    [self setTracks:trs values:vals count:3 ended:ended];
 }
 
 - (void)rot3DCanvasDidTapViewCubePreset {
@@ -17208,13 +17376,18 @@ static void AMRot3DFastUpdateTrackInRuntime(int slot, int track, float val, int6
     else if (sl.tag == 2) { ld[@"bend"] = @(sl.value); rt->bend = sl.value; }
     else if (sl.tag == 3) { ld[@"lighting"] = @(sl.value); rt->lighting = sl.value; }
     os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
-    [self refreshControls];
+    if (sl.tag == 0) _fovLbl.text = [NSString stringWithFormat:@"Perspective FOV: %.0f°", sl.value];
+    else if (sl.tag == 1) _zDepthLbl.text = [NSString stringWithFormat:@"Depth Z: %.0f", sl.value];
+    else if (sl.tag == 2) _bendLbl.text = [NSString stringWithFormat:@"3D Curve Bend: %.0f°", sl.value];
+    else if (sl.tag == 3) _lightLbl.text = [NSString stringWithFormat:@"3D Shading Light: %.0f%%", sl.value * 100.0f];
+    if (_canvasOverlay) [_canvasOverlay setNeedsDisplay];
     AMRequestCoalescedPreviewRedraw();
 }
 
 - (void)onLensSliderEnded:(UISlider *)sl {
     (void)sl;
     [[AMRot3DStore shared] save];
+    AMForceImmediatePreviewRedraw();
 }
 
 - (void)onBackfaceChanged:(UISegmentedControl *)seg {
@@ -17958,6 +18131,18 @@ static void AlightMotionModsInit(void) {
                     @"startVideoCompositionRequest:",
                     (IMP)AMHook_startVideoCompositionRequest,
                     &gOrigStartVideoCompReq);
+    AMSwizzleMethod(@"AVAsynchronousVideoCompositionRequest",
+                    @"finishWithComposedVideoFrame:",
+                    (IMP)AMHook_avCompReqFinishFrame,
+                    &gOrigAVCompReqFinishFrame);
+    AMSwizzleMethod(@"AVAsynchronousVideoCompositionRequest",
+                    @"finishCancelledRequest",
+                    (IMP)AMHook_avCompReqFinishCancel,
+                    &gOrigAVCompReqFinishCancel);
+    AMSwizzleMethod(@"AVAsynchronousVideoCompositionRequest",
+                    @"finishWithError:",
+                    (IMP)AMHook_avCompReqFinishError,
+                    &gOrigAVCompReqFinishError);
 
     AMSwizzleMethod(@"_TtC12AlightMotion19PreviewControlBarVC",
                     @"viewDidLoad",
