@@ -22539,7 +22539,8 @@ static NSString *AMPerfShaderCacheKey(NSString *source, MTLCompileOptions *optio
 }
 
 static IMP gOrigMTLNewLibSync = NULL;
-static id<MTLLibrary> AMHook_mtlNewLibSync(id self, SEL _cmd, NSString *source, MTLCompileOptions *options, NSError **error) {
+typedef id<MTLLibrary> (*AMOrigMTLNewLibSyncFn)(id, SEL, NSString *, MTLCompileOptions *, NSError **) NS_RETURNS_RETAINED;
+static id<MTLLibrary> AMHook_mtlNewLibSync(id self, SEL _cmd, NSString *source, MTLCompileOptions *options, NSError **error) NS_RETURNS_RETAINED {
     BOOL useCache = (gAMPerfShaderLibCache != nil && AMPerfFlagEnabled(@"shaderLibraryCache", YES));
     NSString *key = nil;
     if (useCache && source.length > 0) {
@@ -22564,7 +22565,7 @@ static id<MTLLibrary> AMHook_mtlNewLibSync(id self, SEL _cmd, NSString *source, 
     }
     id<MTLLibrary> lib = nil;
     if (gOrigMTLNewLibSync) {
-        lib = ((id<MTLLibrary> (*)(id, SEL, NSString *, MTLCompileOptions *, NSError **))gOrigMTLNewLibSync)(self, _cmd, source, options, error);
+        lib = ((AMOrigMTLNewLibSyncFn)gOrigMTLNewLibSync)(self, _cmd, source, options, error);
     }
     if (spLog && spId != OS_SIGNPOST_ID_INVALID) {
         os_signpost_interval_end(spLog, spId, "ShaderCompileSync");
@@ -22667,7 +22668,8 @@ static id AMHook_avWriterInputInit(id self, SEL _cmd, AVMediaType mediaType, NSD
 
 // --- Phase 2: TBDR GPU Structural Hooks (Flag-Gated OFF by default) ---
 static IMP gOrigMTLNewTextureWithDesc = NULL;
-static id<MTLTexture> AMHook_mtlNewTextureWithDesc(id self, SEL _cmd, MTLTextureDescriptor *desc) {
+typedef id<MTLTexture> (*AMOrigMTLNewTextureWithDescFn)(id, SEL, MTLTextureDescriptor *) NS_RETURNS_RETAINED;
+static id<MTLTexture> AMHook_mtlNewTextureWithDesc(id self, SEL _cmd, MTLTextureDescriptor *desc) NS_RETURNS_RETAINED {
     if (desc && !AMPerfMasterDisabled()) {
         BOOL wantPrivate = AMPerfFlagEnabled(@"tbdrPrivateStorage", NO);
         BOOL wantSDR8 = (gAMPerfDeviceTier == AMDeviceTier1 && AMPerfFlagEnabled(@"sdrRgba8Intermediate", NO) && !AMFullPreviewParityActive());
@@ -22691,7 +22693,7 @@ static id<MTLTexture> AMHook_mtlNewTextureWithDesc(id self, SEL _cmd, MTLTexture
                     modDesc.pixelFormat = MTLPixelFormatBGRA8Unorm;
                 }
                 if (modDesc && gOrigMTLNewTextureWithDesc) {
-                    id<MTLTexture> tex = ((id<MTLTexture> (*)(id, SEL, MTLTextureDescriptor *))gOrigMTLNewTextureWithDesc)(self, _cmd, modDesc);
+                    id<MTLTexture> tex = ((AMOrigMTLNewTextureWithDescFn)gOrigMTLNewTextureWithDesc)(self, _cmd, modDesc);
                     if (tex) {
                         __atomic_add_fetch(&gAMPerfPrivateTexPromoted, 1, __ATOMIC_RELAXED);
                         return tex;
@@ -22701,7 +22703,7 @@ static id<MTLTexture> AMHook_mtlNewTextureWithDesc(id self, SEL _cmd, MTLTexture
         }
     }
     if (gOrigMTLNewTextureWithDesc) {
-        return ((id<MTLTexture> (*)(id, SEL, MTLTextureDescriptor *))gOrigMTLNewTextureWithDesc)(self, _cmd, desc);
+        return ((AMOrigMTLNewTextureWithDescFn)gOrigMTLNewTextureWithDesc)(self, _cmd, desc);
     }
     return nil;
 }
@@ -23970,7 +23972,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.28-3";
+                static NSString *const kAMModBuildVersion = @"2026.11.28-4";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
