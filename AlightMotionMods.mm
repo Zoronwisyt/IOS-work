@@ -141,15 +141,15 @@ static void AMHook_replaceCurrentItem(id self, SEL _cmd, AVPlayerItem *item) {
     AMTrackPlayerIfPreview((AVPlayer *)self, item);
 }
 
-static id AMHook_initWithPlayerItem(id self, SEL _cmd, AVPlayerItem *item) {
-    id res = self;
+static void *AMHook_initWithPlayerItem(void *selfPtr, SEL _cmd, AVPlayerItem *item) {
+    void *resPtr = selfPtr;
     if (gOrigInitWithPlayerItem) {
-        res = ((id (*)(id, SEL, AVPlayerItem *))gOrigInitWithPlayerItem)(self, _cmd, item);
+        resPtr = ((void *(*)(void *, SEL, AVPlayerItem *))gOrigInitWithPlayerItem)(selfPtr, _cmd, item);
     }
-    if (res) {
-        AMTrackPlayerIfPreview((AVPlayer *)res, item);
+    if (resPtr) {
+        AMTrackPlayerIfPreview((__bridge AVPlayer *)resPtr, item);
     }
-    return res;
+    return resPtr;
 }
 
 static volatile int64_t gAMCompositorStartCount = 0;
@@ -9985,16 +9985,16 @@ static void AMHook_playerItemSetAudioMix(id self, SEL _cmd, AVAudioMix *audioMix
     [(AVPlayerItem *)self setAudioTimePitchAlgorithm:AVAudioTimePitchAlgorithmVarispeed];
 }
 
-static id AMHook_audioMixOutputInit(id self, SEL _cmd, NSArray<AVAssetTrack *> *audioTracks, NSDictionary<NSString *, id> *audioSettings) {
-    id res = self;
+static void *AMHook_audioMixOutputInit(void *selfPtr, SEL _cmd, NSArray<AVAssetTrack *> *audioTracks, NSDictionary<NSString *, id> *audioSettings) {
+    void *resPtr = selfPtr;
     if (gOrigAudioMixOutputInit) {
-        res = ((id (*)(id, SEL, NSArray<AVAssetTrack *> *, NSDictionary<NSString *, id> *))gOrigAudioMixOutputInit)(
-            self, _cmd, audioTracks, audioSettings);
+        resPtr = ((void *(*)(void *, SEL, NSArray<AVAssetTrack *> *, NSDictionary<NSString *, id> *))gOrigAudioMixOutputInit)(
+            selfPtr, _cmd, audioTracks, audioSettings);
     }
-    if (res) {
-        [(AVAssetReaderAudioMixOutput *)res setAudioTimePitchAlgorithm:AVAudioTimePitchAlgorithmVarispeed];
+    if (resPtr) {
+        [(__bridge AVAssetReaderAudioMixOutput *)resPtr setAudioTimePitchAlgorithm:AVAudioTimePitchAlgorithmVarispeed];
     }
-    return res;
+    return resPtr;
 }
 
 static void AMHook_audioMixOutputSetAudioMix(id self, SEL _cmd, AVAudioMix *audioMix) {
@@ -22343,6 +22343,7 @@ static NSProcessInfoThermalState gAMPerfThermalState = NSProcessInfoThermalState
 static BOOL gAMPerfLowPowerMode = NO;
 
 static NSCache<NSString *, id<MTLLibrary>> *gAMPerfShaderLibCache = nil;
+static os_unfair_lock gAMPerfShaderCacheLock = OS_UNFAIR_LOCK_INIT;
 static int64_t gAMPerfLibCacheHits = 0;
 static int64_t gAMPerfLibCacheMisses = 0;
 static int64_t gAMPerfPrivateTexPromoted = 0;
@@ -22471,7 +22472,9 @@ static void AMPerfApplyProxyDecodeForItem(AVPlayerItem *item, NSInteger effectiv
 static void AMPerfPurgeEngineCaches(BOOL isCritical) {
     (void)isCritical;
     if (gAMPerfShaderLibCache) {
+        os_unfair_lock_lock(&gAMPerfShaderCacheLock);
         [gAMPerfShaderLibCache removeAllObjects];
+        os_unfair_lock_unlock(&gAMPerfShaderCacheLock);
     }
 }
 
@@ -22506,9 +22509,10 @@ static CADisplayLink *AMHook_caDisplayLinkWithTarget(id self, SEL _cmd, id targe
 }
 
 // --- Phase 1.2: Metal Shader Library Memoization ONLY (no binary archive, no pipeline cache) ---
-static NSString *AMPerfShaderCacheKey(NSString *source, MTLCompileOptions *options) {
+static NSString *AMPerfShaderCacheKey(id dev, NSString *source, MTLCompileOptions *options) {
     if (!source.length) return nil;
-    NSMutableString *sig = [NSMutableString stringWithCapacity:source.length + 128];
+    NSMutableString *sig = [NSMutableString stringWithCapacity:source.length + 144];
+    [sig appendFormat:@"dev:%lx|", (unsigned long)(uintptr_t)(__bridge void *)dev];
     [sig appendString:source];
     [sig appendString:@"|fm:"];
     BOOL fm = options ? options.fastMathEnabled : YES;
@@ -22545,9 +22549,19 @@ static id<MTLLibrary> AMHook_mtlNewLibSync(id self, SEL _cmd, NSString *source, 
     NSString *key = nil;
     if (useCache && source.length > 0) {
         @try {
-            key = AMPerfShaderCacheKey(source, options);
+            key = AMPerfShaderCacheKey(self, source, options);
             if (key) {
-                id<MTLLibrary> cached = [gAMPerfShaderLibCache objectForKey:key];
+                id<MTLLibrary> cached = nil;
+                os_unfair_lock_lock(&gAMPerfShaderCacheLock);
+                @try {
+                    cached = [gAMPerfShaderLibCache objectForKey:key];
+                    if (cached && ![cached respondsToSelector:@selector(newFunctionWithName:)]) {
+                        [gAMPerfShaderLibCache removeObjectForKey:key];
+                        cached = nil;
+                    }
+                } @finally {
+                    os_unfair_lock_unlock(&gAMPerfShaderCacheLock);
+                }
                 if (cached) {
                     __atomic_add_fetch(&gAMPerfLibCacheHits, 1, __ATOMIC_RELAXED);
                     return cached;
@@ -22571,10 +22585,15 @@ static id<MTLLibrary> AMHook_mtlNewLibSync(id self, SEL _cmd, NSString *source, 
         os_signpost_interval_end(spLog, spId, "ShaderCompileSync");
     }
 
-    if (lib && key && useCache) {
+    if (lib && key && useCache && [lib respondsToSelector:@selector(newFunctionWithName:)]) {
         __atomic_add_fetch(&gAMPerfLibCacheMisses, 1, __ATOMIC_RELAXED);
         @try {
-            [gAMPerfShaderLibCache setObject:lib forKey:key];
+            os_unfair_lock_lock(&gAMPerfShaderCacheLock);
+            @try {
+                [gAMPerfShaderLibCache setObject:lib forKey:key];
+            } @finally {
+                os_unfair_lock_unlock(&gAMPerfShaderCacheLock);
+            }
         } @catch (__unused NSException *ex) {}
     }
     return lib;
@@ -22586,9 +22605,19 @@ static void AMHook_mtlNewLibAsync(id self, SEL _cmd, NSString *source, MTLCompil
     NSString *key = nil;
     if (useCache && source.length > 0) {
         @try {
-            key = AMPerfShaderCacheKey(source, options);
+            key = AMPerfShaderCacheKey(self, source, options);
             if (key) {
-                id<MTLLibrary> cached = [gAMPerfShaderLibCache objectForKey:key];
+                id<MTLLibrary> cached = nil;
+                os_unfair_lock_lock(&gAMPerfShaderCacheLock);
+                @try {
+                    cached = [gAMPerfShaderLibCache objectForKey:key];
+                    if (cached && ![cached respondsToSelector:@selector(newFunctionWithName:)]) {
+                        [gAMPerfShaderLibCache removeObjectForKey:key];
+                        cached = nil;
+                    }
+                } @finally {
+                    os_unfair_lock_unlock(&gAMPerfShaderCacheLock);
+                }
                 if (cached) {
                     __atomic_add_fetch(&gAMPerfLibCacheHits, 1, __ATOMIC_RELAXED);
                     if (completionHandler) completionHandler(cached, nil);
@@ -22604,10 +22633,15 @@ static void AMHook_mtlNewLibAsync(id self, SEL _cmd, NSString *source, MTLCompil
     if (key && useCache) {
         NSString *capKey = [key copy];
         wrapped = ^(id<MTLLibrary> library, NSError *err) {
-            if (library) {
+            if (library && [library respondsToSelector:@selector(newFunctionWithName:)]) {
                 __atomic_add_fetch(&gAMPerfLibCacheMisses, 1, __ATOMIC_RELAXED);
                 @try {
-                    [gAMPerfShaderLibCache setObject:library forKey:capKey];
+                    os_unfair_lock_lock(&gAMPerfShaderCacheLock);
+                    @try {
+                        [gAMPerfShaderLibCache setObject:library forKey:capKey];
+                    } @finally {
+                        os_unfair_lock_unlock(&gAMPerfShaderCacheLock);
+                    }
                 } @catch (__unused NSException *ex) {}
             }
             if (completionHandler) completionHandler(library, err);
@@ -22649,21 +22683,21 @@ static NSDictionary *AMPerfGovernVideoSettings(AVMediaType mediaType, NSDictiona
 }
 
 static IMP gOrigAVWriterInputInitWithHint = NULL;
-static id AMHook_avWriterInputInitWithHint(id self, SEL _cmd, AVMediaType mediaType, NSDictionary *outputSettings, CMFormatDescriptionRef sourceFormatHint) {
+static void *AMHook_avWriterInputInitWithHint(void *selfPtr, SEL _cmd, AVMediaType mediaType, NSDictionary *outputSettings, CMFormatDescriptionRef sourceFormatHint) {
     NSDictionary *tuned = AMPerfGovernVideoSettings(mediaType, outputSettings);
     if (gOrigAVWriterInputInitWithHint) {
-        return ((id (*)(id, SEL, AVMediaType, NSDictionary *, CMFormatDescriptionRef))gOrigAVWriterInputInitWithHint)(self, _cmd, mediaType, tuned, sourceFormatHint);
+        return ((void *(*)(void *, SEL, AVMediaType, NSDictionary *, CMFormatDescriptionRef))gOrigAVWriterInputInitWithHint)(selfPtr, _cmd, mediaType, tuned, sourceFormatHint);
     }
-    return nil;
+    return NULL;
 }
 
 static IMP gOrigAVWriterInputInit = NULL;
-static id AMHook_avWriterInputInit(id self, SEL _cmd, AVMediaType mediaType, NSDictionary *outputSettings) {
+static void *AMHook_avWriterInputInit(void *selfPtr, SEL _cmd, AVMediaType mediaType, NSDictionary *outputSettings) {
     NSDictionary *tuned = AMPerfGovernVideoSettings(mediaType, outputSettings);
     if (gOrigAVWriterInputInit) {
-        return ((id (*)(id, SEL, AVMediaType, NSDictionary *))gOrigAVWriterInputInit)(self, _cmd, mediaType, tuned);
+        return ((void *(*)(void *, SEL, AVMediaType, NSDictionary *))gOrigAVWriterInputInit)(selfPtr, _cmd, mediaType, tuned);
     }
-    return nil;
+    return NULL;
 }
 
 // --- Phase 2: TBDR GPU Structural Hooks (Flag-Gated OFF by default) ---
@@ -23972,7 +24006,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.28-4";
+                static NSString *const kAMModBuildVersion = @"2026.11.28-5";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
