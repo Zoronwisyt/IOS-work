@@ -23419,7 +23419,7 @@ static IMP gOrigExportPreviewVCViewWillAppear = NULL;
     if ([vc respondsToSelector:titleSel]) {
         id lbl = ((id (*)(id, SEL))objc_msgSend)(vc, titleSel);
         if ([lbl isKindOfClass:[UILabel class]]) {
-            NSString *t = [((UILabel *)lbl).text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlinesCharacterSet]];
+            NSString *t = [((UILabel *)lbl).text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
             if (t.length > 0 && ![t.lowercaseString isEqualToString:@"exporting"] && ![t.lowercaseString isEqualToString:@"exporting..."]) {
                 return t;
             }
