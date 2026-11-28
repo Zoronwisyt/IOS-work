@@ -861,7 +861,7 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc);
 
 static NSString *const kAMGPUProfilerHUDKey = @"AMModGPUProfilerHUD";
 static NSString *const kAMShaderArchiveStampKey = @"AMModShaderArchiveStamp";
-static NSString *const kAMShaderArchiveVersion = @"2026.11.27-17";
+static NSString *const kAMShaderArchiveVersion = @"2026.11.27-18";
 
 static NSCache<NSString *, id<MTLLibrary>> *gMTLLibraryCache = nil;
 static NSCache<NSString *, id<MTLRenderPipelineState>> *gMTLRPSCache = nil;
@@ -975,7 +975,11 @@ static NSString *AMShaderSourceKey(NSString *source, MTLCompileOptions *options)
 static NSString *AMRenderPipelineKey(MTLRenderPipelineDescriptor *desc) {
     if (!desc || !desc.fragmentFunction) return nil;
     MTLRenderPipelineColorAttachmentDescriptor *ca0 = desc.colorAttachments[0];
-    return [NSString stringWithFormat:@"%p:%@|%p:%@|%lu:%d:%lu:%lu:%lu:%lu:%lu:%lu|%lu:%lu:%lu",
+    MTLRenderPipelineColorAttachmentDescriptor *ca1 = desc.colorAttachments[1];
+    MTLRenderPipelineColorAttachmentDescriptor *ca2 = desc.colorAttachments[2];
+    MTLRenderPipelineColorAttachmentDescriptor *ca3 = desc.colorAttachments[3];
+    NSUInteger vdHash = desc.vertexDescriptor ? [desc.vertexDescriptor hash] : 0;
+    return [NSString stringWithFormat:@"%p:%@|%p:%@|%lu:%d:%lu:%lu:%lu:%lu:%lu:%lu:%lu|%lu:%lu:%lu:%lu|%d:%d:%lu:%lu:%lu",
             (__bridge void *)desc.vertexFunction, desc.vertexFunction.name ?: @"",
             (__bridge void *)desc.fragmentFunction, desc.fragmentFunction.name ?: @"",
             (unsigned long)ca0.pixelFormat,
@@ -986,9 +990,16 @@ static NSString *AMRenderPipelineKey(MTLRenderPipelineDescriptor *desc) {
             (unsigned long)ca0.destinationRGBBlendFactor,
             (unsigned long)ca0.sourceAlphaBlendFactor,
             (unsigned long)ca0.destinationAlphaBlendFactor,
+            (unsigned long)ca0.writeMask,
             (unsigned long)desc.depthAttachmentPixelFormat,
             (unsigned long)desc.stencilAttachmentPixelFormat,
-            (unsigned long)desc.sampleCount];
+            (unsigned long)desc.sampleCount,
+            (unsigned long)vdHash,
+            (int)desc.isAlphaToCoverageEnabled,
+            (int)desc.isAlphaToOneEnabled,
+            (unsigned long)ca1.pixelFormat,
+            (unsigned long)ca2.pixelFormat,
+            (unsigned long)ca3.pixelFormat];
 }
 
 static id<MTLLibrary> AMHook_mtlNewLibraryWithSourceSync(id self, SEL _cmd, NSString *source, MTLCompileOptions *options, NSError * __autoreleasing *error) {
@@ -1050,6 +1061,10 @@ static id<MTLRenderPipelineState> AMHook_mtlNewRPSSync(id self, SEL _cmd, MTLRen
         }
     }
     id<MTLRenderPipelineState> pso = ((id<MTLRenderPipelineState> (*)(id, SEL, MTLRenderPipelineDescriptor *, NSError * __autoreleasing *))gOrigMTLNewRPSSync)(self, _cmd, useDesc, error);
+    if (!pso && useDesc != desc) {
+        if (error) *error = nil;
+        pso = ((id<MTLRenderPipelineState> (*)(id, SEL, MTLRenderPipelineDescriptor *, NSError * __autoreleasing *))gOrigMTLNewRPSSync)(self, _cmd, desc, error);
+    }
     if (pso) {
         if (key && gMTLRPSCache) {
             [gMTLRPSCache setObject:pso forKey:key];
@@ -1091,6 +1106,10 @@ static void AMHook_mtlNewRPSAsync(id self, SEL _cmd, MTLRenderPipelineDescriptor
     }
     MTLRenderPipelineDescriptor *archCopy = desc ? [desc copy] : nil;
     MTLNewRenderPipelineStateCompletionHandler wrapped = ^(id<MTLRenderPipelineState> pso, NSError *err) {
+        if (!pso && useDesc != desc) {
+            ((void (*)(id, SEL, MTLRenderPipelineDescriptor *, MTLNewRenderPipelineStateCompletionHandler))gOrigMTLNewRPSAsync)(self, _cmd, desc, completionHandler);
+            return;
+        }
         if (pso) {
             if (key && gMTLRPSCache) {
                 [gMTLRPSCache setObject:pso forKey:key];
@@ -10177,7 +10196,6 @@ static void AMHook_layerParentingWillDisplayCell(id self, SEL _cmd, UITableView 
 }
 
 static void AMRot3DSyncAfterParentingChange(void *holder);
-static NSMutableSet<NSNumber *> *gAMAutoLinkedCameraIds;
 
 static void AMHook_layerParentingDidSelectRow(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) {
     id navVC = objc_getAssociatedObject(self, kAMMultiParentNavKey);
@@ -10191,16 +10209,6 @@ static void AMHook_layerParentingDidSelectRow(id self, SEL _cmd, UITableView *ta
             intptr_t slide = AMMainBinarySlide();
             AMSwiftRetain(holder, slide);
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (indexPath.section == 0 && gAMAutoLinkedCameraIds) {
-                    uint64_t *selIds = NULL;
-                    NSUInteger selCount = 0;
-                    if (AMReadHolderSelectedIds(holder, slide, &selIds, &selCount)) {
-                        for (NSUInteger i = 0; i < selCount; ++i) {
-                            [gAMAutoLinkedCameraIds removeObject:@(selIds[i])];
-                        }
-                    }
-                    if (selIds) free(selIds);
-                }
                 AMRot3DSyncAfterParentingChange(holder);
                 AMSwiftRelease(holder, slide);
             });
@@ -17459,181 +17467,11 @@ static void AMRot3DSyncUndoRedoOnMain(void) {
     }
 }
 
-// --- Camera-to-Null Auto-Linking & Universal AE Lens Layer Sync ---
-
-static uint64_t gAMLinkCamId = 0;
-static uint64_t gAMLinkNullId = 0;
-
-static void AMLinkCameraParentCallback(void *scenePtr) {
-    if (!scenePtr || gAMLinkCamId == 0 || gAMLinkNullId == 0) return;
-    intptr_t slide = AMMainBinarySlide();
-    typedef void *(*MetaFn)(uintptr_t);
-    typedef void *(*CopyFn)(void *, void *, void *);
-    typedef void (*DestroyFn)(void *, void *);
-
-    void *sceneMeta = ((MetaFn)(0x1003c6b10ULL + slide))(0);
-    void *elMeta = ((MetaFn)(0x1003e0404ULL + slide))(0);
-    if (!sceneMeta || !elMeta) return;
-    void *sceneVWT = *(void **)((uint8_t *)sceneMeta - 8);
-    size_t sceneSize = *(size_t *)((uint8_t *)sceneVWT + 0x40);
-    int32_t elementsOff = *(int32_t *)((uint8_t *)sceneMeta + 0x1c);
-    void *elVWT = *(void **)((uint8_t *)elMeta - 8);
-    uint8_t elAlignMask = *(uint8_t *)((uint8_t *)elVWT + 0x50);
-    size_t elStride = *(size_t *)((uint8_t *)elVWT + 0x48);
-    int32_t idOff = *(int32_t *)((uint8_t *)elMeta + 0x1c);
-
-    void *sceneCopy = calloc(1, sceneSize + 32);
-    if (!sceneCopy) return;
-    ((CopyFn)(0x100019e78ULL + slide))(scenePtr, sceneCopy, (void *)(0x1003c6b10ULL + slide));
-
-    void *makeUnique = dlsym(RTLD_DEFAULT, "$sSa36_makeUniqueAndReserveCapacityIfNotUniqueyyF");
-    void **elementsField = (void **)((uint8_t *)scenePtr + elementsOff);
-    if (makeUnique && *elementsField) {
-        struct { uint64_t selfPtr, metaPtr, fnPtr; } uArgs = {
-            (uint64_t)elementsField, (uint64_t)elMeta, (uint64_t)makeUnique
-        };
-        __asm__ volatile(
-            "mov x9, %0\n"
-            "ldr x20, [x9, #0]\n"
-            "ldr x0,  [x9, #8]\n"
-            "ldr x16, [x9, #16]\n"
-            "blr x16\n"
-            : : "r"(&uArgs)
-            : "x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x20","x30","memory"
-        );
-    }
-
-    void *arrStorage = *elementsField;
-    if (arrStorage) {
-        int64_t count = *(int64_t *)((uint8_t *)arrStorage + 0x10);
-        size_t hdrOff = (0x20 + (size_t)elAlignMask) & ~(size_t)elAlignMask;
-        uint8_t *basePtr = (uint8_t *)arrStorage + hdrOff;
-        uintptr_t setParentAddr = (uintptr_t)(0x1003ebba4ULL + slide);
-        for (int64_t i = 0; i < count; ++i) {
-            uint8_t *elPtr = basePtr + (size_t)i * elStride;
-            if (*(uint64_t *)(elPtr + idOff) == gAMLinkCamId) {
-                struct { uint64_t a0, a1, a2, a3, a20, fn; } spArgs = {
-                    (uint64_t)sceneCopy, gAMLinkNullId, 0, 0, (uint64_t)elPtr, (uint64_t)setParentAddr
-                };
-                __asm__ volatile(
-                    "mov x9, %0\n"
-                    "ldr x0,  [x9, #0]\n"
-                    "ldr x1,  [x9, #8]\n"
-                    "ldr x2,  [x9, #16]\n"
-                    "ldr x3,  [x9, #24]\n"
-                    "ldr x20, [x9, #32]\n"
-                    "ldr x16, [x9, #40]\n"
-                    "blr x16\n"
-                    : : "r"(&spArgs)
-                    : "x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x20","x30","memory","v0","v1","v2","v3","v4","v5","v6","v7"
-                );
-                break;
-            }
-        }
-    }
-    ((DestroyFn)(0x1000199c0ULL + slide))(sceneCopy, (void *)(0x1003c6b10ULL + slide));
-    free(sceneCopy);
-}
-
-static uint64_t AMCreateAndLinkNullForCamera(void *holder, uint64_t cameraId, int64_t startMs, int64_t endMs) {
-    if (!holder || cameraId == 0) return 0;
-    intptr_t slide = AMMainBinarySlide();
-    typedef void *(*MetaFn)(uint64_t);
-    typedef void (*DestroyFn)(void *, void *);
-    void *elMeta = ((MetaFn)(0x1003e0404ULL + (uintptr_t)slide))(0);
-    if (!elMeta) return 0;
-    void **elVWT = *(void ***)((uint8_t *)elMeta - 8);
-    size_t elSize = (size_t)elVWT[8];
-    if (elSize < 0x100 || elSize > 0x4000) return 0;
-
-    uint8_t *elBuf = (uint8_t *)calloc(1, elSize + 64);
-    if (!elBuf) return 0;
-
-    uintptr_t initElAddr = (uintptr_t)(0x1003e19c8ULL + (uintptr_t)slide);
-    __asm__ volatile(
-        "mov x8, %[buf]\n"
-        "blr %[fn]\n"
-        : : [buf] "r"(elBuf), [fn] "r"(initElAddr)
-        : "x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x30","memory"
-    );
-
-    int32_t typeOff = *(int32_t *)((uint8_t *)elMeta + 0x10);
-    int32_t startOff = *(int32_t *)((uint8_t *)elMeta + 0x14);
-    int32_t endOff = *(int32_t *)((uint8_t *)elMeta + 0x18);
-    int32_t idOff = *(int32_t *)((uint8_t *)elMeta + 0x1c);
-
-    elBuf[typeOff] = 6; // SceneElementType.nullObject
-    AMSetSceneElementLabel(elBuf, @"Camera Null", slide);
-    *(int64_t *)(elBuf + startOff) = startMs;
-    *(int64_t *)(elBuf + endOff) = (endMs > startMs) ? endMs : (startMs + 5000);
-    uint64_t newNullId = *(uint64_t *)(elBuf + idOff);
-
-    AMCallSceneHolderAddElement(holder, elBuf, slide);
-    ((DestroyFn)(0x1000199c0ULL + (uintptr_t)slide))(elBuf, (void *)(0x1003e0404ULL + (uintptr_t)slide));
-    free(elBuf);
-
-    if (newNullId != 0) {
-        gAMLinkCamId = cameraId;
-        gAMLinkNullId = newNullId;
-        struct { uint64_t cb, holderPtr, fn; } peArgs = {
-            (uint64_t)AMLinkCameraParentCallback, (uint64_t)holder, (uint64_t)(0x100392588ULL + slide)
-        };
-        __asm__ volatile(
-            "mov x9, %0\n"
-            "mov w0, #4\n"
-            "mov x1, #0\n"
-            "mov w2, #2\n"
-            "ldr x3,  [x9, #0]\n"
-            "mov x4, #0\n"
-            "ldr x20, [x9, #8]\n"
-            "ldr x16, [x9, #16]\n"
-            "blr x16\n"
-            : : "r"(&peArgs)
-            : "x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x20","x30","memory","v0","v1","v2","v3","v4","v5","v6","v7"
-        );
-        AMRot3DSyncOrAttachEffect(holder, newNullId, YES, NULL, NULL, NULL);
-    }
-    return newNullId;
-}
+// --- Universal AE Lens Layer Sync ---
 
 static void AMRot3DSyncAllVisualLayersInScene(void *holder) {
     if (!holder) return;
     AMRot3DSyncOrAttachEffect(holder, UINT64_MAX, YES, NULL, NULL, NULL);
-}
-
-static BOOL AMRot3DEnsureCameraNullLinks(void *holder) {
-    if (!holder) return NO;
-    if (!gAMAutoLinkedCameraIds) gAMAutoLinkedCameraIds = [NSMutableSet set];
-    typedef struct { uint64_t cid; int64_t s; int64_t e; } AMCamNeed;
-    AMCamNeed needs[8];
-    int nNeeds = 0;
-
-    os_unfair_lock_lock(&gAMRot3DRuntimeLock);
-    for (int i = 0; i < gAMRot3DElementCount && nNeeds < 8; ++i) {
-        if (gAMRot3DElements[i].elementType == 5 && gAMRot3DElements[i].parentId == 0) {
-            uint64_t cid = gAMRot3DElements[i].elementId;
-            if (![gAMAutoLinkedCameraIds containsObject:@(cid)]) {
-                needs[nNeeds].cid = cid;
-                needs[nNeeds].s = gAMRot3DElements[i].startTimeMs;
-                needs[nNeeds].e = gAMRot3DElements[i].endTimeMs;
-                nNeeds++;
-            }
-        }
-    }
-    os_unfair_lock_unlock(&gAMRot3DRuntimeLock);
-
-    BOOL didLink = NO;
-    for (int i = 0; i < nNeeds; ++i) {
-        [gAMAutoLinkedCameraIds addObject:@(needs[i].cid)];
-        if (AMCreateAndLinkNullForCamera(holder, needs[i].cid, needs[i].s, needs[i].e) != 0) {
-            didLink = YES;
-        }
-    }
-    if (didLink) {
-        AMRot3DSyncAllVisualLayersInScene(holder);
-        AMRot3DRefreshHierarchyFromHolder(holder, 0, NULL);
-    }
-    return didLink;
 }
 
 static void AMRot3DScheduleLiveHierarchySync(void) {
@@ -17649,12 +17487,11 @@ static void AMRot3DScheduleLiveHierarchySync(void) {
         if (!holder) return;
         BOOL prevCam = gAMRot3DHasActiveCamera;
         AMRot3DRefreshHierarchyFromHolder(holder, 0, NULL);
-        BOOL linkedCam = AMRot3DEnsureCameraNullLinks(holder);
         if (gAMRot3DHasActiveCamera && prevCam != gAMRot3DHasActiveCamera) {
             AMRot3DSyncAllVisualLayersInScene(holder);
         }
         AMSwiftRelease(holder, slide);
-        if (prevCam != gAMRot3DHasActiveCamera || linkedCam) {
+        if (prevCam != gAMRot3DHasActiveCamera) {
             AMForceImmediatePreviewRedraw();
         }
     });
@@ -17663,7 +17500,6 @@ static void AMRot3DScheduleLiveHierarchySync(void) {
 static void AMRot3DSyncAfterParentingChange(void *holder) {
     if (!holder) return;
     AMRot3DRefreshHierarchyFromHolder(holder, 0, NULL);
-    AMRot3DEnsureCameraNullLinks(holder);
     // If any Null already has an active 3D slot, ensure its newly linked descendants have GPU 3D slots attached!
     uint64_t activeNullIds[16];
     int nNulls = 0;
@@ -22431,7 +22267,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-17";
+                static NSString *const kAMModBuildVersion = @"2026.11.27-18";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
