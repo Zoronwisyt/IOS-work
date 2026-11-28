@@ -24,6 +24,8 @@
 #import <Metal/Metal.h>
 #import <Accelerate/Accelerate.h>
 #import <os/lock.h>
+#import <CommonCrypto/CommonDigest.h>
+#include <atomic>
 #import <vector>
 #import <algorithm>
 #import <objc/runtime.h>
@@ -850,14 +852,526 @@ static void AMHandleUserLinkFromVC(UIViewController *vc, NSURL *u, BOOL directBy
 }
 
 static const void *kAMSettingsBackupBtnKey = &kAMSettingsBackupBtnKey;
+static const void *kAMSettingsShaderBtnKey = &kAMSettingsShaderBtnKey;
 static void AMPresentBackupVaultFromVC(UIViewController *vc);
+
+// ============================================================================
+// Module 12: Metal Shader Library Cache, Pipeline Cache, MTLBinaryArchive & GPU Profiler
+// ============================================================================
+
+static NSString *const kAMGPUProfilerHUDKey = @"AMModGPUProfilerHUD";
+static NSString *const kAMShaderArchiveStampKey = @"AMModShaderArchiveStamp";
+static NSString *const kAMShaderArchiveVersion = @"2026.11.27-17";
+
+static NSCache<NSString *, id<MTLLibrary>> *gMTLLibraryCache = nil;
+static NSCache<NSString *, id<MTLRenderPipelineState>> *gMTLRPSCache = nil;
+static NSCache<NSString *, id<MTLComputePipelineState>> *gMTLCPSCache = nil;
+
+static id<MTLBinaryArchive> gAMBinaryArchive API_AVAILABLE(ios(14.0)) = nil;
+static dispatch_queue_t gAMArchiveQueue = nil;
+static std::atomic<bool> gAMArchiveDirty{false};
+static std::atomic<bool> gAMArchiveSerializePending{false};
+
+static std::atomic<uint64_t> gShaderLibHits{0};
+static std::atomic<uint64_t> gShaderLibMisses{0};
+static std::atomic<uint64_t> gPipelineHits{0};
+static std::atomic<uint64_t> gPipelineMisses{0};
+
+static BOOL gGPUProfilerEnabled = NO;
+static os_unfair_lock gGPUProfLock = OS_UNFAIR_LOCK_INIT;
+static double gGPUFrameTimesMs[120] = {0};
+static int gGPUFrameWriteIdx = 0;
+static int gGPUFrameCount = 0;
+static uint64_t gGPUHitchCount = 0;
+static UILabel *gGPUHudLabel = nil;
+static dispatch_source_t gGPUHudTimer = nil;
+
+static IMP gOrigMTLNewLibSync = NULL;
+static IMP gOrigMTLNewLibAsync = NULL;
+static IMP gOrigMTLNewRPSSync = NULL;
+static IMP gOrigMTLNewRPSAsync = NULL;
+static IMP gOrigMTLNewCPSSync = NULL;
+static IMP gOrigMTLCommandBufferCommit = NULL;
+
+static NSURL *AMShaderArchiveURL(void) {
+    NSArray<NSURL *> *caches = [[NSFileManager defaultManager] URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask];
+    NSURL *base = caches.firstObject ?: [NSURL fileURLWithPath:NSTemporaryDirectory()];
+    return [base URLByAppendingPathComponent:@"AMShaderArchive.metallib"];
+}
+
+static NSString *AMShaderArchiveStamp(void) {
+    NSString *osVer = [NSProcessInfo processInfo].operatingSystemVersionString ?: @"unknown";
+    return [NSString stringWithFormat:@"%@|%@", kAMShaderArchiveVersion, osVer];
+}
+
+static void AMScheduleArchiveSerialize(void) {
+    if (@available(iOS 14.0, *)) {
+        if (!gAMBinaryArchive || !gAMArchiveQueue) return;
+        gAMArchiveDirty.store(true, std::memory_order_relaxed);
+        bool expected = false;
+        if (!gAMArchiveSerializePending.compare_exchange_strong(expected, true)) return;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), gAMArchiveQueue, ^{
+            gAMArchiveSerializePending.store(false, std::memory_order_relaxed);
+            if (!gAMArchiveDirty.exchange(false, std::memory_order_relaxed)) return;
+            NSError *err = nil;
+            [gAMBinaryArchive serializeToURL:AMShaderArchiveURL() error:&err];
+        });
+    }
+}
+
+static void AMFlushArchiveNow(void) {
+    if (@available(iOS 14.0, *)) {
+        if (!gAMBinaryArchive || !gAMArchiveQueue) return;
+        if (!gAMArchiveDirty.exchange(false, std::memory_order_relaxed)) return;
+        dispatch_async(gAMArchiveQueue, ^{
+            NSError *err = nil;
+            [gAMBinaryArchive serializeToURL:AMShaderArchiveURL() error:&err];
+        });
+    }
+}
+
+static NSString *AMShaderSourceKey(NSString *source, MTLCompileOptions *options) {
+    if (!source) return nil;
+    if (options) {
+        if (@available(iOS 14.0, *)) {
+            if (options.libraries.count > 0) return nil;
+        }
+    }
+    NSMutableString *meta = [NSMutableString stringWithCapacity:64];
+    [meta appendFormat:@"fm=%d;lv=%lu",
+     options ? (int)options.fastMathEnabled : 1,
+     options ? (unsigned long)options.languageVersion : 0UL];
+    if (options) {
+        if (@available(iOS 14.0, *)) {
+            [meta appendFormat:@";pi=%d", (int)options.preserveInvariance];
+        }
+        NSDictionary *macros = options.preprocessorMacros;
+        if (macros.count > 0) {
+            NSArray *keys = [[macros allKeys] sortedArrayUsingSelector:@selector(compare:)];
+            for (id k in keys) {
+                [meta appendFormat:@";%@=%@", k, macros[k]];
+            }
+        }
+    }
+    NSData *srcData = [source dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *metaData = [meta dataUsingEncoding:NSUTF8StringEncoding];
+    CC_SHA256_CTX ctx;
+    CC_SHA256_Init(&ctx);
+    if (metaData.length) CC_SHA256_Update(&ctx, metaData.bytes, (CC_LONG)metaData.length);
+    CC_SHA256_Update(&ctx, "\0", 1);
+    if (srcData.length) CC_SHA256_Update(&ctx, srcData.bytes, (CC_LONG)srcData.length);
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256_Final(digest, &ctx);
+    char hex[CC_SHA256_DIGEST_LENGTH * 2 + 1];
+    static const char kHex[] = "0123456789abcdef";
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+        hex[i * 2] = kHex[(digest[i] >> 4) & 0xF];
+        hex[i * 2 + 1] = kHex[digest[i] & 0xF];
+    }
+    hex[CC_SHA256_DIGEST_LENGTH * 2] = '\0';
+    return [NSString stringWithUTF8String:hex];
+}
+
+static NSString *AMRenderPipelineKey(MTLRenderPipelineDescriptor *desc) {
+    if (!desc || !desc.fragmentFunction) return nil;
+    MTLRenderPipelineColorAttachmentDescriptor *ca0 = desc.colorAttachments[0];
+    return [NSString stringWithFormat:@"%p:%@|%p:%@|%lu:%d:%lu:%lu:%lu:%lu:%lu:%lu|%lu:%lu:%lu",
+            (__bridge void *)desc.vertexFunction, desc.vertexFunction.name ?: @"",
+            (__bridge void *)desc.fragmentFunction, desc.fragmentFunction.name ?: @"",
+            (unsigned long)ca0.pixelFormat,
+            (int)ca0.isBlendingEnabled,
+            (unsigned long)ca0.rgbBlendOperation,
+            (unsigned long)ca0.alphaBlendOperation,
+            (unsigned long)ca0.sourceRGBBlendFactor,
+            (unsigned long)ca0.destinationRGBBlendFactor,
+            (unsigned long)ca0.sourceAlphaBlendFactor,
+            (unsigned long)ca0.destinationAlphaBlendFactor,
+            (unsigned long)desc.depthAttachmentPixelFormat,
+            (unsigned long)desc.stencilAttachmentPixelFormat,
+            (unsigned long)desc.sampleCount];
+}
+
+static id<MTLLibrary> AMHook_mtlNewLibraryWithSourceSync(id self, SEL _cmd, NSString *source, MTLCompileOptions *options, NSError * __autoreleasing *error) {
+    NSString *key = AMShaderSourceKey(source, options);
+    if (key && gMTLLibraryCache) {
+        id<MTLLibrary> cached = [gMTLLibraryCache objectForKey:key];
+        if (cached) {
+            gShaderLibHits.fetch_add(1, std::memory_order_relaxed);
+            return cached;
+        }
+    }
+    gShaderLibMisses.fetch_add(1, std::memory_order_relaxed);
+    id<MTLLibrary> lib = ((id<MTLLibrary> (*)(id, SEL, NSString *, MTLCompileOptions *, NSError * __autoreleasing *))gOrigMTLNewLibSync)(self, _cmd, source, options, error);
+    if (lib && key && gMTLLibraryCache) {
+        [gMTLLibraryCache setObject:lib forKey:key];
+    }
+    return lib;
+}
+
+static void AMHook_mtlNewLibraryWithSourceAsync(id self, SEL _cmd, NSString *source, MTLCompileOptions *options, MTLNewLibraryCompletionHandler completionHandler) {
+    NSString *key = AMShaderSourceKey(source, options);
+    if (key && gMTLLibraryCache) {
+        id<MTLLibrary> cached = [gMTLLibraryCache objectForKey:key];
+        if (cached) {
+            gShaderLibHits.fetch_add(1, std::memory_order_relaxed);
+            if (completionHandler) {
+                completionHandler(cached, nil);
+            }
+            return;
+        }
+    }
+    gShaderLibMisses.fetch_add(1, std::memory_order_relaxed);
+    MTLNewLibraryCompletionHandler wrapped = ^(id<MTLLibrary> lib, NSError *err) {
+        if (lib && key && gMTLLibraryCache) {
+            [gMTLLibraryCache setObject:lib forKey:key];
+        }
+        if (completionHandler) {
+            completionHandler(lib, err);
+        }
+    };
+    ((void (*)(id, SEL, NSString *, MTLCompileOptions *, MTLNewLibraryCompletionHandler))gOrigMTLNewLibAsync)(self, _cmd, source, options, wrapped);
+}
+
+static id<MTLRenderPipelineState> AMHook_mtlNewRPSSync(id self, SEL _cmd, MTLRenderPipelineDescriptor *desc, NSError * __autoreleasing *error) {
+    NSString *key = AMRenderPipelineKey(desc);
+    if (key && gMTLRPSCache) {
+        id<MTLRenderPipelineState> cached = [gMTLRPSCache objectForKey:key];
+        if (cached) {
+            gPipelineHits.fetch_add(1, std::memory_order_relaxed);
+            return cached;
+        }
+    }
+    gPipelineMisses.fetch_add(1, std::memory_order_relaxed);
+    MTLRenderPipelineDescriptor *useDesc = desc;
+    if (@available(iOS 14.0, *)) {
+        if (gAMBinaryArchive && desc && (!desc.binaryArchives || desc.binaryArchives.count == 0)) {
+            useDesc = [desc copy];
+            useDesc.binaryArchives = @[gAMBinaryArchive];
+        }
+    }
+    id<MTLRenderPipelineState> pso = ((id<MTLRenderPipelineState> (*)(id, SEL, MTLRenderPipelineDescriptor *, NSError * __autoreleasing *))gOrigMTLNewRPSSync)(self, _cmd, useDesc, error);
+    if (pso) {
+        if (key && gMTLRPSCache) {
+            [gMTLRPSCache setObject:pso forKey:key];
+        }
+        if (@available(iOS 14.0, *)) {
+            if (gAMBinaryArchive && gAMArchiveQueue && desc) {
+                MTLRenderPipelineDescriptor *archCopy = [desc copy];
+                dispatch_async(gAMArchiveQueue, ^{
+                    NSError *archErr = nil;
+                    if ([gAMBinaryArchive addRenderPipelineFunctionsWithDescriptor:archCopy error:&archErr]) {
+                        AMScheduleArchiveSerialize();
+                    }
+                });
+            }
+        }
+    }
+    return pso;
+}
+
+static void AMHook_mtlNewRPSAsync(id self, SEL _cmd, MTLRenderPipelineDescriptor *desc, MTLNewRenderPipelineStateCompletionHandler completionHandler) {
+    NSString *key = AMRenderPipelineKey(desc);
+    if (key && gMTLRPSCache) {
+        id<MTLRenderPipelineState> cached = [gMTLRPSCache objectForKey:key];
+        if (cached) {
+            gPipelineHits.fetch_add(1, std::memory_order_relaxed);
+            if (completionHandler) {
+                completionHandler(cached, nil);
+            }
+            return;
+        }
+    }
+    gPipelineMisses.fetch_add(1, std::memory_order_relaxed);
+    MTLRenderPipelineDescriptor *useDesc = desc;
+    if (@available(iOS 14.0, *)) {
+        if (gAMBinaryArchive && desc && (!desc.binaryArchives || desc.binaryArchives.count == 0)) {
+            useDesc = [desc copy];
+            useDesc.binaryArchives = @[gAMBinaryArchive];
+        }
+    }
+    MTLRenderPipelineDescriptor *archCopy = desc ? [desc copy] : nil;
+    MTLNewRenderPipelineStateCompletionHandler wrapped = ^(id<MTLRenderPipelineState> pso, NSError *err) {
+        if (pso) {
+            if (key && gMTLRPSCache) {
+                [gMTLRPSCache setObject:pso forKey:key];
+            }
+            if (@available(iOS 14.0, *)) {
+                if (gAMBinaryArchive && gAMArchiveQueue && archCopy) {
+                    dispatch_async(gAMArchiveQueue, ^{
+                        NSError *archErr = nil;
+                        if ([gAMBinaryArchive addRenderPipelineFunctionsWithDescriptor:archCopy error:&archErr]) {
+                            AMScheduleArchiveSerialize();
+                        }
+                    });
+                }
+            }
+        }
+        if (completionHandler) {
+            completionHandler(pso, err);
+        }
+    };
+    ((void (*)(id, SEL, MTLRenderPipelineDescriptor *, MTLNewRenderPipelineStateCompletionHandler))gOrigMTLNewRPSAsync)(self, _cmd, useDesc, wrapped);
+}
+
+static id<MTLComputePipelineState> AMHook_mtlNewCPSSync(id self, SEL _cmd, id<MTLFunction> computeFunction, NSError * __autoreleasing *error) {
+    NSString *key = computeFunction ? [NSString stringWithFormat:@"%p:%@", (__bridge void *)computeFunction, computeFunction.name ?: @""] : nil;
+    if (key && gMTLCPSCache) {
+        id<MTLComputePipelineState> cached = [gMTLCPSCache objectForKey:key];
+        if (cached) {
+            gPipelineHits.fetch_add(1, std::memory_order_relaxed);
+            return cached;
+        }
+    }
+    gPipelineMisses.fetch_add(1, std::memory_order_relaxed);
+    id<MTLComputePipelineState> cps = ((id<MTLComputePipelineState> (*)(id, SEL, id<MTLFunction>, NSError * __autoreleasing *))gOrigMTLNewCPSSync)(self, _cmd, computeFunction, error);
+    if (cps && key && gMTLCPSCache) {
+        [gMTLCPSCache setObject:cps forKey:key];
+    }
+    return cps;
+}
+
+static void AMHook_mtlCommandBufferCommit(id self, SEL _cmd) {
+    if (__builtin_expect(gGPUProfilerEnabled, 0)) {
+        id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)self;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> completedCB) {
+            CFTimeInterval dt = completedCB.GPUEndTime - completedCB.GPUStartTime;
+            if (dt > 0.0 && dt < 2.0) {
+                double ms = dt * 1000.0;
+                os_unfair_lock_lock(&gGPUProfLock);
+                gGPUFrameTimesMs[gGPUFrameWriteIdx] = ms;
+                gGPUFrameWriteIdx = (gGPUFrameWriteIdx + 1) % 120;
+                if (gGPUFrameCount < 120) gGPUFrameCount++;
+                if (ms > 16.67) gGPUHitchCount++;
+                os_unfair_lock_unlock(&gGPUProfLock);
+            }
+        }];
+    }
+    ((void (*)(id, SEL))gOrigMTLCommandBufferCommit)(self, _cmd);
+}
+
+static void AMUpdateGPUHudDisplay(void) {
+    if (!gGPUProfilerEnabled) {
+        if (gGPUHudLabel) {
+            [gGPUHudLabel removeFromSuperview];
+            gGPUHudLabel = nil;
+        }
+        return;
+    }
+    UIWindow *win = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                if (w.isKeyWindow) { win = w; break; }
+            }
+            if (win) break;
+        }
+    }
+    if (!win) win = [UIApplication sharedApplication].keyWindow;
+    if (!win) return;
+
+    if (!gGPUHudLabel) {
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12.0, 52.0, 250.0, 22.0)];
+        lbl.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.78];
+        lbl.textColor = [UIColor colorWithRed:0.45 green:0.95 blue:0.65 alpha:1.0];
+        lbl.font = [UIFont monospacedDigitSystemFontOfSize:10.5 weight:UIFontWeightSemibold];
+        lbl.textAlignment = NSTextAlignmentCenter;
+        lbl.layer.cornerRadius = 7.0;
+        lbl.clipsToBounds = YES;
+        lbl.userInteractionEnabled = NO;
+        gGPUHudLabel = lbl;
+        [win addSubview:lbl];
+    } else if (gGPUHudLabel.superview != win) {
+        [win addSubview:gGPUHudLabel];
+    }
+
+    double samples[120];
+    int count = 0;
+    uint64_t hitches = 0;
+    os_unfair_lock_lock(&gGPUProfLock);
+    count = gGPUFrameCount;
+    hitches = gGPUHitchCount;
+    for (int i = 0; i < count; i++) samples[i] = gGPUFrameTimesMs[i];
+    os_unfair_lock_unlock(&gGPUProfLock);
+
+    double p50 = 0.0, p95 = 0.0;
+    if (count > 0) {
+        std::sort(samples, samples + count);
+        p50 = samples[count / 2];
+        int idx95 = (int)(count * 0.95);
+        if (idx95 >= count) idx95 = count - 1;
+        p95 = samples[idx95];
+    }
+    uint64_t hits = gShaderLibHits.load(std::memory_order_relaxed) + gPipelineHits.load(std::memory_order_relaxed);
+    uint64_t total = hits + gShaderLibMisses.load(std::memory_order_relaxed) + gPipelineMisses.load(std::memory_order_relaxed);
+    int pct = total > 0 ? (int)((hits * 100ULL) / total) : 100;
+
+    gGPUHudLabel.text = [NSString stringWithFormat:@"GPU p50 %.1fms | p95 %.1fms | %d%% (%llu)",
+                         p50, p95, pct, (unsigned long long)hitches];
+}
+
+static void AMSetGPUProfilerEnabled(BOOL enabled) {
+    gGPUProfilerEnabled = enabled;
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kAMGPUProfilerHUDKey];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (enabled && !gGPUHudTimer) {
+            gGPUHudTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+            dispatch_source_set_timer(gGPUHudTimer, DISPATCH_TIME_NOW, (uint64_t)(0.25 * NSEC_PER_SEC), (uint64_t)(0.05 * NSEC_PER_SEC));
+            dispatch_source_set_event_handler(gGPUHudTimer, ^{
+                AMUpdateGPUHudDisplay();
+            });
+            dispatch_resume(gGPUHudTimer);
+        } else if (!enabled && gGPUHudTimer) {
+            dispatch_source_cancel(gGPUHudTimer);
+            gGPUHudTimer = nil;
+        }
+        AMUpdateGPUHudDisplay();
+    });
+}
+
+static void AMInstallMetalShaderCacheAndProfiler(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        gMTLLibraryCache = [[NSCache alloc] init];
+        gMTLLibraryCache.countLimit = 512;
+        gMTLRPSCache = [[NSCache alloc] init];
+        gMTLRPSCache.countLimit = 512;
+        gMTLCPSCache = [[NSCache alloc] init];
+        gMTLCPSCache.countLimit = 256;
+
+        gGPUProfilerEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:kAMGPUProfilerHUDKey];
+        if (gGPUProfilerEnabled) {
+            AMSetGPUProfilerEnabled(YES);
+        }
+
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (!dev) return;
+
+        if (@available(iOS 14.0, *)) {
+            if ([dev respondsToSelector:@selector(newBinaryArchiveWithDescriptor:error:)]) {
+                gAMArchiveQueue = dispatch_queue_create("com.rockmotion.shaderarchive", DISPATCH_QUEUE_SERIAL);
+                NSURL *archURL = AMShaderArchiveURL();
+                NSString *curStamp = AMShaderArchiveStamp();
+                NSString *savedStamp = [[NSUserDefaults standardUserDefaults] stringForKey:kAMShaderArchiveStampKey];
+                NSFileManager *fm = [NSFileManager defaultManager];
+                if (![savedStamp isEqualToString:curStamp]) {
+                    [fm removeItemAtURL:archURL error:nil];
+                    [[NSUserDefaults standardUserDefaults] setObject:curStamp forKey:kAMShaderArchiveStampKey];
+                }
+                MTLBinaryArchiveDescriptor *archDesc = [[MTLBinaryArchiveDescriptor alloc] init];
+                if ([fm fileExistsAtPath:archURL.path]) {
+                    archDesc.url = archURL;
+                }
+                NSError *err = nil;
+                id<MTLBinaryArchive> arch = [dev newBinaryArchiveWithDescriptor:archDesc error:&err];
+                if (!arch && archDesc.url) {
+                    [fm removeItemAtURL:archURL error:nil];
+                    archDesc.url = nil;
+                    arch = [dev newBinaryArchiveWithDescriptor:archDesc error:nil];
+                }
+                gAMBinaryArchive = arch;
+            }
+        }
+
+        Class devCls = [dev class];
+        if (devCls) {
+            Method mLibSync = class_getInstanceMethod(devCls, @selector(newLibraryWithSource:options:error:));
+            if (mLibSync) gOrigMTLNewLibSync = method_setImplementation(mLibSync, (IMP)AMHook_mtlNewLibraryWithSourceSync);
+
+            Method mLibAsync = class_getInstanceMethod(devCls, @selector(newLibraryWithSource:options:completionHandler:));
+            if (mLibAsync) gOrigMTLNewLibAsync = method_setImplementation(mLibAsync, (IMP)AMHook_mtlNewLibraryWithSourceAsync);
+
+            Method mRPSSync = class_getInstanceMethod(devCls, @selector(newRenderPipelineStateWithDescriptor:error:));
+            if (mRPSSync) gOrigMTLNewRPSSync = method_setImplementation(mRPSSync, (IMP)AMHook_mtlNewRPSSync);
+
+            Method mRPSAsync = class_getInstanceMethod(devCls, @selector(newRenderPipelineStateWithDescriptor:completionHandler:));
+            if (mRPSAsync) gOrigMTLNewRPSAsync = method_setImplementation(mRPSAsync, (IMP)AMHook_mtlNewRPSAsync);
+
+            Method mCPSSync = class_getInstanceMethod(devCls, @selector(newComputePipelineStateWithFunction:error:));
+            if (mCPSSync) gOrigMTLNewCPSSync = method_setImplementation(mCPSSync, (IMP)AMHook_mtlNewCPSSync);
+        }
+
+        id<MTLCommandQueue> q = [dev newCommandQueue];
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        if (cb) {
+            Class cbCls = [cb class];
+            Method mCommit = class_getInstanceMethod(cbCls, @selector(commit));
+            if (mCommit) gOrigMTLCommandBufferCommit = method_setImplementation(mCommit, (IMP)AMHook_mtlCommandBufferCommit);
+        }
+
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                          object:nil
+                                                           queue:nil
+                                                      usingBlock:^(NSNotification *note) {
+            (void)note;
+            AMFlushArchiveNow();
+        }];
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillTerminateNotification
+                                                          object:nil
+                                                           queue:nil
+                                                      usingBlock:^(NSNotification *note) {
+            (void)note;
+            AMFlushArchiveNow();
+        }];
+    });
+}
+
+static void AMPresentShaderCacheAndProfilerSheet(UIViewController *vc) {
+    if (!vc) return;
+    uint64_t lHits = gShaderLibHits.load(std::memory_order_relaxed);
+    uint64_t lMiss = gShaderLibMisses.load(std::memory_order_relaxed);
+    uint64_t pHits = gPipelineHits.load(std::memory_order_relaxed);
+    uint64_t pMiss = gPipelineMisses.load(std::memory_order_relaxed);
+
+    NSURL *archURL = AMShaderArchiveURL();
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:archURL.path error:nil];
+    unsigned long long archKB = ([attrs[NSFileSize] unsignedLongLongValue]) / 1024ULL;
+
+    NSString *msg = [NSString stringWithFormat:
+                     @"Shader Lib: %llu hits / %llu compiles\n"
+                     @"Pipeline State: %llu hits / %llu compiles\n"
+                     @"Disk Archive: %llu KB\n"
+                     @"GPU HUD: %@",
+                     lHits, lMiss, pHits, pMiss, archKB,
+                     gGPUProfilerEnabled ? @"ON" : @"OFF"];
+
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Shader Cache & GPU HUD"
+                                                                message:msg
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:(gGPUProfilerEnabled ? @"Disable GPU HUD" : @"Enable GPU HUD")
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(__kindof UIAlertAction * _Nonnull a) {
+        (void)a;
+        AMSetGPUProfilerEnabled(!gGPUProfilerEnabled);
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Clear Shader Cache"
+                                           style:UIAlertActionStyleDestructive
+                                         handler:^(__kindof UIAlertAction * _Nonnull a) {
+        (void)a;
+        [gMTLLibraryCache removeAllObjects];
+        [gMTLRPSCache removeAllObjects];
+        [gMTLCPSCache removeAllObjects];
+        [[NSFileManager defaultManager] removeItemAtURL:AMShaderArchiveURL() error:nil];
+        gShaderLibHits = 0; gShaderLibMisses = 0;
+        gPipelineHits = 0; gPipelineMisses = 0;
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+    [vc presentViewController:ac animated:YES completion:nil];
+}
 
 @interface AMSettingsLinkHandler : NSObject
 + (void)onTapOpenLink:(UIButton *)btn;
 + (void)onTapOpenBackupVault:(UIButton *)btn;
++ (void)onTapShaderCache:(UIButton *)btn;
 @end
 
 @implementation AMSettingsLinkHandler
+
++ (void)onTapShaderCache:(UIButton *)btn {
+    UIViewController *vc = objc_getAssociatedObject(btn, kAMSettingsShaderBtnKey);
+    if (!vc) return;
+    AMPresentShaderCacheAndProfilerSheet(vc);
+}
 
 + (void)onTapOpenBackupVault:(UIButton *)btn {
     UIViewController *vc = objc_getAssociatedObject(btn, kAMSettingsBackupBtnKey);
@@ -926,7 +1440,7 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     CGFloat existingH = existingHdr ? existingHdr.frame.size.height : 0.0;
     // Trim excess bottom padding of SettingsHeaderView so "Open Alight Link" sits higher and leaves clean separation above Section 0
     CGFloat hdrH = (existingH > 40.0) ? MAX(38.0, existingH - 10.0) : existingH;
-    CGFloat pillContainerH = 112.0;
+    CGFloat pillContainerH = 162.0;
 
     UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, hdrH + pillContainerH)];
     header.backgroundColor = [UIColor clearColor];
@@ -987,6 +1501,31 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     backupIcon.tintColor = AMSettingsTextColor();
     [backupPill addSubview:backupIcon];
 
+    UIButton *shaderPill = [UIButton buttonWithType:UIButtonTypeSystem];
+    shaderPill.translatesAutoresizingMaskIntoConstraints = NO;
+    shaderPill.backgroundColor = AMSettingsPillColor();
+    shaderPill.layer.cornerRadius = 14.0;
+    shaderPill.clipsToBounds = YES;
+    [header addSubview:shaderPill];
+
+    UILabel *shaderLbl = [[UILabel alloc] init];
+    shaderLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    shaderLbl.text = @"Shader Cache & GPU HUD";
+    shaderLbl.font = AMThemeFont(14.0, UIFontWeightMedium);
+    shaderLbl.textColor = AMSettingsTextColor();
+    shaderLbl.userInteractionEnabled = NO;
+    [shaderPill addSubview:shaderLbl];
+
+    UIImageView *shaderIcon = [[UIImageView alloc] init];
+    shaderIcon.translatesAutoresizingMaskIntoConstraints = NO;
+    shaderIcon.userInteractionEnabled = NO;
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:13.0 weight:UIImageSymbolWeightMedium];
+        shaderIcon.image = [UIImage systemImageNamed:@"cpu" withConfiguration:cfg];
+    }
+    shaderIcon.tintColor = AMSettingsTextColor();
+    [shaderPill addSubview:shaderIcon];
+
     [NSLayoutConstraint activateConstraints:@[
         [pill.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16.0],
         [pill.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16.0],
@@ -1009,6 +1548,17 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
 
         [backupIcon.trailingAnchor constraintEqualToAnchor:backupPill.trailingAnchor constant:-15.0],
         [backupIcon.centerYAnchor constraintEqualToAnchor:backupPill.centerYAnchor],
+
+        [shaderPill.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16.0],
+        [shaderPill.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16.0],
+        [shaderPill.topAnchor constraintEqualToAnchor:backupPill.bottomAnchor constant:8.0],
+        [shaderPill.heightAnchor constraintEqualToConstant:42.0],
+
+        [shaderLbl.leadingAnchor constraintEqualToAnchor:shaderPill.leadingAnchor constant:16.0],
+        [shaderLbl.centerYAnchor constraintEqualToAnchor:shaderPill.centerYAnchor],
+
+        [shaderIcon.trailingAnchor constraintEqualToAnchor:shaderPill.trailingAnchor constant:-15.0],
+        [shaderIcon.centerYAnchor constraintEqualToAnchor:shaderPill.centerYAnchor],
     ]];
 
     objc_setAssociatedObject(pill, kAMSettingsLinkBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
@@ -1019,6 +1569,11 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     objc_setAssociatedObject(backupPill, kAMSettingsBackupBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
     [backupPill addTarget:[AMSettingsLinkHandler class]
                    action:@selector(onTapOpenBackupVault:)
+         forControlEvents:UIControlEventTouchUpInside];
+
+    objc_setAssociatedObject(shaderPill, kAMSettingsShaderBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
+    [shaderPill addTarget:[AMSettingsLinkHandler class]
+                   action:@selector(onTapShaderCache:)
          forControlEvents:UIControlEventTouchUpInside];
 
     tv.tableHeaderView = header;
@@ -21829,6 +22384,7 @@ static void AlightMotionModsInit(void) {
                     (IMP)AMHook_appAttestAttestKey,
                     &gOrigAppAttestAttestKey);
     AMInstallSideStoreStabilityGuard();
+    AMInstallMetalShaderCacheAndProfiler();
 
     // Module 9B: Multi-Font & Files Paste/Import Crash Fix
     AMSwizzleMethod(@"NSFileManager",
@@ -21875,7 +22431,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-16";
+                static NSString *const kAMModBuildVersion = @"2026.11.27-17";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
