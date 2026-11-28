@@ -1599,8 +1599,22 @@ static void AMMigrateCustomEffectXMLCategories(void) {
 }
 
 static void AMInstallCustomEffectCategoryIfNeeded(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
+    static BOOL sInstalled = NO;
+    if (sInstalled) return;
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            AMInstallCustomEffectCategoryIfNeeded();
+        });
+        return;
+    }
+    // EffectCategory.all initializes Firebase-backed effect metadata; never invoke swiftOnce before [FIRApp configure] finishes.
+    Class firAppCls = NSClassFromString(@"FIRApp");
+    SEL defaultAppSel = NSSelectorFromString(@"defaultApp");
+    if (firAppCls && [firAppCls respondsToSelector:defaultAppSel]) {
+        id defApp = ((id (*)(id, SEL))objc_msgSend)(firAppCls, defaultAppSel);
+        if (!defApp) return;
+    }
+    @try {
         AMMigrateCustomEffectXMLCategories();
 
         intptr_t slide = AMMainBinarySlide();
@@ -1790,7 +1804,8 @@ static void AMInstallCustomEffectCategoryIfNeeded(void) {
         }
 
         *globalSlot = newHdr;
-    });
+        sInstalled = YES;
+    } @catch (__unused NSException *ex) {}
 }
 
 static UILabel *AMFindFirstLabelInView(UIView *v);
@@ -23907,10 +23922,6 @@ static void AlightMotionModsInit(void) {
                     (IMP)AMHook_libraryPanelShouldReceiveTouch,
                     &gOrigLibraryPanelShouldReceiveTouch);
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        AMInstallCustomEffectCategoryIfNeeded();
-    });
-
     AMSwizzleMethod(@"UIWindow",
                     @"sendEvent:",
                     (IMP)AMHook_windowSendEvent,
@@ -23987,6 +23998,7 @@ static void AlightMotionModsInit(void) {
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
         (void)note;
+        AMInstallCustomEffectCategoryIfNeeded();
         [[AMLaunchIntroManager shared] startIfNeeded];
     }];
     [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeKeyNotification
@@ -24006,7 +24018,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.28-5";
+                static NSString *const kAMModBuildVersion = @"2026.11.28-6";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
