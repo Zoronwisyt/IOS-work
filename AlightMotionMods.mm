@@ -850,11 +850,14 @@ static void AMHandleUserLinkFromVC(UIViewController *vc, NSURL *u, BOOL directBy
 }
 
 static const void *kAMSettingsBackupBtnKey = &kAMSettingsBackupBtnKey;
+static const void *kAMSettingsPackageBtnKey = &kAMSettingsPackageBtnKey;
 static void AMPresentBackupVaultFromVC(UIViewController *vc);
+static void AMPresentPackageExporterFromVC(UIViewController *vc);
 
 @interface AMSettingsLinkHandler : NSObject
 + (void)onTapOpenLink:(UIButton *)btn;
 + (void)onTapOpenBackupVault:(UIButton *)btn;
++ (void)onTapMakePackage:(UIButton *)btn;
 @end
 
 @implementation AMSettingsLinkHandler
@@ -863,6 +866,12 @@ static void AMPresentBackupVaultFromVC(UIViewController *vc);
     UIViewController *vc = objc_getAssociatedObject(btn, kAMSettingsBackupBtnKey);
     if (!vc) return;
     AMPresentBackupVaultFromVC(vc);
+}
+
++ (void)onTapMakePackage:(UIButton *)btn {
+    UIViewController *vc = objc_getAssociatedObject(btn, kAMSettingsPackageBtnKey);
+    if (!vc) return;
+    AMPresentPackageExporterFromVC(vc);
 }
 
 + (void)onTapOpenLink:(UIButton *)btn {
@@ -926,7 +935,7 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     CGFloat existingH = existingHdr ? existingHdr.frame.size.height : 0.0;
     // Trim excess bottom padding of SettingsHeaderView so "Open Alight Link" sits higher and leaves clean separation above Section 0
     CGFloat hdrH = (existingH > 40.0) ? MAX(38.0, existingH - 10.0) : existingH;
-    CGFloat pillContainerH = 112.0;
+    CGFloat pillContainerH = 162.0;
 
     UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, hdrH + pillContainerH)];
     header.backgroundColor = [UIColor clearColor];
@@ -987,6 +996,31 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     backupIcon.tintColor = AMSettingsTextColor();
     [backupPill addSubview:backupIcon];
 
+    UIButton *pkgPill = [UIButton buttonWithType:UIButtonTypeSystem];
+    pkgPill.translatesAutoresizingMaskIntoConstraints = NO;
+    pkgPill.backgroundColor = AMSettingsPillColor();
+    pkgPill.layer.cornerRadius = 14.0;
+    pkgPill.clipsToBounds = YES;
+    [header addSubview:pkgPill];
+
+    UILabel *pkgLbl = [[UILabel alloc] init];
+    pkgLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    pkgLbl.text = @"Make Project Package (.amproj)";
+    pkgLbl.font = AMThemeFont(14.0, UIFontWeightMedium);
+    pkgLbl.textColor = AMSettingsTextColor();
+    pkgLbl.userInteractionEnabled = NO;
+    [pkgPill addSubview:pkgLbl];
+
+    UIImageView *pkgIcon = [[UIImageView alloc] init];
+    pkgIcon.translatesAutoresizingMaskIntoConstraints = NO;
+    pkgIcon.userInteractionEnabled = NO;
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:13.0 weight:UIImageSymbolWeightMedium];
+        pkgIcon.image = [UIImage systemImageNamed:@"shippingbox" withConfiguration:cfg];
+    }
+    pkgIcon.tintColor = AMSettingsTextColor();
+    [pkgPill addSubview:pkgIcon];
+
     [NSLayoutConstraint activateConstraints:@[
         [pill.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16.0],
         [pill.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16.0],
@@ -1009,6 +1043,17 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
 
         [backupIcon.trailingAnchor constraintEqualToAnchor:backupPill.trailingAnchor constant:-15.0],
         [backupIcon.centerYAnchor constraintEqualToAnchor:backupPill.centerYAnchor],
+
+        [pkgPill.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16.0],
+        [pkgPill.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16.0],
+        [pkgPill.topAnchor constraintEqualToAnchor:backupPill.bottomAnchor constant:8.0],
+        [pkgPill.heightAnchor constraintEqualToConstant:42.0],
+
+        [pkgLbl.leadingAnchor constraintEqualToAnchor:pkgPill.leadingAnchor constant:16.0],
+        [pkgLbl.centerYAnchor constraintEqualToAnchor:pkgPill.centerYAnchor],
+
+        [pkgIcon.trailingAnchor constraintEqualToAnchor:pkgPill.trailingAnchor constant:-15.0],
+        [pkgIcon.centerYAnchor constraintEqualToAnchor:pkgPill.centerYAnchor],
     ]];
 
     objc_setAssociatedObject(pill, kAMSettingsLinkBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
@@ -1020,6 +1065,11 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     [backupPill addTarget:[AMSettingsLinkHandler class]
                    action:@selector(onTapOpenBackupVault:)
          forControlEvents:UIControlEventTouchUpInside];
+
+    objc_setAssociatedObject(pkgPill, kAMSettingsPackageBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
+    [pkgPill addTarget:[AMSettingsLinkHandler class]
+                action:@selector(onTapMakePackage:)
+      forControlEvents:UIControlEventTouchUpInside];
 
     tv.tableHeaderView = header;
     objc_setAssociatedObject(vc, kAMSettingsLinkBtnKey, pill, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -3362,6 +3412,7 @@ static BOOL AMVCTreeContainsEditor(UIViewController *vc, NSInteger depth) {
         [clsName containsString:@"AMProjectMultiPickerVC"] ||
         [clsName containsString:@"AMOriginalProjectsImporterVC"] ||
         [clsName containsString:@"AMBackupVaultVC"] ||
+        [clsName containsString:@"AMPackageExporterVC"] ||
         [clsName containsString:@"Loading"] ||
         [clsName containsString:@"Splash"] ||
         [clsName containsString:@"Launch"]) {
@@ -21402,6 +21453,742 @@ static void AMHook_fontBrowserViewDidLoad(id self, SEL _cmd) {
     }
 }
 
+// ============================================================================
+// Module 12: Offline Sign-In-Free Project Package Exporter (.amproj)
+// Packages local <scene> XML project(s) + referenced media + imported fonts +
+// manifest.txt into a native Alight Motion .amproj ZIP archive via SSZipArchive,
+// completely offline with zero sign-in, zero Alight Cloud upload, and zero size limit.
+// Hooked directly into ShareNC.onTapExport: when Project Package is selected,
+// plus accessible from Settings -> "Make Project Package (.amproj)".
+// ============================================================================
+
+static IMP gOrigShareNCOnTapExport = NULL;
+
+static NSString *AMSanitizePackageFilename(NSString *raw, NSString *fallback) {
+    NSString *s = [raw ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (s.length == 0) s = fallback ?: @"Project";
+    NSCharacterSet *bad = [NSCharacterSet characterSetWithCharactersInString:@"/\\:?*\"<>|\r\n\t"];
+    NSArray<NSString *> *parts = [s componentsSeparatedByCharactersInSet:bad];
+    s = [[parts componentsJoinedByString:@"_"] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@". "]];
+    if (s.length == 0) s = fallback ?: @"Project";
+    if (s.length > 64) s = [s substringToIndex:64];
+    return s;
+}
+
+static NSString *AMUniqueFlatName(NSString *desired, NSMutableSet<NSString *> *usedLower) {
+    NSString *base = [desired stringByDeletingPathExtension];
+    NSString *ext = [desired pathExtension];
+    if (base.length == 0) base = @"file";
+    NSString *cand = ext.length > 0 ? [NSString stringWithFormat:@"%@.%@", base, ext] : base;
+    NSInteger idx = 2;
+    while ([usedLower containsObject:cand.lowercaseString]) {
+        cand = ext.length > 0
+            ? [NSString stringWithFormat:@"%@_%ld.%@", base, (long)idx, ext]
+            : [NSString stringWithFormat:@"%@_%ld", base, (long)idx];
+        idx++;
+    }
+    [usedLower addObject:cand.lowercaseString];
+    return cand;
+}
+
+static NSDictionary<NSString *, NSString *> *AMBuildLocalFileIndex(NSArray<NSString *> *dirs, NSSet<NSString *> * _Nullable allowedExts) {
+    NSMutableDictionary<NSString *, NSString *> *index = [NSMutableDictionary dictionary];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *dir in dirs) {
+        if (dir.length == 0 || ![fm fileExistsAtPath:dir]) continue;
+        NSDirectoryEnumerator<NSString *> *en = [fm enumeratorAtPath:dir];
+        NSString *rel = nil;
+        NSInteger count = 0;
+        while ((rel = [en nextObject]) != nil && count < 12000) {
+            count++;
+            NSString *full = [dir stringByAppendingPathComponent:rel];
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+            NSString *ext = rel.pathExtension.lowercaseString;
+            if (allowedExts && ![allowedExts containsObject:ext]) continue;
+            NSString *base = rel.lastPathComponent;
+            if (base.length > 0 && !index[base.lowercaseString]) {
+                index[base.lowercaseString] = full;
+            }
+        }
+    }
+    return index;
+}
+
+static NSString * _Nullable AMResolveMediaRefPath(NSString *rawVal,
+                                                  NSString *libDir,
+                                                  NSString *docsDir,
+                                                  NSDictionary<NSString *, NSString *> *mediaIndex) {
+    if (rawVal.length == 0) return nil;
+    NSString *v = [rawVal stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (v.length == 0) return nil;
+    NSString *low = v.lowercaseString;
+    if ([low hasPrefix:@"amproj:"] || [low hasPrefix:@"http://"] || [low hasPrefix:@"https://"] ||
+        [low hasPrefix:@"samplemedia"] || [low hasPrefix:@"#"]) {
+        return nil;
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *decoded = [v stringByRemovingPercentEncoding] ?: v;
+
+    if ([low hasPrefix:@"file://"]) {
+        NSURL *u = [NSURL URLWithString:v];
+        NSString *p = u.path ?: [decoded substringFromIndex:7];
+        if (p.length > 0 && [fm fileExistsAtPath:p]) return p;
+        NSString *base = p.lastPathComponent;
+        if (base.length > 0 && mediaIndex[base.lowercaseString]) {
+            return mediaIndex[base.lowercaseString];
+        }
+    }
+
+    if ([decoded hasPrefix:@"/"] && [fm fileExistsAtPath:decoded]) {
+        return decoded;
+    }
+
+    // Strip any custom URI scheme (e.g. am://media/..., ammedia:..., content://...)
+    NSString *tail = decoded;
+    NSRange schemeRange = [tail rangeOfString:@"://"];
+    if (schemeRange.location != NSNotFound) {
+        tail = [tail substringFromIndex:NSMaxRange(schemeRange)];
+    } else {
+        NSRange colonRange = [tail rangeOfString:@":"];
+        if (colonRange.location != NSNotFound && colonRange.location < 16) {
+            tail = [tail substringFromIndex:NSMaxRange(colonRange)];
+        }
+    }
+    NSRange qRange = [tail rangeOfString:@"?"];
+    if (qRange.location != NSNotFound) {
+        tail = [tail substringToIndex:qRange.location];
+    }
+
+    NSString *libCandidate = [libDir stringByAppendingPathComponent:tail];
+    if ([fm fileExistsAtPath:libCandidate]) return libCandidate;
+    NSString *mediaCandidate = [[libDir stringByAppendingPathComponent:@"media"] stringByAppendingPathComponent:tail.lastPathComponent];
+    if (tail.lastPathComponent.length > 0 && [fm fileExistsAtPath:mediaCandidate]) return mediaCandidate;
+    NSString *docsCandidate = [docsDir stringByAppendingPathComponent:tail.lastPathComponent];
+    if (tail.lastPathComponent.length > 0 && [fm fileExistsAtPath:docsCandidate]) return docsCandidate;
+
+    NSString *base = tail.lastPathComponent;
+    if (base.length > 0 && mediaIndex[base.lowercaseString]) {
+        return mediaIndex[base.lowercaseString];
+    }
+    return nil;
+}
+
+static void AMBuildOfflineProjectPackage(NSArray<NSDictionary *> *projectEntries,
+                                         void (^ _Nullable progress)(NSString *status),
+                                         void (^completion)(NSURL * _Nullable amprojURL,
+                                                            NSUInteger mediaCount,
+                                                            NSUInteger fontCount,
+                                                            uint64_t totalBytes,
+                                                            NSError * _Nullable err)) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (projectEntries.count == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(nil, 0, 0, 0, [NSError errorWithDomain:@"AMOfflinePackage" code:1
+                                                        userInfo:@{NSLocalizedDescriptionKey: @"No projects selected."}]);
+            });
+            return;
+        }
+
+        Class zipCls = NSClassFromString(@"SSZipArchive");
+        SEL createZipSel = NSSelectorFromString(@"createZipFileAtPath:withContentsOfDirectory:keepParentDirectory:");
+        if (!zipCls || ![zipCls respondsToSelector:createZipSel]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(nil, 0, 0, 0, [NSError errorWithDomain:@"AMOfflinePackage" code:2
+                                                        userInfo:@{NSLocalizedDescriptionKey: @"ZIP archiver unavailable."}]);
+            });
+            return;
+        }
+
+        if (progress) {
+            dispatch_async(dispatch_get_main_queue(), ^{ progress(@"Scanning local media & fonts..."); });
+        }
+
+        NSString *libDir = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject ?: @"";
+        NSString *docsDir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject ?: @"";
+        NSString *mediaDir = [libDir stringByAppendingPathComponent:@"media"];
+
+        NSDictionary<NSString *, NSString *> *mediaIndex = AMBuildLocalFileIndex(@[mediaDir, docsDir], nil);
+        NSSet<NSString *> *fontExts = [NSSet setWithArray:@[@"ttf", @"otf", @"ttc", @"woff", @"woff2"]];
+        NSDictionary<NSString *, NSString *> *fontIndex = AMBuildLocalFileIndex(
+            @[docsDir, [libDir stringByAppendingPathComponent:@"fonts"], [libDir stringByAppendingPathComponent:@"Fonts"]],
+            fontExts);
+
+        NSString *stageDir = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                              [NSString stringWithFormat:@"AMPkgStage_%@", [[NSUUID UUID] UUIDString]]];
+        NSError *dirErr = nil;
+        if (![fm createDirectoryAtPath:stageDir withIntermediateDirectories:YES attributes:nil error:&dirErr]) {
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(nil, 0, 0, 0, dirErr); });
+            return;
+        }
+
+        NSMutableSet<NSString *> *usedNames = [NSMutableSet setWithObject:@"manifest.txt"];
+        NSMutableDictionary<NSString *, NSString *> *copiedMediaMap = [NSMutableDictionary dictionary]; // srcPath -> flatName
+        NSMutableSet<NSString *> *copiedFonts = [NSMutableSet set];
+        NSMutableArray<NSString *> *manifestLines = [NSMutableArray array];
+
+        NSRegularExpression *mediaAttrRx = [NSRegularExpression
+            regularExpressionWithPattern:@"(\\b(?:uri|src|fillImage|fillVideo)\\s*=\\s*\")([^\"]+)(\")"
+                                 options:0
+                                   error:nil];
+        NSRegularExpression *fontRefRx = [NSRegularExpression
+            regularExpressionWithPattern:@"imported\\?name=([^\"&<\\s]+)"
+                                 options:NSRegularExpressionCaseInsensitive
+                                   error:nil];
+
+        NSUInteger xmlWritten = 0;
+        NSUInteger totalProjects = projectEntries.count;
+
+        for (NSUInteger i = 0; i < totalProjects; i++) {
+            NSDictionary *entry = projectEntries[i];
+            NSString *xmlPath = [entry[@"path"] isKindOfClass:[NSString class]] ? entry[@"path"] : @"";
+            NSString *title = [entry[@"title"] isKindOfClass:[NSString class]] ? entry[@"title"] : @"Project";
+            if (xmlPath.length == 0 || ![fm fileExistsAtPath:xmlPath]) continue;
+
+            if (progress) {
+                NSString *msg = [NSString stringWithFormat:@"Packaging %lu/%lu: %@",
+                                 (unsigned long)(i + 1), (unsigned long)totalProjects, title];
+                dispatch_async(dispatch_get_main_queue(), ^{ progress(msg); });
+            }
+
+            NSError *readErr = nil;
+            NSString *xml = [NSString stringWithContentsOfFile:xmlPath encoding:NSUTF8StringEncoding error:&readErr];
+            if (xml.length == 0 || ![xml containsString:@"<scene"]) continue;
+
+            // 1. Collect & rewrite all local media references to `amproj:<flatName>`
+            NSArray<NSTextCheckingResult *> *matches = [mediaAttrRx matchesInString:xml options:0 range:NSMakeRange(0, xml.length)];
+            NSMutableString *rewritten = [xml mutableCopy];
+            for (NSInteger mIdx = (NSInteger)matches.count - 1; mIdx >= 0; mIdx--) {
+                NSTextCheckingResult *m = matches[(NSUInteger)mIdx];
+                if (m.numberOfRanges < 4) continue;
+                NSRange valRange = [m rangeAtIndex:2];
+                NSString *val = [xml substringWithRange:valRange];
+                NSString *resolved = AMResolveMediaRefPath(val, libDir, docsDir, mediaIndex);
+                if (!resolved) continue;
+
+                NSString *flatName = copiedMediaMap[resolved];
+                if (!flatName) {
+                    NSString *desired = AMSanitizePackageFilename(resolved.lastPathComponent, @"media.bin");
+                    flatName = AMUniqueFlatName(desired, usedNames);
+                    NSString *dst = [stageDir stringByAppendingPathComponent:flatName];
+                    if ([fm copyItemAtPath:resolved toPath:dst error:nil]) {
+                        copiedMediaMap[resolved] = flatName;
+                        [manifestLines addObject:flatName];
+                    } else {
+                        continue;
+                    }
+                }
+                NSString *replacement = [@"amproj:" stringByAppendingString:flatName];
+                [rewritten replaceCharactersInRange:valRange withString:replacement];
+            }
+
+            // 2. Collect referenced imported custom fonts
+            NSArray<NSTextCheckingResult *> *fMatches = [fontRefRx matchesInString:xml options:0 range:NSMakeRange(0, xml.length)];
+            for (NSTextCheckingResult *fmRes in fMatches) {
+                if (fmRes.numberOfRanges < 2) continue;
+                NSString *rawFont = [xml substringWithRange:[fmRes rangeAtIndex:1]];
+                NSString *fontName = [rawFont stringByRemovingPercentEncoding] ?: rawFont;
+                NSString *fontPath = fontIndex[fontName.lowercaseString];
+                if (!fontPath) {
+                    // Try matching stem if extension omitted
+                    NSString *stem = fontName.stringByDeletingPathExtension.lowercaseString;
+                    for (NSString *k in fontIndex) {
+                        if ([k.stringByDeletingPathExtension isEqualToString:stem]) {
+                            fontPath = fontIndex[k];
+                            break;
+                        }
+                    }
+                }
+                if (fontPath && ![copiedFonts containsObject:fontPath]) {
+                    NSString *desiredFont = AMSanitizePackageFilename(fontPath.lastPathComponent, @"font.ttf");
+                    NSString *flatFont = AMUniqueFlatName(desiredFont, usedNames);
+                    NSString *dstFont = [stageDir stringByAppendingPathComponent:flatFont];
+                    if ([fm copyItemAtPath:fontPath toPath:dstFont error:nil]) {
+                        [copiedFonts addObject:fontPath];
+                        [manifestLines addObject:flatFont];
+                    }
+                }
+            }
+
+            // 3. Write rewritten XML into package root
+            NSString *xmlFileName = AMUniqueFlatName([AMSanitizePackageFilename(title, @"Project") stringByAppendingString:@".xml"], usedNames);
+            NSString *xmlDst = [stageDir stringByAppendingPathComponent:xmlFileName];
+            if ([rewritten writeToFile:xmlDst atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+                [manifestLines addObject:xmlFileName];
+                xmlWritten++;
+            }
+        }
+
+        if (xmlWritten == 0) {
+            [fm removeItemAtPath:stageDir error:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(nil, 0, 0, 0, [NSError errorWithDomain:@"AMOfflinePackage" code:3
+                                                        userInfo:@{NSLocalizedDescriptionKey: @"Could not read project XML file."}]);
+            });
+            return;
+        }
+
+        // 4. Write manifest.txt (native ProjectPackager format)
+        NSString *manifestBody = [[manifestLines componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
+        [manifestBody writeToFile:[stageDir stringByAppendingPathComponent:@"manifest.txt"]
+                       atomically:YES
+                         encoding:NSUTF8StringEncoding
+                            error:nil];
+
+        if (progress) {
+            dispatch_async(dispatch_get_main_queue(), ^{ progress(@"Creating .amproj archive..."); });
+        }
+
+        NSString *outBase = (projectEntries.count == 1)
+            ? AMSanitizePackageFilename(projectEntries.firstObject[@"title"], @"Project")
+            : [NSString stringWithFormat:@"Project_Package_%lu_Projects", (unsigned long)xmlWritten];
+        NSString *outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                             [NSString stringWithFormat:@"%@.amproj", outBase]];
+        [fm removeItemAtPath:outPath error:nil];
+
+        BOOL ok = ((BOOL (*)(id, SEL, NSString *, NSString *, BOOL))objc_msgSend)(
+            zipCls, createZipSel, outPath, stageDir, NO);
+        [fm removeItemAtPath:stageDir error:nil];
+
+        NSDictionary *outAttrs = ok ? [fm attributesOfItemAtPath:outPath error:nil] : nil;
+        uint64_t outBytes = [outAttrs[NSFileSize] unsignedLongLongValue];
+        BOOL validZip = NO;
+        if (ok && outBytes >= 22) {
+            NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:outPath];
+            NSData *sig = [fh readDataOfLength:4];
+            [fh closeFile];
+            if (sig.length == 4) {
+                const uint8_t *b = (const uint8_t *)sig.bytes;
+                validZip = (b[0] == 'P' && b[1] == 'K' && b[2] == 0x03 && b[3] == 0x04);
+            }
+        }
+
+        NSUInteger mCount = copiedMediaMap.count;
+        NSUInteger fCount = copiedFonts.count;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!validZip) {
+                completion(nil, 0, 0, 0, [NSError errorWithDomain:@"AMOfflinePackage" code:4
+                                                        userInfo:@{NSLocalizedDescriptionKey: @"Failed to create .amproj ZIP archive."}]);
+                return;
+            }
+            completion([NSURL fileURLWithPath:outPath], mCount, fCount, outBytes, nil);
+        });
+    });
+}
+
+static void AMRunOfflinePackageExportFromVC(UIViewController *presenter, NSArray<NSDictionary *> *projectEntries) {
+    if (!presenter || projectEntries.count == 0) return;
+
+    UIAlertController *prog = [UIAlertController alertControllerWithTitle:@"Creating Project Package"
+                                                                  message:@"Preparing local .amproj (no sign-in)..."
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+    [presenter presentViewController:prog animated:YES completion:^{
+        AMBuildOfflineProjectPackage(projectEntries, ^(NSString *status) {
+            prog.message = status;
+        }, ^(NSURL * _Nullable amprojURL, NSUInteger mediaCount, NSUInteger fontCount, uint64_t totalBytes, NSError * _Nullable err) {
+            [prog dismissViewControllerAnimated:YES completion:^{
+                if (err || !amprojURL) {
+                    UIAlertController *eAlert = [UIAlertController alertControllerWithTitle:@"Package Export Failed"
+                                                                                    message:(err.localizedDescription ?: @"Unknown error.")
+                                                                             preferredStyle:UIAlertControllerStyleAlert];
+                    [eAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                    [presenter presentViewController:eAlert animated:YES completion:nil];
+                    return;
+                }
+                (void)mediaCount;
+                (void)fontCount;
+                (void)totalBytes;
+                UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[amprojURL]
+                                                                                  applicationActivities:nil];
+                if (avc.popoverPresentationController) {
+                    avc.popoverPresentationController.sourceView = presenter.view;
+                    avc.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(presenter.view.bounds),
+                                                                              CGRectGetMidY(presenter.view.bounds), 1, 1);
+                    avc.popoverPresentationController.permittedArrowDirections = 0;
+                }
+                [presenter presentViewController:avc animated:YES completion:nil];
+            }];
+        });
+    }];
+}
+
+// --- Native Multi-Select Offline Project Package Exporter Sheet ---
+
+@interface AMPackageExporterVC : UIViewController <UITableViewDataSource, UITableViewDelegate, UITextFieldDelegate>
+@property (nonatomic, strong) NSArray<NSDictionary *> *allProjects;
+@property (nonatomic, strong) NSArray<NSDictionary *> *filteredProjects;
+@property (nonatomic, strong) NSMutableSet<NSString *> *selectedPaths;
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, strong) UITextField *searchField;
+@property (nonatomic, strong) UIButton *exportBtn;
+@property (nonatomic, strong) UILabel *subtitleLabel;
+@end
+
+@implementation AMPackageExporterVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor colorWithRed:0.961 green:0.965 blue:0.976 alpha:1.0];
+    self.selectedPaths = [NSMutableSet set];
+
+    NSMutableArray<NSDictionary *> *xmlOnly = [NSMutableArray array];
+    for (NSDictionary *p in AMLoadUserProjectsFromDisk()) {
+        NSString *path = p[@"path"];
+        if (path.length > 0 && ![path.pathExtension.lowercaseString isEqualToString:@"amproj"]) {
+            [xmlOnly addObject:p];
+        }
+    }
+    [xmlOnly sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSDate *da = a[@"date"] ?: [NSDate distantPast];
+        NSDate *db = b[@"date"] ?: [NSDate distantPast];
+        return [db compare:da];
+    }];
+    self.allProjects = xmlOnly;
+    self.filteredProjects = xmlOnly;
+
+    UIView *hdr = [[UIView alloc] init];
+    hdr.translatesAutoresizingMaskIntoConstraints = NO;
+    hdr.backgroundColor = [UIColor whiteColor];
+    [self.view addSubview:hdr];
+
+    UILabel *titleLbl = [[UILabel alloc] init];
+    titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    titleLbl.text = @"Make Project Package";
+    titleLbl.font = AMThemeFont(18.0, UIFontWeightBold);
+    titleLbl.textColor = AMSettingsTextColor();
+    [hdr addSubview:titleLbl];
+
+    self.subtitleLabel = [[UILabel alloc] init];
+    self.subtitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.subtitleLabel.text = @"Offline .amproj export — no sign-in required";
+    self.subtitleLabel.font = AMThemeFont(12.5, UIFontWeightRegular);
+    self.subtitleLabel.textColor = [UIColor colorWithWhite:0.42 alpha:1.0];
+    [hdr addSubview:self.subtitleLabel];
+
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    closeBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [closeBtn setTitle:@"Close" forState:UIControlStateNormal];
+    closeBtn.titleLabel.font = AMThemeFont(15.0, UIFontWeightMedium);
+    [closeBtn setTitleColor:AMSettingsTextColor() forState:UIControlStateNormal];
+    [closeBtn addTarget:self action:@selector(onTapClose) forControlEvents:UIControlEventTouchUpInside];
+    [hdr addSubview:closeBtn];
+
+    self.searchField = [[UITextField alloc] init];
+    self.searchField.translatesAutoresizingMaskIntoConstraints = NO;
+    self.searchField.placeholder = @"Search projects...";
+    self.searchField.font = AMThemeFont(14.5, UIFontWeightRegular);
+    self.searchField.backgroundColor = AMSettingsPillColor();
+    self.searchField.textColor = AMSettingsTextColor();
+    self.searchField.layer.cornerRadius = 11.0;
+    self.searchField.clearButtonMode = UITextFieldViewModeWhileEditing;
+    self.searchField.delegate = self;
+    UIView *pad = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 12, 36)];
+    self.searchField.leftView = pad;
+    self.searchField.leftViewMode = UITextFieldViewModeAlways;
+    [self.searchField addTarget:self action:@selector(onSearchChanged) forControlEvents:UIControlEventEditingChanged];
+    [hdr addSubview:self.searchField];
+
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
+    self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.tableView.backgroundColor = [UIColor clearColor];
+    self.tableView.separatorInset = UIEdgeInsetsMake(0, 16, 0, 16);
+    self.tableView.rowHeight = 64.0;
+    self.tableView.dataSource = self;
+    self.tableView.delegate = self;
+    [self.view addSubview:self.tableView];
+
+    UIView *footer = [[UIView alloc] init];
+    footer.translatesAutoresizingMaskIntoConstraints = NO;
+    footer.backgroundColor = [UIColor whiteColor];
+    [self.view addSubview:footer];
+
+    self.exportBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.exportBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    self.exportBtn.backgroundColor = AMAccentGreenColor();
+    self.exportBtn.layer.cornerRadius = 14.0;
+    [self.exportBtn setTitle:@"Select a Project to Package" forState:UIControlStateNormal];
+    [self.exportBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.exportBtn.titleLabel.font = AMThemeFont(15.5, UIFontWeightBold);
+    self.exportBtn.enabled = NO;
+    self.exportBtn.alpha = 0.5;
+    [self.exportBtn addTarget:self action:@selector(onTapExport) forControlEvents:UIControlEventTouchUpInside];
+    [footer addSubview:self.exportBtn];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [hdr.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [hdr.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [hdr.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+
+        [titleLbl.topAnchor constraintEqualToAnchor:hdr.safeAreaLayoutGuide.topAnchor constant:16.0],
+        [titleLbl.leadingAnchor constraintEqualToAnchor:hdr.leadingAnchor constant:18.0],
+
+        [closeBtn.centerYAnchor constraintEqualToAnchor:titleLbl.centerYAnchor],
+        [closeBtn.trailingAnchor constraintEqualToAnchor:hdr.trailingAnchor constant:-18.0],
+
+        [self.subtitleLabel.topAnchor constraintEqualToAnchor:titleLbl.bottomAnchor constant:2.0],
+        [self.subtitleLabel.leadingAnchor constraintEqualToAnchor:titleLbl.leadingAnchor],
+        [self.subtitleLabel.trailingAnchor constraintEqualToAnchor:hdr.trailingAnchor constant:-18.0],
+
+        [self.searchField.topAnchor constraintEqualToAnchor:self.subtitleLabel.bottomAnchor constant:12.0],
+        [self.searchField.leadingAnchor constraintEqualToAnchor:hdr.leadingAnchor constant:16.0],
+        [self.searchField.trailingAnchor constraintEqualToAnchor:hdr.trailingAnchor constant:-16.0],
+        [self.searchField.heightAnchor constraintEqualToConstant:38.0],
+        [self.searchField.bottomAnchor constraintEqualToAnchor:hdr.bottomAnchor constant:-12.0],
+
+        [self.tableView.topAnchor constraintEqualToAnchor:hdr.bottomAnchor],
+        [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.tableView.bottomAnchor constraintEqualToAnchor:footer.topAnchor],
+
+        [footer.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [footer.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [footer.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+
+        [self.exportBtn.topAnchor constraintEqualToAnchor:footer.topAnchor constant:12.0],
+        [self.exportBtn.leadingAnchor constraintEqualToAnchor:footer.leadingAnchor constant:16.0],
+        [self.exportBtn.trailingAnchor constraintEqualToAnchor:footer.trailingAnchor constant:-16.0],
+        [self.exportBtn.heightAnchor constraintEqualToConstant:48.0],
+        [self.exportBtn.bottomAnchor constraintEqualToAnchor:footer.safeAreaLayoutGuide.bottomAnchor constant:-12.0],
+    ]];
+}
+
+- (void)onTapClose {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)onSearchChanged {
+    NSString *q = [self.searchField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (q.length == 0) {
+        self.filteredProjects = self.allProjects;
+    } else {
+        NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
+        for (NSDictionary *p in self.allProjects) {
+            NSString *t = p[@"title"] ?: @"";
+            if ([t localizedCaseInsensitiveContainsString:q]) [out addObject:p];
+        }
+        self.filteredProjects = out;
+    }
+    [self.tableView reloadData];
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    [textField resignFirstResponder];
+    return YES;
+}
+
+- (void)updateExportButton {
+    NSUInteger n = self.selectedPaths.count;
+    if (n == 0) {
+        [self.exportBtn setTitle:@"Select a Project to Package" forState:UIControlStateNormal];
+        self.exportBtn.enabled = NO;
+        self.exportBtn.alpha = 0.5;
+    } else if (n == 1) {
+        [self.exportBtn setTitle:@"Export Project Package (.amproj)" forState:UIControlStateNormal];
+        self.exportBtn.enabled = YES;
+        self.exportBtn.alpha = 1.0;
+    } else {
+        [self.exportBtn setTitle:[NSString stringWithFormat:@"Export %lu Projects (.amproj)", (unsigned long)n]
+                        forState:UIControlStateNormal];
+        self.exportBtn.enabled = YES;
+        self.exportBtn.alpha = 1.0;
+    }
+}
+
+- (void)onTapExport {
+    NSMutableArray<NSDictionary *> *chosen = [NSMutableArray array];
+    for (NSDictionary *p in self.allProjects) {
+        NSString *path = p[@"path"];
+        if (path && [self.selectedPaths containsObject:path]) {
+            [chosen addObject:p];
+        }
+    }
+    if (chosen.count == 0) return;
+    AMRunOfflinePackageExportFromVC(self, chosen);
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    (void)tableView; (void)section;
+    return (NSInteger)self.filteredProjects.count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    static NSString *cid = @"AMPkgCell";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cid];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cid];
+        cell.backgroundColor = [UIColor whiteColor];
+        cell.textLabel.font = AMThemeFont(15.0, UIFontWeightSemibold);
+        cell.textLabel.textColor = AMSettingsTextColor();
+        cell.detailTextLabel.font = AMThemeFont(12.0, UIFontWeightRegular);
+        cell.detailTextLabel.textColor = [UIColor colorWithWhite:0.45 alpha:1.0];
+        cell.imageView.contentMode = UIViewContentModeScaleAspectFill;
+        cell.imageView.clipsToBounds = YES;
+        cell.imageView.layer.cornerRadius = 6.0;
+        cell.tintColor = AMAccentGreenColor();
+    }
+    NSDictionary *p = self.filteredProjects[(NSUInteger)indexPath.row];
+    cell.textLabel.text = p[@"title"] ?: @"Untitled";
+    cell.detailTextLabel.text = p[@"meta"] ?: @"";
+    NSString *thumbPath = p[@"thumb"];
+    if (thumbPath.length > 0) {
+        UIImage *img = [UIImage imageWithContentsOfFile:thumbPath];
+        if (img) {
+            UIGraphicsBeginImageContextWithOptions(CGSizeMake(44, 44), YES, 0);
+            [img drawInRect:CGRectMake(0, 0, 44, 44)];
+            cell.imageView.image = UIGraphicsGetImageFromCurrentImageContext();
+            UIGraphicsEndImageContext();
+        } else {
+            cell.imageView.image = nil;
+        }
+    } else {
+        cell.imageView.image = nil;
+    }
+    BOOL sel = [self.selectedPaths containsObject:(p[@"path"] ?: @"")];
+    cell.accessoryType = sel ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    NSDictionary *p = self.filteredProjects[(NSUInteger)indexPath.row];
+    NSString *path = p[@"path"];
+    if (path.length == 0) return;
+    if ([self.selectedPaths containsObject:path]) {
+        [self.selectedPaths removeObject:path];
+    } else {
+        [self.selectedPaths addObject:path];
+    }
+    [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
+    [self updateExportButton];
+}
+
+@end
+
+static void AMPresentPackageExporterFromVC(UIViewController *vc) {
+    if (!vc) return;
+    AMPackageExporterVC *expVC = [[AMPackageExporterVC alloc] init];
+    expVC.modalPresentationStyle = UIModalPresentationPageSheet;
+    [vc presentViewController:expVC animated:YES completion:nil];
+}
+
+static BOOL AMViewHierarchyContainsText(UIView *v, NSString *needle) {
+    if (!v || needle.length == 0) return NO;
+    if ([v isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)v).text;
+        if (t.length > 0 && [t localizedCaseInsensitiveContainsString:needle]) return YES;
+    }
+    for (UIView *sub in v.subviews) {
+        if (AMViewHierarchyContainsText(sub, needle)) return YES;
+    }
+    return NO;
+}
+
+static BOOL AMShareVCIsProjectPackageSelected(UIViewController *shareVC) {
+    if (!shareVC) return NO;
+    SEL hSel = NSSelectorFromString(@"packageEstimationViewHeight");
+    SEL vSel = NSSelectorFromString(@"packageEstimationView");
+    if ([shareVC respondsToSelector:hSel] && [shareVC respondsToSelector:vSel]) {
+        NSLayoutConstraint *hc = ((NSLayoutConstraint *(*)(id, SEL))objc_msgSend)(shareVC, hSel);
+        UIView *pv = ((UIView *(*)(id, SEL))objc_msgSend)(shareVC, vSel);
+        if (hc && pv && hc.constant > 1.0 && !pv.hidden && pv.alpha > 0.01) {
+            return YES;
+        }
+    }
+    SEL tvSel = NSSelectorFromString(@"shareTableView");
+    if ([shareVC respondsToSelector:tvSel]) {
+        UITableView *tv = ((UITableView *(*)(id, SEL))objc_msgSend)(shareVC, tvSel);
+        NSIndexPath *ip = tv.indexPathForSelectedRow;
+        if (ip) {
+            UITableViewCell *cell = [tv cellForRowAtIndexPath:ip];
+            NSString *loc = NSLocalizedString(@"project_package", nil) ?: @"Project Package";
+            if (AMViewHierarchyContainsText(cell, @"Project Package") || AMViewHierarchyContainsText(cell, loc)) {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+static NSString * _Nullable AMFindEditorTitleNearVC(UIViewController *vc, NSInteger depth) {
+    if (!vc || depth > 6) return nil;
+    NSString *cls = NSStringFromClass([vc class]) ?: @"";
+    if ([cls containsString:@"ProjectEdit"]) {
+        if (vc.title.length > 0) return vc.title;
+        if (vc.navigationItem.title.length > 0) return vc.navigationItem.title;
+    }
+    for (UIViewController *c in vc.childViewControllers) {
+        NSString *t = AMFindEditorTitleNearVC(c, depth + 1);
+        if (t.length > 0) return t;
+    }
+    return nil;
+}
+
+static NSDictionary * _Nullable AMResolveActiveEditorProject(UIViewController *shareNC) {
+    NSArray<NSDictionary *> *all = AMLoadUserProjectsFromDisk();
+    NSMutableArray<NSDictionary *> *xmls = [NSMutableArray array];
+    for (NSDictionary *p in all) {
+        NSString *path = p[@"path"];
+        if (path.length > 0 && ![path.pathExtension.lowercaseString isEqualToString:@"amproj"]) {
+            [xmls addObject:p];
+        }
+    }
+    if (xmls.count == 0) return nil;
+    [xmls sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSDate *da = a[@"date"] ?: [NSDate distantPast];
+        NSDate *db = b[@"date"] ?: [NSDate distantPast];
+        return [db compare:da];
+    }];
+
+    NSString *editorTitle = AMFindEditorTitleNearVC(shareNC.presentingViewController, 0);
+    if (editorTitle.length > 0) {
+        for (NSDictionary *p in xmls) {
+            if ([p[@"title"] isEqualToString:editorTitle]) {
+                return p;
+            }
+        }
+    }
+    return xmls.firstObject;
+}
+
+static void AMHook_shareNCOnTapExport(id self, SEL _cmd, id sender) {
+    UINavigationController *nc = [self isKindOfClass:[UINavigationController class]] ? (UINavigationController *)self : nil;
+    UIViewController *shareVC = nil;
+    for (UIViewController *vc in nc.viewControllers) {
+        NSString *cname = NSStringFromClass([vc class]) ?: @"";
+        if ([cname containsString:@"ShareVC"]) {
+            shareVC = vc;
+            break;
+        }
+    }
+
+    if (shareVC && AMShareVCIsProjectPackageSelected(shareVC)) {
+        BOOL fromList = NO;
+        Ivar listIvar = class_getInstanceVariable([shareVC class], "shareFromProjectList");
+        if (listIvar) {
+            fromList = (*(const uint8_t *)((__bridge const uint8_t *)shareVC + ivar_getOffset(listIvar)) != 0);
+        }
+
+        if (fromList) {
+            AMPresentPackageExporterFromVC(nc);
+            return;
+        }
+
+        NSDictionary *activeProj = AMResolveActiveEditorProject(nc);
+        if (activeProj) {
+            AMRunOfflinePackageExportFromVC(nc, @[activeProj]);
+        } else {
+            AMPresentPackageExporterFromVC(nc);
+        }
+        return;
+    }
+
+    if (gOrigShareNCOnTapExport) {
+        ((void (*)(id, SEL, id))gOrigShareNCOnTapExport)(self, _cmd, sender);
+    }
+}
+
 static void AMSwizzleMethod(NSString *className, NSString *selName, IMP replacement, IMP *outOrig) {
     Class cls = NSClassFromString(className);
     if (!cls) return;
@@ -21517,6 +22304,11 @@ static void AlightMotionModsInit(void) {
                     @"viewDidLoad",
                     (IMP)AMHook_settingsVCViewDidLoad,
                     &gOrigSettingsVCViewDidLoad);
+
+    AMSwizzleMethod(@"_TtC12AlightMotion7ShareNC",
+                    @"onTapExport:",
+                    (IMP)AMHook_shareNCOnTapExport,
+                    &gOrigShareNCOnTapExport);
 
     AMSwizzleMethod(@"NSBundle",
                     @"URLsForResourcesWithExtension:subdirectory:",
@@ -21692,7 +22484,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-20";
+                static NSString *const kAMModBuildVersion = @"2026.11.27-21";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
