@@ -19166,7 +19166,7 @@ static void AMMuxVideoAndAudioFiles(NSURL *videoURL,
 }
 
 static void AMFetchYouTubePlayerJSON(NSString *videoID,
-                                     BOOL useIOSFallback,
+                                     NSInteger clientTier,
                                      void (^completion)(NSDictionary * _Nullable json, NSString *ua, NSError * _Nullable err)) {
     NSURL *apiURL = [NSURL URLWithString:@"https://www.youtube.com/youtubei/v1/player?prettyPrint=false"];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:apiURL
@@ -19174,32 +19174,54 @@ static void AMFetchYouTubePlayerJSON(NSString *videoID,
                                                    timeoutInterval:20.0];
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    NSString *ua = useIOSFallback
-        ? @"com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)"
-        : @"com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
-    [req setValue:ua forHTTPHeaderField:@"User-Agent"];
-    [req setValue:(useIOSFallback ? @"5" : @"28") forHTTPHeaderField:@"X-YouTube-Client-Name"];
-    [req setValue:(useIOSFallback ? @"20.10.4" : @"1.60.19") forHTTPHeaderField:@"X-YouTube-Client-Version"];
-    [req setValue:@"https://www.youtube.com" forHTTPHeaderField:@"Origin"];
 
-    NSDictionary *clientDict = useIOSFallback
-        ? @{@"clientName": @"IOS",
-            @"clientVersion": @"20.10.4",
-            @"deviceMake": @"Apple",
-            @"deviceModel": @"iPhone16,2",
-            @"osName": @"iPhone",
-            @"osVersion": @"18.3.2.22D82",
-            @"hl": @"en",
-            @"gl": @"US"}
-        : @{@"clientName": @"ANDROID_VR",
-            @"clientVersion": @"1.60.19",
-            @"deviceMake": @"Oculus",
-            @"deviceModel": @"Quest 3",
-            @"osName": @"Android",
-            @"osVersion": @"12L",
-            @"androidSdkVersion": @32,
-            @"hl": @"en",
-            @"gl": @"US"};
+    NSString *ua = nil;
+    NSString *clientNameHeader = nil;
+    NSString *clientVerHeader = nil;
+    NSDictionary *clientDict = nil;
+
+    if (clientTier == 0) {
+        ua = @"com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+        clientNameHeader = @"28";
+        clientVerHeader = @"1.60.19";
+        clientDict = @{@"clientName": @"ANDROID_VR",
+                       @"clientVersion": @"1.60.19",
+                       @"deviceMake": @"Oculus",
+                       @"deviceModel": @"Quest 3",
+                       @"osName": @"Android",
+                       @"osVersion": @"12L",
+                       @"androidSdkVersion": @32,
+                       @"hl": @"en",
+                       @"gl": @"US"};
+    } else if (clientTier == 1) {
+        ua = @"com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)";
+        clientNameHeader = @"5";
+        clientVerHeader = @"20.10.4";
+        clientDict = @{@"clientName": @"IOS",
+                       @"clientVersion": @"20.10.4",
+                       @"deviceMake": @"Apple",
+                       @"deviceModel": @"iPhone16,2",
+                       @"osName": @"iPhone",
+                       @"osVersion": @"18.3.2.22D82",
+                       @"hl": @"en",
+                       @"gl": @"US"};
+    } else {
+        ua = @"com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip";
+        clientNameHeader = @"3";
+        clientVerHeader = @"20.10.38";
+        clientDict = @{@"clientName": @"ANDROID",
+                       @"clientVersion": @"20.10.38",
+                       @"osName": @"Android",
+                       @"osVersion": @"14",
+                       @"androidSdkVersion": @34,
+                       @"hl": @"en",
+                       @"gl": @"US"};
+    }
+
+    [req setValue:ua forHTTPHeaderField:@"User-Agent"];
+    [req setValue:clientNameHeader forHTTPHeaderField:@"X-YouTube-Client-Name"];
+    [req setValue:clientVerHeader forHTTPHeaderField:@"X-YouTube-Client-Version"];
+    [req setValue:@"https://www.youtube.com" forHTTPHeaderField:@"Origin"];
 
     NSDictionary *payload = @{@"context": @{@"client": clientDict}, @"videoId": videoID};
     req.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
@@ -19221,14 +19243,17 @@ static void AMFetchYouTubePlayerJSON(NSString *videoID,
 
 static void AMResolveAndDownloadYouTube(NSString *videoID,
                                         BOOL audioOnly,
-                                        BOOL isFallback,
+                                        NSInteger clientTier,
                                         void (^statusBlock)(NSString *status, float progress),
                                         void (^completion)(NSURL * _Nullable localURL, NSString * _Nullable title, NSError * _Nullable err)) {
-    if (statusBlock) statusBlock(isFallback ? @"Retrying YouTube (iOS client)..." : @"Resolving YouTube link...", 0.15f);
-    AMFetchYouTubePlayerJSON(videoID, isFallback, ^(NSDictionary * _Nullable json, NSString *ua, NSError * _Nullable err) {
+    NSString *tierStatus = (clientTier == 0) ? @"Resolving YouTube link..."
+                         : (clientTier == 1) ? @"Retrying YouTube (iOS client)..."
+                                             : @"Retrying YouTube (Android client)...";
+    if (statusBlock) statusBlock(tierStatus, 0.15f);
+    AMFetchYouTubePlayerJSON(videoID, clientTier, ^(NSDictionary * _Nullable json, NSString *ua, NSError * _Nullable err) {
         if (err || !json) {
-            if (!isFallback) {
-                AMResolveAndDownloadYouTube(videoID, audioOnly, YES, statusBlock, completion);
+            if (clientTier < 2) {
+                AMResolveAndDownloadYouTube(videoID, audioOnly, clientTier + 1, statusBlock, completion);
             } else {
                 completion(nil, nil, err);
             }
@@ -19290,17 +19315,23 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
         NSURL *mediaDir = AMRockMotionMediaDirectoryURL();
         NSString *uid = [NSUUID UUID].UUIDString;
 
-        void (^tryFallbackOrHLS)(NSError * _Nullable) = ^(NSError * _Nullable prevErr) {
-            if (!isFallback) {
-                AMResolveAndDownloadYouTube(videoID, audioOnly, YES, statusBlock, completion);
-                return;
-            }
+        void (^tryNextTierOrHLS)(NSError * _Nullable) = ^(NSError * _Nullable prevErr) {
             if (hlsURLStr.length) {
                 if (statusBlock) statusBlock(audioOnly ? @"Exporting YouTube HLS audio..." : @"Exporting YouTube HLS video...", 0.60f);
                 NSURL *hlsDest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"yt_hls_%@.%@", uid, audioOnly ? @"m4a" : @"mp4"]];
                 AMExportRemoteOrLocalMedia([NSURL URLWithString:hlsURLStr], ua, audioOnly, hlsDest, ^(NSURL * _Nullable outURL, NSError * _Nullable hlsErr) {
-                    completion(outURL, title, hlsErr);
+                    if (outURL && !hlsErr) {
+                        completion(outURL, title, nil);
+                    } else if (clientTier < 2) {
+                        AMResolveAndDownloadYouTube(videoID, audioOnly, clientTier + 1, statusBlock, completion);
+                    } else {
+                        completion(nil, nil, hlsErr ?: prevErr);
+                    }
                 });
+                return;
+            }
+            if (clientTier < 2) {
+                AMResolveAndDownloadYouTube(videoID, audioOnly, clientTier + 1, statusBlock, completion);
                 return;
             }
             NSString *reason = [playStatus[@"reason"] isKindOfClass:[NSString class]] ? playStatus[@"reason"] : nil;
@@ -19309,22 +19340,50 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
         };
 
         if (audioOnly) {
-            NSMutableArray<NSString *> *audioCandidates = [NSMutableArray array];
-            if (bestAudioURL.length) [audioCandidates addObject:bestAudioURL];
-            if (bestProgURL.length) [audioCandidates addObject:bestProgURL];
-            if (!audioCandidates.count) {
-                tryFallbackOrHLS(nil);
+            if (bestAudioURL.length) {
+                if (statusBlock) statusBlock(@"Downloading YouTube audio...", 0.45f);
+                NSURL *dest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@.m4a", uid]];
+                AMDownloadURLToLocalFile([NSURL URLWithString:bestAudioURL], ua, nil, dest, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
+                    if (localURL && !dlErr) {
+                        completion(localURL, title, nil);
+                    } else if (bestProgURL.length) {
+                        if (statusBlock) statusBlock(@"Extracting YouTube audio...", 0.65f);
+                        NSURL *tmpVid = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"yt_audsrc_%@.mp4", uid]]];
+                        AMDownloadURLToLocalFile([NSURL URLWithString:bestProgURL], ua, nil, tmpVid, nil, ^(NSURL * _Nullable pLocal, NSError * _Nullable pErr) {
+                            if (!pLocal || pErr) {
+                                tryNextTierOrHLS(pErr ?: dlErr);
+                                return;
+                            }
+                            AMExportRemoteOrLocalMedia(pLocal, nil, YES, dest, ^(NSURL * _Nullable outURL, NSError * _Nullable expErr) {
+                                [[NSFileManager defaultManager] removeItemAtURL:tmpVid error:nil];
+                                if (outURL && !expErr) completion(outURL, title, nil);
+                                else tryNextTierOrHLS(expErr);
+                            });
+                        });
+                    } else {
+                        tryNextTierOrHLS(dlErr);
+                    }
+                });
                 return;
             }
-            if (statusBlock) statusBlock(@"Downloading YouTube audio...", 0.45f);
-            NSURL *dest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@.m4a", uid]];
-            AMDownloadFirstWorkingURL(audioCandidates, 0, ua, nil, dest, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
-                if (localURL && !dlErr) {
-                    completion(localURL, title, nil);
-                } else {
-                    tryFallbackOrHLS(dlErr);
-                }
-            });
+            if (bestProgURL.length) {
+                if (statusBlock) statusBlock(@"Extracting YouTube audio...", 0.55f);
+                NSURL *tmpVid = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"yt_audsrc_%@.mp4", uid]]];
+                NSURL *dest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@.m4a", uid]];
+                AMDownloadURLToLocalFile([NSURL URLWithString:bestProgURL], ua, nil, tmpVid, nil, ^(NSURL * _Nullable pLocal, NSError * _Nullable pErr) {
+                    if (!pLocal || pErr) {
+                        tryNextTierOrHLS(pErr);
+                        return;
+                    }
+                    AMExportRemoteOrLocalMedia(pLocal, nil, YES, dest, ^(NSURL * _Nullable outURL, NSError * _Nullable expErr) {
+                        [[NSFileManager defaultManager] removeItemAtURL:tmpVid error:nil];
+                        if (outURL && !expErr) completion(outURL, title, nil);
+                        else tryNextTierOrHLS(expErr);
+                    });
+                });
+                return;
+            }
+            tryNextTierOrHLS(nil);
             return;
         }
 
@@ -19341,11 +19400,11 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
                             if (pLocal && !pErr) {
                                 completion(pLocal, title, nil);
                             } else {
-                                tryFallbackOrHLS(pErr ?: vErr);
+                                tryNextTierOrHLS(pErr ?: vErr);
                             }
                         });
                     } else {
-                        tryFallbackOrHLS(vErr);
+                        tryNextTierOrHLS(vErr);
                     }
                     return;
                 }
@@ -19366,10 +19425,10 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
                         } else if (bestProgURL.length) {
                             AMDownloadURLToLocalFile([NSURL URLWithString:bestProgURL], ua, nil, dest, nil, ^(NSURL * _Nullable pLocal, NSError * _Nullable pErr) {
                                 if (pLocal && !pErr) completion(pLocal, title, nil);
-                                else tryFallbackOrHLS(pErr ?: mErr);
+                                else tryNextTierOrHLS(pErr ?: mErr);
                             });
                         } else {
-                            tryFallbackOrHLS(mErr);
+                            tryNextTierOrHLS(mErr);
                         }
                     });
                 });
@@ -19384,13 +19443,13 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
                 if (localURL && !dlErr) {
                     completion(localURL, title, nil);
                 } else {
-                    tryFallbackOrHLS(dlErr);
+                    tryNextTierOrHLS(dlErr);
                 }
             });
             return;
         }
 
-        tryFallbackOrHLS(nil);
+        tryNextTierOrHLS(nil);
     });
 }
 
@@ -19790,7 +19849,7 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
     };
 
     if (ytID) {
-        AMResolveAndDownloadYouTube(ytID, audioOnly, NO, statusCb, doneCb);
+        AMResolveAndDownloadYouTube(ytID, audioOnly, 0, statusCb, doneCb);
     } else {
         AMResolveAndDownloadTikTok(raw, audioOnly, statusCb, doneCb);
     }
@@ -20950,7 +21009,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-10";
+                static NSString *const kAMModBuildVersion = @"2026.11.27-11";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
