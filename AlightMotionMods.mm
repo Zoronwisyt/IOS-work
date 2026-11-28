@@ -24,6 +24,9 @@
 #import <Metal/Metal.h>
 #import <Accelerate/Accelerate.h>
 #import <os/lock.h>
+#import <os/proc.h>
+#import <os/signpost.h>
+#import <CommonCrypto/CommonDigest.h>
 #import <vector>
 #import <algorithm>
 #import <objc/runtime.h>
@@ -113,10 +116,13 @@ static BOOL AMItemUsesAMCompositor(AVPlayerItem *item) {
 
 static BOOL gAMIntroActive = NO;
 
+static void AMPerfApplyProxyDecodeForItem(AVPlayerItem *item, NSInteger effectiveDivisor);
+
 static void AMTrackPlayerIfPreview(AVPlayer *player, AVPlayerItem *item) {
     if (!player || gAMIntroActive) return;
     if (AMItemUsesAMCompositor(item)) {
         item.audioTimePitchAlgorithm = AVAudioTimePitchAlgorithmVarispeed;
+        AMPerfApplyProxyDecodeForItem(item, gPreviewDivisor);
     }
     if (AMItemUsesAMCompositor(item) || AMItemUsesAMCompositor(player.currentItem)) {
         gActivePreviewPlayer = player;
@@ -353,6 +359,9 @@ static void AMResolveCompositorOffsets(Class compClass) {
 }
 
 static void AMRot3DScheduleLiveHierarchySync(void);
+static NSInteger AMPerfEffectivePreviewDivisor(NSInteger userDivisor);
+static os_log_t AMPerfSignpostLog(void);
+static BOOL AMPerfFlagEnabled(NSString *name, BOOL defaultVal);
 
 static void AMHook_startVideoCompositionRequest(id self, SEL _cmd, id request) {
     __atomic_add_fetch(&gAMCompositorStartCount, 1, __ATOMIC_RELAXED);
@@ -363,7 +372,7 @@ static void AMHook_startVideoCompositionRequest(id self, SEL _cmd, id request) {
         if (compImplPtr != NULL) {
             id compObj = (__bridge id)compImplPtr;
             if (object_getClass(compObj) == gCompositorMetalClass) {
-                NSInteger div = gPreviewDivisor;
+                NSInteger div = AMPerfEffectivePreviewDivisor(gPreviewDivisor);
                 if (div < 1 || div > 4) div = 1;
                 uint8_t *base = (uint8_t *)compImplPtr;
                 *(uint8_t *)(base + gDynaResOffset) = (div > 1) ? 1 : 0;
@@ -371,8 +380,16 @@ static void AMHook_startVideoCompositionRequest(id self, SEL _cmd, id request) {
             }
         }
     }
+    os_log_t spLog = AMPerfFlagEnabled(@"telemetry", YES) ? AMPerfSignpostLog() : NULL;
+    os_signpost_id_t spId = spLog ? os_signpost_id_generate(spLog) : OS_SIGNPOST_ID_INVALID;
+    if (spLog && spId != OS_SIGNPOST_ID_INVALID) {
+        os_signpost_interval_begin(spLog, spId, "RenderFrame");
+    }
     if (gOrigStartVideoCompReq) {
         ((void (*)(id, SEL, id))gOrigStartVideoCompReq)(self, _cmd, request);
+    }
+    if (spLog && spId != OS_SIGNPOST_ID_INVALID) {
+        os_signpost_interval_end(spLog, spId, "RenderFrame");
     }
 }
 
@@ -851,13 +868,16 @@ static void AMHandleUserLinkFromVC(UIViewController *vc, NSURL *u, BOOL directBy
 
 static const void *kAMSettingsBackupBtnKey = &kAMSettingsBackupBtnKey;
 static const void *kAMSettingsPackageBtnKey = &kAMSettingsPackageBtnKey;
+static const void *kAMSettingsPerfBtnKey = &kAMSettingsPerfBtnKey;
 static void AMPresentBackupVaultFromVC(UIViewController *vc);
 static void AMPresentPackageExporterFromVC(UIViewController *vc);
+static void AMPresentEnginePerformanceFromVC(UIViewController *vc);
 
 @interface AMSettingsLinkHandler : NSObject
 + (void)onTapOpenLink:(UIButton *)btn;
 + (void)onTapOpenBackupVault:(UIButton *)btn;
 + (void)onTapMakePackage:(UIButton *)btn;
++ (void)onTapPerformance:(UIButton *)btn;
 @end
 
 @implementation AMSettingsLinkHandler
@@ -872,6 +892,12 @@ static void AMPresentPackageExporterFromVC(UIViewController *vc);
     UIViewController *vc = objc_getAssociatedObject(btn, kAMSettingsPackageBtnKey);
     if (!vc) return;
     AMPresentPackageExporterFromVC(vc);
+}
+
++ (void)onTapPerformance:(UIButton *)btn {
+    UIViewController *vc = objc_getAssociatedObject(btn, kAMSettingsPerfBtnKey);
+    if (!vc) return;
+    AMPresentEnginePerformanceFromVC(vc);
 }
 
 + (void)onTapOpenLink:(UIButton *)btn {
@@ -935,7 +961,7 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     CGFloat existingH = existingHdr ? existingHdr.frame.size.height : 0.0;
     // Trim excess bottom padding of SettingsHeaderView so "Open Alight Link" sits higher and leaves clean separation above Section 0
     CGFloat hdrH = (existingH > 40.0) ? MAX(38.0, existingH - 10.0) : existingH;
-    CGFloat pillContainerH = 162.0;
+    CGFloat pillContainerH = 212.0;
 
     UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, hdrH + pillContainerH)];
     header.backgroundColor = [UIColor clearColor];
@@ -1021,6 +1047,31 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     pkgIcon.tintColor = AMSettingsTextColor();
     [pkgPill addSubview:pkgIcon];
 
+    UIButton *perfPill = [UIButton buttonWithType:UIButtonTypeSystem];
+    perfPill.translatesAutoresizingMaskIntoConstraints = NO;
+    perfPill.backgroundColor = AMSettingsPillColor();
+    perfPill.layer.cornerRadius = 14.0;
+    perfPill.clipsToBounds = YES;
+    [header addSubview:perfPill];
+
+    UILabel *perfLbl = [[UILabel alloc] init];
+    perfLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    perfLbl.text = @"Engine Performance (iOS)";
+    perfLbl.font = AMThemeFont(14.0, UIFontWeightMedium);
+    perfLbl.textColor = AMSettingsTextColor();
+    perfLbl.userInteractionEnabled = NO;
+    [perfPill addSubview:perfLbl];
+
+    UIImageView *perfIcon = [[UIImageView alloc] init];
+    perfIcon.translatesAutoresizingMaskIntoConstraints = NO;
+    perfIcon.userInteractionEnabled = NO;
+    if (@available(iOS 13.0, *)) {
+        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:13.0 weight:UIImageSymbolWeightMedium];
+        perfIcon.image = [UIImage systemImageNamed:@"gauge" withConfiguration:cfg];
+    }
+    perfIcon.tintColor = AMSettingsTextColor();
+    [perfPill addSubview:perfIcon];
+
     [NSLayoutConstraint activateConstraints:@[
         [pill.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16.0],
         [pill.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16.0],
@@ -1054,6 +1105,17 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
 
         [pkgIcon.trailingAnchor constraintEqualToAnchor:pkgPill.trailingAnchor constant:-15.0],
         [pkgIcon.centerYAnchor constraintEqualToAnchor:pkgPill.centerYAnchor],
+
+        [perfPill.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16.0],
+        [perfPill.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16.0],
+        [perfPill.topAnchor constraintEqualToAnchor:pkgPill.bottomAnchor constant:8.0],
+        [perfPill.heightAnchor constraintEqualToConstant:42.0],
+
+        [perfLbl.leadingAnchor constraintEqualToAnchor:perfPill.leadingAnchor constant:16.0],
+        [perfLbl.centerYAnchor constraintEqualToAnchor:perfPill.centerYAnchor],
+
+        [perfIcon.trailingAnchor constraintEqualToAnchor:perfPill.trailingAnchor constant:-15.0],
+        [perfIcon.centerYAnchor constraintEqualToAnchor:perfPill.centerYAnchor],
     ]];
 
     objc_setAssociatedObject(pill, kAMSettingsLinkBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
@@ -1070,6 +1132,11 @@ static void AMHook_settingsVCViewDidLoad(id self, SEL _cmd) {
     [pkgPill addTarget:[AMSettingsLinkHandler class]
                 action:@selector(onTapMakePackage:)
       forControlEvents:UIControlEventTouchUpInside];
+
+    objc_setAssociatedObject(perfPill, kAMSettingsPerfBtnKey, vc, OBJC_ASSOCIATION_ASSIGN);
+    [perfPill addTarget:[AMSettingsLinkHandler class]
+                 action:@selector(onTapPerformance:)
+       forControlEvents:UIControlEventTouchUpInside];
 
     tv.tableHeaderView = header;
     objc_setAssociatedObject(vc, kAMSettingsLinkBtnKey, pill, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -20742,9 +20809,12 @@ static void AMHook_appAttestAttestKey(id self, SEL _cmd, NSString *keyId, NSData
     }
 }
 
+static void AMPerfPurgeEngineCaches(BOOL isCritical);
+
 static void AMPurgeSideStoreMemoryCaches(BOOL isCritical) {
     gAMLastMemoryPressureEpoch = [[NSDate date] timeIntervalSince1970];
     [[NSURLCache sharedURLCache] removeAllCachedResponses];
+    AMPerfPurgeEngineCaches(isCritical);
     dispatch_async(dispatch_get_main_queue(), ^{
         [AMCategoryThumbCache() removeAllObjects];
         [[AMHomepageSearchOverlayManager shared] purgeTransientCaches];
@@ -22189,6 +22259,800 @@ static void AMHook_shareNCOnTapExport(id self, SEL _cmd, id sender) {
     }
 }
 
+// ============================================================================
+// Modules 20–24: iPhone Engine Performance Optimization (Phases 0–4)
+//   - Module 20: AMDeviceProfile (T1/T2/T3 by RAM, GPU family, ProMotion, thermal, Low Power) + AMPerf.* flags
+//   - Module 21: Phase 1 Safe Wins (ProMotion CADisplayLink pacing, library-only shader NSCache,
+//                thermal/Low-Power preview ladder, RAM-aware export bitrate governor)
+//   - Module 22: Phase 2 TBDR GPU Structural (flag-gated OFF: Private texture storage,
+//                in-flight command buffer cap, T1 SDR RGBA8 intermediate)
+//   - Module 23: Phase 3 Media Decode (T1 preview proxy decode resolution cap)
+//   - Module 24: Phase 4 Telemetry (os_signpost + MetricKit diagnostics + Settings Performance sheet)
+// ============================================================================
+
+typedef NS_ENUM(NSInteger, AMDeviceTier) {
+    AMDeviceTier1 = 1, // <=3.5 GB RAM or GPU < Apple7 (A12-A13, XR/11/SE2)
+    AMDeviceTier2 = 2, // <=4.5 GB RAM or GPU == Apple7 (4 GB / A14, 12/13)
+    AMDeviceTier3 = 3, // >=6 GB RAM and GPU >= Apple8 (A15+/Pro)
+};
+
+static AMDeviceTier gAMPerfDeviceTier = AMDeviceTier2;
+static uint64_t gAMPerfPhysicalRAM = 0;
+static NSInteger gAMPerfGPUFamilyNum = 0; // 7=Apple7, 8=Apple8, 9=Apple9
+static NSInteger gAMPerfMaxScreenFPS = 60;
+static NSProcessInfoThermalState gAMPerfThermalState = NSProcessInfoThermalStateNominal;
+static BOOL gAMPerfLowPowerMode = NO;
+
+static NSCache<NSString *, id<MTLLibrary>> *gAMPerfShaderLibCache = nil;
+static int64_t gAMPerfLibCacheHits = 0;
+static int64_t gAMPerfLibCacheMisses = 0;
+static int64_t gAMPerfPrivateTexPromoted = 0;
+static int64_t gAMPerfBitrateCappedCount = 0;
+static int64_t gAMPerfDisplayLinksPaced = 0;
+static dispatch_semaphore_t gAMPerfInFlightSem = nil;
+static os_log_t gAMPerfSignpostLogObj = NULL;
+
+static os_log_t AMPerfSignpostLog(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gAMPerfSignpostLogObj = os_log_create("com.rockmotion.perf", "engine");
+    });
+    return gAMPerfSignpostLogObj;
+}
+
+static NSString *AMPerfDefaultsKey(NSString *name) {
+    return [@"AMPerf." stringByAppendingString:name];
+}
+
+static BOOL AMPerfMasterDisabled(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:@"AMPerf.disableAll"];
+}
+
+static BOOL AMPerfFlagEnabled(NSString *name, BOOL defaultVal) {
+    if (AMPerfMasterDisabled()) return NO;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSString *key = AMPerfDefaultsKey(name);
+    if ([ud objectForKey:key] == nil) return defaultVal;
+    return [ud boolForKey:key];
+}
+
+static void AMPerfSetFlag(NSString *name, BOOL val) {
+    [[NSUserDefaults standardUserDefaults] setBool:val forKey:AMPerfDefaultsKey(name)];
+}
+
+static void AMPerfRefreshDeviceState(void) {
+    NSProcessInfo *pi = [NSProcessInfo processInfo];
+    gAMPerfThermalState = pi.thermalState;
+    gAMPerfLowPowerMode = pi.lowPowerModeEnabled;
+}
+
+static void AMPerfInitDeviceProfile(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSProcessInfo *pi = [NSProcessInfo processInfo];
+        gAMPerfPhysicalRAM = pi.physicalMemory;
+        gAMPerfThermalState = pi.thermalState;
+        gAMPerfLowPowerMode = pi.lowPowerModeEnabled;
+
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (dev) {
+            if ([dev supportsFamily:(MTLGPUFamily)1009]) gAMPerfGPUFamilyNum = 9;
+            else if ([dev supportsFamily:(MTLGPUFamily)1008]) gAMPerfGPUFamilyNum = 8;
+            else if ([dev supportsFamily:(MTLGPUFamily)1007]) gAMPerfGPUFamilyNum = 7;
+            else gAMPerfGPUFamilyNum = 6;
+        }
+
+        double ramGB = (double)gAMPerfPhysicalRAM / (1024.0 * 1024.0 * 1024.0);
+        if (ramGB <= 3.5 || gAMPerfGPUFamilyNum < 7) {
+            gAMPerfDeviceTier = AMDeviceTier1;
+        } else if (ramGB <= 4.5 || gAMPerfGPUFamilyNum == 7) {
+            gAMPerfDeviceTier = AMDeviceTier2;
+        } else {
+            gAMPerfDeviceTier = AMDeviceTier3;
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSInteger fps = [UIScreen mainScreen].maximumFramesPerSecond;
+            if (fps >= 30) gAMPerfMaxScreenFPS = fps;
+        });
+
+        [[NSNotificationCenter defaultCenter] addObserverForName:NSProcessInfoThermalStateDidChangeNotification
+                                                          object:nil
+                                                           queue:nil
+                                                      usingBlock:^(NSNotification *note) {
+            (void)note;
+            AMPerfRefreshDeviceState();
+        }];
+        [[NSNotificationCenter defaultCenter] addObserverForName:NSProcessInfoPowerStateDidChangeNotification
+                                                          object:nil
+                                                           queue:nil
+                                                      usingBlock:^(NSNotification *note) {
+            (void)note;
+            AMPerfRefreshDeviceState();
+        }];
+    });
+}
+
+static NSInteger AMPerfEffectivePreviewDivisor(NSInteger userDivisor) {
+    NSInteger div = (userDivisor >= 1 && userDivisor <= 4) ? userDivisor : 1;
+    if (!AMPerfFlagEnabled(@"thermalLadder", YES)) return div;
+    NSProcessInfoThermalState ts = gAMPerfThermalState;
+    BOOL lpm = gAMPerfLowPowerMode;
+    if (ts >= NSProcessInfoThermalStateCritical) {
+        div = MIN(4, div + 2);
+    } else if (ts >= NSProcessInfoThermalStateSerious || lpm) {
+        div = MIN(4, div + 1);
+    }
+    return div;
+}
+
+static void AMPerfApplyProxyDecodeForItem(AVPlayerItem *item, NSInteger effectiveDivisor) {
+    if (!item) return;
+    if (!AMPerfFlagEnabled(@"proxyDecode", YES)) return;
+    if (gAMPerfDeviceTier != AMDeviceTier1) return;
+    NSInteger div = AMPerfEffectivePreviewDivisor(effectiveDivisor);
+    @try {
+        if (div >= 3) {
+            item.preferredMaximumResolution = CGSizeMake(854.0, 480.0);
+        } else if (div == 2) {
+            item.preferredMaximumResolution = CGSizeMake(1280.0, 720.0);
+        } else {
+            item.preferredMaximumResolution = CGSizeZero;
+        }
+    } @catch (__unused NSException *ex) {}
+}
+
+static void AMPerfPurgeEngineCaches(BOOL isCritical) {
+    (void)isCritical;
+    if (gAMPerfShaderLibCache) {
+        [gAMPerfShaderLibCache removeAllObjects];
+    }
+}
+
+// --- Phase 1.1: ProMotion / CADisplayLink Frame Pacing ---
+static IMP gOrigCADisplayLinkWithTarget = NULL;
+static CADisplayLink *AMHook_caDisplayLinkWithTarget(id self, SEL _cmd, id target, SEL sel) {
+    CADisplayLink *dl = nil;
+    if (gOrigCADisplayLinkWithTarget) {
+        dl = ((CADisplayLink *(*)(id, SEL, id, SEL))gOrigCADisplayLinkWithTarget)(self, _cmd, target, sel);
+    }
+    if (!dl || !AMPerfFlagEnabled(@"framePacing", YES)) return dl;
+    @try {
+        BOOL criticalOrLPM = (gAMPerfThermalState >= NSProcessInfoThermalStateCritical || gAMPerfLowPowerMode);
+        BOOL isProMotion = (gAMPerfMaxScreenFPS >= 90);
+        if (criticalOrLPM || isProMotion || gAMPerfThermalState >= NSProcessInfoThermalStateSerious) {
+            if (@available(iOS 15.0, *)) {
+                if (criticalOrLPM) {
+                    dl.preferredFrameRateRange = CAFrameRateRangeMake(15.0f, 30.0f, 30.0f);
+                } else if (gAMPerfThermalState >= NSProcessInfoThermalStateSerious) {
+                    dl.preferredFrameRateRange = CAFrameRateRangeMake(24.0f, 48.0f, 48.0f);
+                } else {
+                    // Cap 120 Hz ProMotion over-render to 60 Hz for timeline playback/UI smoothness
+                    dl.preferredFrameRateRange = CAFrameRateRangeMake(30.0f, 60.0f, 60.0f);
+                }
+            } else {
+                dl.preferredFramesPerSecond = criticalOrLPM ? 30 : 60;
+            }
+            __atomic_add_fetch(&gAMPerfDisplayLinksPaced, 1, __ATOMIC_RELAXED);
+        }
+    } @catch (__unused NSException *ex) {}
+    return dl;
+}
+
+// --- Phase 1.2: Metal Shader Library Memoization ONLY (no binary archive, no pipeline cache) ---
+static NSString *AMPerfShaderCacheKey(NSString *source, MTLCompileOptions *options) {
+    if (!source.length) return nil;
+    NSMutableString *sig = [NSMutableString stringWithCapacity:source.length + 128];
+    [sig appendString:source];
+    [sig appendString:@"|fm:"];
+    BOOL fm = options ? options.fastMathEnabled : YES;
+    [sig appendString:fm ? @"1" : @"0"];
+    [sig appendFormat:@"|lv:%lu", (unsigned long)(options ? options.languageVersion : 0)];
+    if (options && [options respondsToSelector:@selector(preserveInvariance)]) {
+        BOOL pi = ((BOOL (*)(id, SEL))objc_msgSend)(options, @selector(preserveInvariance));
+        [sig appendString:pi ? @"|pi:1" : @"|pi:0"];
+    }
+    if (options && options.preprocessorMacros.count > 0) {
+        NSArray<NSString *> *keys = [[options.preprocessorMacros allKeys] sortedArrayUsingSelector:@selector(compare:)];
+        for (NSString *k in keys) {
+            [sig appendFormat:@"|%@=%@", k, options.preprocessorMacros[k]];
+        }
+    }
+    NSData *utf8 = [sig dataUsingEncoding:NSUTF8StringEncoding];
+    if (!utf8) return nil;
+    uint8_t digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(utf8.bytes, (CC_LONG)utf8.length, digest);
+    char hex[CC_SHA256_DIGEST_LENGTH * 2 + 1];
+    static const char kHex[] = "0123456789abcdef";
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+        hex[i * 2] = kHex[(digest[i] >> 4) & 0xF];
+        hex[i * 2 + 1] = kHex[digest[i] & 0xF];
+    }
+    hex[CC_SHA256_DIGEST_LENGTH * 2] = '\0';
+    return [NSString stringWithUTF8String:hex];
+}
+
+static IMP gOrigMTLNewLibSync = NULL;
+static id<MTLLibrary> AMHook_mtlNewLibSync(id self, SEL _cmd, NSString *source, MTLCompileOptions *options, NSError **error) {
+    BOOL useCache = (gAMPerfShaderLibCache != nil && AMPerfFlagEnabled(@"shaderLibraryCache", YES));
+    NSString *key = nil;
+    if (useCache && source.length > 0) {
+        @try {
+            key = AMPerfShaderCacheKey(source, options);
+            if (key) {
+                id<MTLLibrary> cached = [gAMPerfShaderLibCache objectForKey:key];
+                if (cached) {
+                    __atomic_add_fetch(&gAMPerfLibCacheHits, 1, __ATOMIC_RELAXED);
+                    return cached;
+                }
+            }
+        } @catch (__unused NSException *ex) {
+            key = nil;
+        }
+    }
+
+    os_log_t spLog = AMPerfFlagEnabled(@"telemetry", YES) ? AMPerfSignpostLog() : NULL;
+    os_signpost_id_t spId = spLog ? os_signpost_id_generate(spLog) : OS_SIGNPOST_ID_INVALID;
+    if (spLog && spId != OS_SIGNPOST_ID_INVALID) {
+        os_signpost_interval_begin(spLog, spId, "ShaderCompileSync");
+    }
+    id<MTLLibrary> lib = nil;
+    if (gOrigMTLNewLibSync) {
+        lib = ((id<MTLLibrary> (*)(id, SEL, NSString *, MTLCompileOptions *, NSError **))gOrigMTLNewLibSync)(self, _cmd, source, options, error);
+    }
+    if (spLog && spId != OS_SIGNPOST_ID_INVALID) {
+        os_signpost_interval_end(spLog, spId, "ShaderCompileSync");
+    }
+
+    if (lib && key && useCache) {
+        __atomic_add_fetch(&gAMPerfLibCacheMisses, 1, __ATOMIC_RELAXED);
+        @try {
+            [gAMPerfShaderLibCache setObject:lib forKey:key];
+        } @catch (__unused NSException *ex) {}
+    }
+    return lib;
+}
+
+static IMP gOrigMTLNewLibAsync = NULL;
+static void AMHook_mtlNewLibAsync(id self, SEL _cmd, NSString *source, MTLCompileOptions *options, MTLNewLibraryCompletionHandler completionHandler) {
+    BOOL useCache = (gAMPerfShaderLibCache != nil && AMPerfFlagEnabled(@"shaderLibraryCache", YES));
+    NSString *key = nil;
+    if (useCache && source.length > 0) {
+        @try {
+            key = AMPerfShaderCacheKey(source, options);
+            if (key) {
+                id<MTLLibrary> cached = [gAMPerfShaderLibCache objectForKey:key];
+                if (cached) {
+                    __atomic_add_fetch(&gAMPerfLibCacheHits, 1, __ATOMIC_RELAXED);
+                    if (completionHandler) completionHandler(cached, nil);
+                    return;
+                }
+            }
+        } @catch (__unused NSException *ex) {
+            key = nil;
+        }
+    }
+
+    MTLNewLibraryCompletionHandler wrapped = completionHandler;
+    if (key && useCache) {
+        NSString *capKey = [key copy];
+        wrapped = ^(id<MTLLibrary> library, NSError *err) {
+            if (library) {
+                __atomic_add_fetch(&gAMPerfLibCacheMisses, 1, __ATOMIC_RELAXED);
+                @try {
+                    [gAMPerfShaderLibCache setObject:library forKey:capKey];
+                } @catch (__unused NSException *ex) {}
+            }
+            if (completionHandler) completionHandler(library, err);
+        };
+    }
+    if (gOrigMTLNewLibAsync) {
+        ((void (*)(id, SEL, NSString *, MTLCompileOptions *, MTLNewLibraryCompletionHandler))gOrigMTLNewLibAsync)(self, _cmd, source, options, wrapped);
+    }
+}
+
+// --- Phase 1.5: RAM/Tier-Aware Export Bitrate Governor ---
+static NSDictionary *AMPerfGovernVideoSettings(AVMediaType mediaType, NSDictionary *settings) {
+    if (!settings || ![mediaType isEqualToString:AVMediaTypeVideo]) return settings;
+    if (!AMPerfFlagEnabled(@"bitrateGovernor", YES)) return settings;
+    if (gAMPerfDeviceTier >= AMDeviceTier3) return settings;
+
+    @try {
+        size_t avail = os_proc_available_memory();
+        // If plenty of live headroom (>1.5 GB), keep full 100 Mbps
+        if (avail >= (size_t)(1500ULL * 1024ULL * 1024ULL)) return settings;
+
+        NSDictionary *comp = settings[AVVideoCompressionPropertiesKey];
+        if (![comp isKindOfClass:[NSDictionary class]]) return settings;
+        NSNumber *brNum = comp[AVVideoAverageBitRateKey];
+        if (![brNum isKindOfClass:[NSNumber class]]) return settings;
+
+        double maxBitrate = (gAMPerfDeviceTier == AMDeviceTier1) ? 50000000.0 : 80000000.0;
+        if (brNum.doubleValue <= maxBitrate) return settings;
+
+        NSMutableDictionary *newComp = [comp mutableCopy];
+        newComp[AVVideoAverageBitRateKey] = @((long long)maxBitrate);
+        NSMutableDictionary *newSettings = [settings mutableCopy];
+        newSettings[AVVideoCompressionPropertiesKey] = [newComp copy];
+        __atomic_add_fetch(&gAMPerfBitrateCappedCount, 1, __ATOMIC_RELAXED);
+        return [newSettings copy];
+    } @catch (__unused NSException *ex) {
+        return settings;
+    }
+}
+
+static IMP gOrigAVWriterInputInitWithHint = NULL;
+static id AMHook_avWriterInputInitWithHint(id self, SEL _cmd, AVMediaType mediaType, NSDictionary *outputSettings, CMFormatDescriptionRef sourceFormatHint) {
+    NSDictionary *tuned = AMPerfGovernVideoSettings(mediaType, outputSettings);
+    if (gOrigAVWriterInputInitWithHint) {
+        return ((id (*)(id, SEL, AVMediaType, NSDictionary *, CMFormatDescriptionRef))gOrigAVWriterInputInitWithHint)(self, _cmd, mediaType, tuned, sourceFormatHint);
+    }
+    return nil;
+}
+
+static IMP gOrigAVWriterInputInit = NULL;
+static id AMHook_avWriterInputInit(id self, SEL _cmd, AVMediaType mediaType, NSDictionary *outputSettings) {
+    NSDictionary *tuned = AMPerfGovernVideoSettings(mediaType, outputSettings);
+    if (gOrigAVWriterInputInit) {
+        return ((id (*)(id, SEL, AVMediaType, NSDictionary *))gOrigAVWriterInputInit)(self, _cmd, mediaType, tuned);
+    }
+    return nil;
+}
+
+// --- Phase 2: TBDR GPU Structural Hooks (Flag-Gated OFF by default) ---
+static IMP gOrigMTLNewTextureWithDesc = NULL;
+static id<MTLTexture> AMHook_mtlNewTextureWithDesc(id self, SEL _cmd, MTLTextureDescriptor *desc) {
+    if (desc && !AMPerfMasterDisabled()) {
+        BOOL wantPrivate = AMPerfFlagEnabled(@"tbdrPrivateStorage", NO);
+        BOOL wantSDR8 = (gAMPerfDeviceTier == AMDeviceTier1 && AMPerfFlagEnabled(@"sdrRgba8Intermediate", NO));
+        if ((wantPrivate || wantSDR8) &&
+            desc.textureType == MTLTextureType2D &&
+            (desc.usage & MTLTextureUsageRenderTarget) != 0 &&
+            desc.width >= 64 && desc.height >= 64) {
+            @try {
+                MTLTextureDescriptor *modDesc = nil;
+                if (wantPrivate &&
+                    (desc.usage & MTLTextureUsageShaderRead) != 0 &&
+                    desc.storageMode == MTLStorageModeShared) {
+                    modDesc = [desc copy];
+                    modDesc.storageMode = MTLStorageModePrivate;
+                    modDesc.allowGPUOptimizedContents = YES;
+                }
+                if (wantSDR8 &&
+                    desc.pixelFormat == MTLPixelFormatRGBA16Float &&
+                    desc.width >= 1920 && desc.height >= 1080) {
+                    if (!modDesc) modDesc = [desc copy];
+                    modDesc.pixelFormat = MTLPixelFormatBGRA8Unorm;
+                }
+                if (modDesc && gOrigMTLNewTextureWithDesc) {
+                    id<MTLTexture> tex = ((id<MTLTexture> (*)(id, SEL, MTLTextureDescriptor *))gOrigMTLNewTextureWithDesc)(self, _cmd, modDesc);
+                    if (tex) {
+                        __atomic_add_fetch(&gAMPerfPrivateTexPromoted, 1, __ATOMIC_RELAXED);
+                        return tex;
+                    }
+                }
+            } @catch (__unused NSException *ex) {}
+        }
+    }
+    if (gOrigMTLNewTextureWithDesc) {
+        return ((id<MTLTexture> (*)(id, SEL, MTLTextureDescriptor *))gOrigMTLNewTextureWithDesc)(self, _cmd, desc);
+    }
+    return nil;
+}
+
+static IMP gOrigMTLCmdBufCommit = NULL;
+static void AMHook_mtlCmdBufCommit(id self, SEL _cmd) {
+    BOOL capOn = (gAMPerfInFlightSem != nil && AMPerfFlagEnabled(@"inFlightCap", NO));
+    BOOL acquired = NO;
+    if (capOn) {
+        // Bounded 150ms wait prevents any deadlock or 0x8badf00d watchdog
+        long res = dispatch_semaphore_wait(gAMPerfInFlightSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(150 * NSEC_PER_MSEC)));
+        acquired = (res == 0);
+        if (acquired) {
+            @try {
+                [(id<MTLCommandBuffer>)self addCompletedHandler:^(__unused id<MTLCommandBuffer> cb) {
+                    dispatch_semaphore_signal(gAMPerfInFlightSem);
+                }];
+            } @catch (__unused NSException *ex) {
+                dispatch_semaphore_signal(gAMPerfInFlightSem);
+                acquired = NO;
+            }
+        }
+    }
+    if (gOrigMTLCmdBufCommit) {
+        ((void (*)(id, SEL))gOrigMTLCmdBufCommit)(self, _cmd);
+    } else if (acquired) {
+        dispatch_semaphore_signal(gAMPerfInFlightSem);
+    }
+}
+
+// --- Phase 4: MetricKit Diagnostics Subscriber (runtime-resolved, zero link dep) ---
+@interface AMPerfMetricSubscriber : NSObject
++ (instancetype)shared;
+- (void)didReceiveMetricPayloads:(NSArray *)payloads;
+- (void)didReceiveDiagnosticPayloads:(NSArray *)payloads;
+@end
+
+@implementation AMPerfMetricSubscriber
+
++ (instancetype)shared {
+    static AMPerfMetricSubscriber *inst = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        inst = [[AMPerfMetricSubscriber alloc] init];
+    });
+    return inst;
+}
+
+- (void)savePayloads:(NSArray *)payloads prefix:(NSString *)prefix {
+    if (!payloads.count || !AMPerfFlagEnabled(@"telemetry", YES)) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            NSArray<NSString *> *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+            if (!docs.count) return;
+            NSString *dir = [docs.firstObject stringByAppendingPathComponent:@"diagnostics"];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+
+            SEL jsonSel = NSSelectorFromString(@"JSONRepresentation");
+            long long ts = (long long)[[NSDate date] timeIntervalSince1970];
+            NSUInteger idx = 0;
+            for (id p in payloads) {
+                if (![p respondsToSelector:jsonSel]) continue;
+                NSData *data = ((NSData *(*)(id, SEL))objc_msgSend)(p, jsonSel);
+                if (![data isKindOfClass:[NSData class]] || !data.length) continue;
+                NSString *name = [NSString stringWithFormat:@"%@_%lld_%lu.json", prefix, ts, (unsigned long)idx++];
+                [data writeToFile:[dir stringByAppendingPathComponent:name] atomically:YES];
+            }
+
+            // Trim diagnostics directory to latest 10 files
+            NSArray<NSString *> *files = [[fm contentsOfDirectoryAtPath:dir error:nil] sortedArrayUsingSelector:@selector(compare:)];
+            if (files.count > 10) {
+                for (NSUInteger i = 0; i < files.count - 10; i++) {
+                    [fm removeItemAtPath:[dir stringByAppendingPathComponent:files[i]] error:nil];
+                }
+            }
+        }
+    });
+}
+
+- (void)didReceiveMetricPayloads:(NSArray *)payloads {
+    [self savePayloads:payloads prefix:@"mx_metric"];
+}
+
+- (void)didReceiveDiagnosticPayloads:(NSArray *)payloads {
+    [self savePayloads:payloads prefix:@"mx_diag"];
+}
+
+@end
+
+// --- Phase 4: Native Settings -> Engine Performance (iOS) Modal ---
+@interface AMPerfSettingsSheetVC : UIViewController
+@property (nonatomic, strong) UIScrollView *scrollView;
+@property (nonatomic, strong) UILabel *statsLabel;
+@property (nonatomic, strong) NSMutableArray<UISwitch *> *switches;
+@end
+
+@implementation AMPerfSettingsSheetVC
+
+- (NSString *)thermalString:(NSProcessInfoThermalState)st {
+    switch (st) {
+        case NSProcessInfoThermalStateNominal: return @"Nominal";
+        case NSProcessInfoThermalStateFair: return @"Fair";
+        case NSProcessInfoThermalStateSerious: return @"Serious";
+        case NSProcessInfoThermalStateCritical: return @"Critical";
+        default: return @"Unknown";
+    }
+}
+
+- (void)refreshStats {
+    AMPerfRefreshDeviceState();
+    double ramGB = (double)gAMPerfPhysicalRAM / (1024.0 * 1024.0 * 1024.0);
+    double availMB = (double)os_proc_available_memory() / (1024.0 * 1024.0);
+    NSString *tierName = (gAMPerfDeviceTier == AMDeviceTier1) ? @"T1 (Low RAM)" :
+                         (gAMPerfDeviceTier == AMDeviceTier2) ? @"T2 (Mid 4 GB)" : @"T3 (Pro 6 GB+)";
+    int64_t hits = __atomic_load_n(&gAMPerfLibCacheHits, __ATOMIC_RELAXED);
+    int64_t misses = __atomic_load_n(&gAMPerfLibCacheMisses, __ATOMIC_RELAXED);
+    int64_t paced = __atomic_load_n(&gAMPerfDisplayLinksPaced, __ATOMIC_RELAXED);
+    int64_t privTex = __atomic_load_n(&gAMPerfPrivateTexPromoted, __ATOMIC_RELAXED);
+    int64_t brCap = __atomic_load_n(&gAMPerfBitrateCappedCount, __ATOMIC_RELAXED);
+
+    self.statsLabel.text = [NSString stringWithFormat:
+        @"Device Tier: %@  |  RAM: %.1f GB (%.0f MB free)\n"
+        @"GPU: Apple%ld  |  Display: %ld Hz  |  Thermal: %@%@\n"
+        @"Shader Cache: %lld hits / %lld misses  |  DisplayLinks Paced: %lld\n"
+        @"TBDR Private Tex: %lld  |  Bitrate Caps: %lld",
+        tierName, ramGB, availMB,
+        (long)gAMPerfGPUFamilyNum, (long)gAMPerfMaxScreenFPS,
+        [self thermalString:gAMPerfThermalState],
+        gAMPerfLowPowerMode ? @" (Low Power)" : @"",
+        hits, misses, paced, privTex, brCap];
+}
+
+- (UIView *)buildToggleRowWithTitle:(NSString *)title
+                           subtitle:(NSString *)subtitle
+                            flagKey:(NSString *)flagKey
+                         defaultVal:(BOOL)defaultVal
+                           isMaster:(BOOL)isMaster {
+    UIView *card = [[UIView alloc] init];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.backgroundColor = AMSurfaceColor();
+    card.layer.cornerRadius = 12.0;
+
+    UILabel *tLbl = [[UILabel alloc] init];
+    tLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    tLbl.text = title;
+    tLbl.font = AMThemeFont(14.0, UIFontWeightSemibold);
+    tLbl.textColor = [UIColor whiteColor];
+    [card addSubview:tLbl];
+
+    UILabel *sLbl = [[UILabel alloc] init];
+    sLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    sLbl.text = subtitle;
+    sLbl.font = AMThemeFont(11.5, UIFontWeightRegular);
+    sLbl.textColor = [UIColor colorWithWhite:1.0 alpha:0.65];
+    sLbl.numberOfLines = 0;
+    [card addSubview:sLbl];
+
+    UISwitch *sw = [[UISwitch alloc] init];
+    sw.translatesAutoresizingMaskIntoConstraints = NO;
+    sw.onTintColor = isMaster ? [UIColor systemRedColor] : AMAccentGreenColor();
+    if (isMaster) {
+        sw.on = AMPerfMasterDisabled();
+    } else {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        NSString *k = AMPerfDefaultsKey(flagKey);
+        sw.on = ([ud objectForKey:k] == nil) ? defaultVal : [ud boolForKey:k];
+    }
+    objc_setAssociatedObject(sw, "flagKey", flagKey, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    objc_setAssociatedObject(sw, "isMaster", @(isMaster), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [sw addTarget:self action:@selector(onToggleSwitch:) forControlEvents:UIControlEventValueChanged];
+    [card addSubview:sw];
+    [self.switches addObject:sw];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [tLbl.topAnchor constraintEqualToAnchor:card.topAnchor constant:12.0],
+        [tLbl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:14.0],
+        [tLbl.trailingAnchor constraintEqualToAnchor:sw.leadingAnchor constant:-10.0],
+
+        [sLbl.topAnchor constraintEqualToAnchor:tLbl.bottomAnchor constant:3.0],
+        [sLbl.leadingAnchor constraintEqualToAnchor:tLbl.leadingAnchor],
+        [sLbl.trailingAnchor constraintEqualToAnchor:tLbl.trailingAnchor],
+        [sLbl.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-12.0],
+
+        [sw.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-14.0],
+        [sw.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+    ]];
+    return card;
+}
+
+- (void)onToggleSwitch:(UISwitch *)sw {
+    NSString *flagKey = objc_getAssociatedObject(sw, "flagKey");
+    BOOL isMaster = [objc_getAssociatedObject(sw, "isMaster") boolValue];
+    if (isMaster) {
+        [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"AMPerf.disableAll"];
+    } else if (flagKey.length) {
+        AMPerfSetFlag(flagKey, sw.on);
+    }
+    [self refreshStats];
+}
+
+- (void)onTapFlush:(UIButton *)btn {
+    (void)btn;
+    AMPurgeSideStoreMemoryCaches(YES);
+    [self refreshStats];
+    UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [h impactOccurred];
+}
+
+- (void)onTapClose:(UIButton *)btn {
+    (void)btn;
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = AMBgColor();
+    self.switches = [NSMutableArray array];
+
+    UILabel *hdr = [[UILabel alloc] init];
+    hdr.translatesAutoresizingMaskIntoConstraints = NO;
+    hdr.text = @"Engine Performance (iOS)";
+    hdr.font = AMThemeFont(18.0, UIFontWeightBold);
+    hdr.textColor = [UIColor whiteColor];
+    [self.view addSubview:hdr];
+
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    closeBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [closeBtn setTitle:@"Done" forState:UIControlStateNormal];
+    [closeBtn setTitleColor:AMAccentGreenColor() forState:UIControlStateNormal];
+    closeBtn.titleLabel.font = AMThemeFont(15.0, UIFontWeightSemibold);
+    [closeBtn addTarget:self action:@selector(onTapClose:) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:closeBtn];
+
+    self.scrollView = [[UIScrollView alloc] init];
+    self.scrollView.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:self.scrollView];
+
+    UIStackView *stack = [[UIStackView alloc] init];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 10.0;
+    [self.scrollView addSubview:stack];
+
+    UIView *statsCard = [[UIView alloc] init];
+    statsCard.translatesAutoresizingMaskIntoConstraints = NO;
+    statsCard.backgroundColor = AMInputSurfaceColor();
+    statsCard.layer.cornerRadius = 12.0;
+    statsCard.layer.borderWidth = 1.0;
+    statsCard.layer.borderColor = AMBorderColor().CGColor;
+
+    self.statsLabel = [[UILabel alloc] init];
+    self.statsLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.statsLabel.font = AMThemeFont(12.0, UIFontWeightMedium);
+    self.statsLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.9];
+    self.statsLabel.numberOfLines = 0;
+    [statsCard addSubview:self.statsLabel];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.statsLabel.topAnchor constraintEqualToAnchor:statsCard.topAnchor constant:12.0],
+        [self.statsLabel.bottomAnchor constraintEqualToAnchor:statsCard.bottomAnchor constant:-12.0],
+        [self.statsLabel.leadingAnchor constraintEqualToAnchor:statsCard.leadingAnchor constant:14.0],
+        [self.statsLabel.trailingAnchor constraintEqualToAnchor:statsCard.trailingAnchor constant:-14.0],
+    ]];
+    [stack addArrangedSubview:statsCard];
+
+    // Phase 1 & 3 (Safe defaults ON)
+    [stack addArrangedSubview:[self buildToggleRowWithTitle:@"ProMotion Frame Pacing"
+                                                   subtitle:@"Caps 120 Hz over-render to 60 Hz (30 Hz in Low Power / Critical heat)."
+                                                    flagKey:@"framePacing" defaultVal:YES isMaster:NO]];
+    [stack addArrangedSubview:[self buildToggleRowWithTitle:@"Shader Library Cache"
+                                                   subtitle:@"Memoizes compiled Metal effect libraries in RAM (no binary archive)."
+                                                    flagKey:@"shaderLibraryCache" defaultVal:YES isMaster:NO]];
+    [stack addArrangedSubview:[self buildToggleRowWithTitle:@"Thermal & Low Power Ladder"
+                                                   subtitle:@"Steps preview divisor down when hot/Low Power; exports stay full res."
+                                                    flagKey:@"thermalLadder" defaultVal:YES isMaster:NO]];
+    [stack addArrangedSubview:[self buildToggleRowWithTitle:@"RAM-Aware Bitrate Governor"
+                                                   subtitle:@"Caps 4K export bitrate on <=4 GB iPhones when free RAM < 1.5 GB."
+                                                    flagKey:@"bitrateGovernor" defaultVal:YES isMaster:NO]];
+    [stack addArrangedSubview:[self buildToggleRowWithTitle:@"T1 Proxy Video Decode"
+                                                   subtitle:@"Caps preview decoder resolution on <=3 GB iPhones at 1/2-1/4 preview."
+                                                    flagKey:@"proxyDecode" defaultVal:YES isMaster:NO]];
+
+    // Phase 2 (Experimental GPU — default OFF)
+    [stack addArrangedSubview:[self buildToggleRowWithTitle:@"TBDR Private Texture Storage (Beta)"
+                                                   subtitle:@"Promotes GPU-only render targets to MTLStorageModePrivate (A12+ compression)."
+                                                    flagKey:@"tbdrPrivateStorage" defaultVal:NO isMaster:NO]];
+    [stack addArrangedSubview:[self buildToggleRowWithTitle:@"In-Flight GPU Command Cap (Beta)"
+                                                   subtitle:@"Limits concurrent Metal command buffers (2 on T1, 3 on T2-T3) to cut 4K stalls."
+                                                    flagKey:@"inFlightCap" defaultVal:NO isMaster:NO]];
+    [stack addArrangedSubview:[self buildToggleRowWithTitle:@"T1 SDR 8-Bit Intermediate (Beta)"
+                                                   subtitle:@"Uses BGRA8 instead of RGBA16F on 1080p/4K targets on <=3 GB iPhones."
+                                                    flagKey:@"sdrRgba8Intermediate" defaultVal:NO isMaster:NO]];
+
+    // Phase 4 & Master Kill Switch
+    [stack addArrangedSubview:[self buildToggleRowWithTitle:@"Signposts & MetricKit Logs"
+                                                   subtitle:@"Records os_signpost traces & saves crash/Jetsam JSON to Documents/diagnostics."
+                                                    flagKey:@"telemetry" defaultVal:YES isMaster:NO]];
+    [stack addArrangedSubview:[self buildToggleRowWithTitle:@"Master Kill Switch (Disable All)"
+                                                   subtitle:@"Turns off all iPhone Engine Performance hooks immediately."
+                                                    flagKey:@"disableAll" defaultVal:NO isMaster:YES]];
+
+    UIButton *flushBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    flushBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    flushBtn.backgroundColor = AMAccentGreenColor();
+    flushBtn.layer.cornerRadius = 12.0;
+    [flushBtn setTitle:@"Flush Engine & Shader Caches Now" forState:UIControlStateNormal];
+    [flushBtn setTitleColor:AMSettingsTextColor() forState:UIControlStateNormal];
+    flushBtn.titleLabel.font = AMThemeFont(14.0, UIFontWeightBold);
+    [flushBtn addTarget:self action:@selector(onTapFlush:) forControlEvents:UIControlEventTouchUpInside];
+    [flushBtn.heightAnchor constraintEqualToConstant:44.0].active = YES;
+    [stack addArrangedSubview:flushBtn];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [hdr.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:16.0],
+        [hdr.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:18.0],
+
+        [closeBtn.centerYAnchor constraintEqualToAnchor:hdr.centerYAnchor],
+        [closeBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-18.0],
+
+        [self.scrollView.topAnchor constraintEqualToAnchor:hdr.bottomAnchor constant:14.0],
+        [self.scrollView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.scrollView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.scrollView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+
+        [stack.topAnchor constraintEqualToAnchor:self.scrollView.contentLayoutGuide.topAnchor constant:4.0],
+        [stack.bottomAnchor constraintEqualToAnchor:self.scrollView.contentLayoutGuide.bottomAnchor constant:-24.0],
+        [stack.leadingAnchor constraintEqualToAnchor:self.scrollView.frameLayoutGuide.leadingAnchor constant:16.0],
+        [stack.trailingAnchor constraintEqualToAnchor:self.scrollView.frameLayoutGuide.trailingAnchor constant:-16.0],
+    ]];
+
+    [self refreshStats];
+}
+
+@end
+
+static void AMPresentEnginePerformanceFromVC(UIViewController *vc) {
+    if (!vc) return;
+    AMPerfSettingsSheetVC *sheet = [[AMPerfSettingsSheetVC alloc] init];
+    if (@available(iOS 15.0, *)) {
+        sheet.modalPresentationStyle = UIModalPresentationPageSheet;
+    }
+    [vc presentViewController:sheet animated:YES completion:nil];
+}
+
+static void AMInstalliPhoneEnginePerformance(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        AMPerfInitDeviceProfile();
+
+        // Shader library cache sized by iPhone tier (T1: 64, T2: 128, T3: 256)
+        gAMPerfShaderLibCache = [[NSCache alloc] init];
+        gAMPerfShaderLibCache.countLimit = (gAMPerfDeviceTier == AMDeviceTier1) ? 64 :
+                                           (gAMPerfDeviceTier == AMDeviceTier2) ? 128 : 256;
+
+        // In-flight command buffer semaphore (T1: 2, T2-T3: 3)
+        gAMPerfInFlightSem = dispatch_semaphore_create((gAMPerfDeviceTier == AMDeviceTier1) ? 2 : 3);
+
+        // Phase 1.1: ProMotion CADisplayLink class-method swizzle
+        Class dlMeta = object_getClass([CADisplayLink class]);
+        if (dlMeta) {
+            Method m = class_getInstanceMethod(dlMeta, @selector(displayLinkWithTarget:selector:));
+            if (m) {
+                gOrigCADisplayLinkWithTarget = method_setImplementation(m, (IMP)AMHook_caDisplayLinkWithTarget);
+            }
+        }
+
+        // Phase 1.2 + Phase 2: Concrete MTLDevice + MTLCommandBuffer hooks
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (dev) {
+            Class devCls = object_getClass(dev);
+            if (devCls) {
+                Method mSync = class_getInstanceMethod(devCls, @selector(newLibraryWithSource:options:error:));
+                if (mSync) gOrigMTLNewLibSync = method_setImplementation(mSync, (IMP)AMHook_mtlNewLibSync);
+
+                Method mAsync = class_getInstanceMethod(devCls, @selector(newLibraryWithSource:options:completionHandler:));
+                if (mAsync) gOrigMTLNewLibAsync = method_setImplementation(mAsync, (IMP)AMHook_mtlNewLibAsync);
+
+                Method mTex = class_getInstanceMethod(devCls, @selector(newTextureWithDescriptor:));
+                if (mTex) gOrigMTLNewTextureWithDesc = method_setImplementation(mTex, (IMP)AMHook_mtlNewTextureWithDesc);
+            }
+            @try {
+                id<MTLCommandQueue> q = [dev newCommandQueue];
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                if (cb) {
+                    Class cbCls = object_getClass(cb);
+                    if (cbCls) {
+                        Method mCommit = class_getInstanceMethod(cbCls, @selector(commit));
+                        if (mCommit) gOrigMTLCmdBufCommit = method_setImplementation(mCommit, (IMP)AMHook_mtlCmdBufCommit);
+                    }
+                }
+            } @catch (__unused NSException *ex) {}
+        }
+
+        // Phase 1.5: AVAssetWriterInput export bitrate governor
+        Class writerInCls = [AVAssetWriterInput class];
+        if (writerInCls) {
+            Method mHint = class_getInstanceMethod(writerInCls, @selector(initWithMediaType:outputSettings:sourceFormatHint:));
+            if (mHint) gOrigAVWriterInputInitWithHint = method_setImplementation(mHint, (IMP)AMHook_avWriterInputInitWithHint);
+            Method mInit = class_getInstanceMethod(writerInCls, @selector(initWithMediaType:outputSettings:));
+            if (mInit) gOrigAVWriterInputInit = method_setImplementation(mInit, (IMP)AMHook_avWriterInputInit);
+        }
+
+        // Phase 4: MetricKit subscriber (runtime-resolved)
+        Class mmCls = NSClassFromString(@"MXMetricManager");
+        if (mmCls) {
+            SEL sharedSel = NSSelectorFromString(@"sharedManager");
+            SEL addSubSel = NSSelectorFromString(@"addSubscriber:");
+            if ([mmCls respondsToSelector:sharedSel]) {
+                id mgr = ((id (*)(id, SEL))objc_msgSend)(mmCls, sharedSel);
+                if (mgr && [mgr respondsToSelector:addSubSel]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(mgr, addSubSel, [AMPerfMetricSubscriber shared]);
+                }
+            }
+        }
+    });
+}
+
 static void AMSwizzleMethod(NSString *className, NSString *selName, IMP replacement, IMP *outOrig) {
     Class cls = NSClassFromString(className);
     if (!cls) return;
@@ -22438,6 +23302,7 @@ static void AlightMotionModsInit(void) {
                     (IMP)AMHook_appAttestAttestKey,
                     &gOrigAppAttestAttestKey);
     AMInstallSideStoreStabilityGuard();
+    AMInstalliPhoneEnginePerformance();
 
     // Module 9B: Multi-Font & Files Paste/Import Crash Fix
     AMSwizzleMethod(@"NSFileManager",
@@ -22484,7 +23349,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-21";
+                static NSString *const kAMModBuildVersion = @"2026.11.28-1";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
