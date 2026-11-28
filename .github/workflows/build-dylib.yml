@@ -30,6 +30,7 @@ jobs:
             -framework UniformTypeIdentifiers \
             -framework AVFoundation \
             -framework CoreMedia \
+            -framework CoreVideo \
             -framework Metal \
             -framework Accelerate \
             -o AlightMotionMods.dylib \

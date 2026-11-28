@@ -21,6 +21,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
 #import <Metal/Metal.h>
 #import <Accelerate/Accelerate.h>
 #import <os/lock.h>
@@ -222,7 +223,59 @@ static void AMNotifyCompositorRequestFinished(void) {
     });
 }
 
+static BOOL AMPerfFlagEnabled(NSString *name, BOOL defaultVal);
+static int64_t gAMPerfFullParityFrames = 0;
+
+static BOOL AMFullPreviewParityActive(void) {
+    return (gPreviewDivisor == 1 && AMPerfFlagEnabled(@"fullPreviewParity", YES));
+}
+
+static void AMTagPreviewFrameSRGBIfNeeded(CVPixelBufferRef frame) {
+    if (!frame || !AMFullPreviewParityActive()) return;
+    OSType fmt = CVPixelBufferGetPixelFormatType(frame);
+    if (fmt != kCVPixelFormatType_32BGRA &&
+        fmt != kCVPixelFormatType_32RGBA &&
+        fmt != kCVPixelFormatType_32ARGB &&
+        fmt != kCVPixelFormatType_64RGBAHalf) {
+        return;
+    }
+    BOOL hasTransfer = NO;
+    if (@available(iOS 15.0, *)) {
+        CFTypeRef existing = CVBufferCopyAttachment(frame, kCVImageBufferTransferFunctionKey, NULL);
+        if (existing) {
+            hasTransfer = YES;
+            CFRelease(existing);
+        }
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        hasTransfer = (CVBufferGetAttachment(frame, kCVImageBufferTransferFunctionKey, NULL) != NULL);
+#pragma clang diagnostic pop
+    }
+    if (hasTransfer) return;
+
+    static CGColorSpaceRef sRGBSpace = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sRGBSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    });
+    CVBufferSetAttachment(frame, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(frame, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_sRGB, kCVAttachmentMode_ShouldPropagate);
+    if (sRGBSpace) {
+        CVBufferSetAttachment(frame, kCVImageBufferCGColorSpaceKey, sRGBSpace, kCVAttachmentMode_ShouldPropagate);
+    }
+    __atomic_add_fetch(&gAMPerfFullParityFrames, 1, __ATOMIC_RELAXED);
+}
+
 static void AMHook_avCompReqFinishFrame(id self, SEL _cmd, CVPixelBufferRef frame) {
+    if (frame && AMFullPreviewParityActive()) {
+        @try {
+            AVAsynchronousVideoCompositionRequest *req = (AVAsynchronousVideoCompositionRequest *)self;
+            if (req.renderContext && !req.renderContext.highQualityRendering) {
+                AMTagPreviewFrameSRGBIfNeeded(frame);
+            }
+        } @catch (__unused NSException *ex) {}
+    }
     if (gOrigAVCompReqFinishFrame) {
         ((void (*)(id, SEL, CVPixelBufferRef))gOrigAVCompReqFinishFrame)(self, _cmd, frame);
     }
@@ -422,6 +475,10 @@ static const void *kAMQualityButtonAssocKey = &kAMQualityButtonAssocKey;
     gPreviewDivisor = (gPreviewDivisor % 4) + 1;
     [[NSUserDefaults standardUserDefaults] setInteger:gPreviewDivisor forKey:kAMPreviewQualityKey];
     [self styleQualityButton:btn];
+    AVPlayer *player = AMResolveActivePreviewPlayer();
+    if (player && player.currentItem) {
+        AMPerfApplyProxyDecodeForItem(player.currentItem, gPreviewDivisor);
+    }
     AMForceImmediatePreviewRedraw();
     UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     [haptic impactOccurred];
@@ -22375,6 +22432,7 @@ static void AMPerfInitDeviceProfile(void) {
 
 static NSInteger AMPerfEffectivePreviewDivisor(NSInteger userDivisor) {
     NSInteger div = (userDivisor >= 1 && userDivisor <= 4) ? userDivisor : 1;
+    if (div == 1 && AMPerfFlagEnabled(@"fullPreviewParity", YES)) return 1;
     if (!AMPerfFlagEnabled(@"thermalLadder", YES)) return div;
     NSProcessInfoThermalState ts = gAMPerfThermalState;
     BOOL lpm = gAMPerfLowPowerMode;
@@ -22388,6 +22446,12 @@ static NSInteger AMPerfEffectivePreviewDivisor(NSInteger userDivisor) {
 
 static void AMPerfApplyProxyDecodeForItem(AVPlayerItem *item, NSInteger effectiveDivisor) {
     if (!item) return;
+    if (effectiveDivisor == 1 && AMPerfFlagEnabled(@"fullPreviewParity", YES)) {
+        @try {
+            item.preferredMaximumResolution = CGSizeZero;
+        } @catch (__unused NSException *ex) {}
+        return;
+    }
     if (!AMPerfFlagEnabled(@"proxyDecode", YES)) return;
     if (gAMPerfDeviceTier != AMDeviceTier1) return;
     NSInteger div = AMPerfEffectivePreviewDivisor(effectiveDivisor);
@@ -22604,7 +22668,7 @@ static IMP gOrigMTLNewTextureWithDesc = NULL;
 static id<MTLTexture> AMHook_mtlNewTextureWithDesc(id self, SEL _cmd, MTLTextureDescriptor *desc) {
     if (desc && !AMPerfMasterDisabled()) {
         BOOL wantPrivate = AMPerfFlagEnabled(@"tbdrPrivateStorage", NO);
-        BOOL wantSDR8 = (gAMPerfDeviceTier == AMDeviceTier1 && AMPerfFlagEnabled(@"sdrRgba8Intermediate", NO));
+        BOOL wantSDR8 = (gAMPerfDeviceTier == AMDeviceTier1 && AMPerfFlagEnabled(@"sdrRgba8Intermediate", NO) && !AMFullPreviewParityActive());
         if ((wantPrivate || wantSDR8) &&
             desc.textureType == MTLTextureType2D &&
             (desc.usage & MTLTextureUsageRenderTarget) != 0 &&
@@ -22756,17 +22820,18 @@ static void AMHook_mtlCmdBufCommit(id self, SEL _cmd) {
     int64_t paced = __atomic_load_n(&gAMPerfDisplayLinksPaced, __ATOMIC_RELAXED);
     int64_t privTex = __atomic_load_n(&gAMPerfPrivateTexPromoted, __ATOMIC_RELAXED);
     int64_t brCap = __atomic_load_n(&gAMPerfBitrateCappedCount, __ATOMIC_RELAXED);
+    int64_t parityFrames = __atomic_load_n(&gAMPerfFullParityFrames, __ATOMIC_RELAXED);
 
     self.statsLabel.text = [NSString stringWithFormat:
         @"Device Tier: %@  |  RAM: %.1f GB (%.0f MB free)\n"
         @"GPU: Apple%ld  |  Display: %ld Hz  |  Thermal: %@%@\n"
         @"Shader Cache: %lld hits / %lld misses  |  DisplayLinks Paced: %lld\n"
-        @"TBDR Private Tex: %lld  |  Bitrate Caps: %lld",
+        @"TBDR Private Tex: %lld  |  Bitrate Caps: %lld  |  Full Parity sRGB: %lld",
         tierName, ramGB, availMB,
         (long)gAMPerfGPUFamilyNum, (long)gAMPerfMaxScreenFPS,
         [self thermalString:gAMPerfThermalState],
         gAMPerfLowPowerMode ? @" (Low Power)" : @"",
-        hits, misses, paced, privTex, brCap];
+        hits, misses, paced, privTex, brCap, parityFrames];
 }
 
 - (UIView *)buildToggleRowWithTitle:(NSString *)title
@@ -22833,6 +22898,13 @@ static void AMHook_mtlCmdBufCommit(id self, SEL _cmd) {
         [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:@"AMPerf.disableAll"];
     } else if (flagKey.length) {
         AMPerfSetFlag(flagKey, sw.on);
+        if ([flagKey isEqualToString:@"fullPreviewParity"]) {
+            AVPlayer *player = AMResolveActivePreviewPlayer();
+            if (player && player.currentItem) {
+                AMPerfApplyProxyDecodeForItem(player.currentItem, gPreviewDivisor);
+            }
+            AMForceImmediatePreviewRedraw();
+        }
     }
     [self refreshStats];
 }
@@ -22902,6 +22974,9 @@ static void AMHook_mtlCmdBufCommit(id self, SEL _cmd) {
     [stack addArrangedSubview:statsCard];
 
     // Phase 1 & 3 (Safe defaults ON)
+    [stack addArrangedSubview:[self buildToggleRowWithTitle:@"Full Preview 1:1 Parity"
+                                                   subtitle:@"Locks Full preview to native res, RGBA16F & sRGB color to match frame screenshots."
+                                                    flagKey:@"fullPreviewParity" defaultVal:YES isMaster:NO]];
     [stack addArrangedSubview:[self buildToggleRowWithTitle:@"ProMotion Frame Pacing"
                                                    subtitle:@"Caps 120 Hz over-render to 60 Hz (30 Hz in Low Power / Critical heat)."
                                                     flagKey:@"framePacing" defaultVal:YES isMaster:NO]];
@@ -23349,7 +23424,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.28-1";
+                static NSString *const kAMModBuildVersion = @"2026.11.28-2";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
