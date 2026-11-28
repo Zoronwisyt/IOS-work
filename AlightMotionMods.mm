@@ -22167,7 +22167,7 @@ static void AMHook_shareNCOnTapExport(id self, SEL _cmd, id sender) {
         BOOL fromList = NO;
         Ivar listIvar = class_getInstanceVariable([shareVC class], "shareFromProjectList");
         if (listIvar) {
-            fromList = (*(const uint8_t *)((__bridge const uint8_t *)shareVC + ivar_getOffset(listIvar)) != 0);
+            fromList = (*((const uint8_t *)(__bridge const void *)shareVC + ivar_getOffset(listIvar)) != 0);
         }
 
         if (fromList) {
