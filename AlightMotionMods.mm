@@ -9622,6 +9622,7 @@ static void AMHook_layerParentingWillDisplayCell(id self, SEL _cmd, UITableView 
 }
 
 static void AMRot3DSyncAfterParentingChange(void *holder);
+static NSMutableSet<NSNumber *> *gAMAutoLinkedCameraIds;
 
 static void AMHook_layerParentingDidSelectRow(id self, SEL _cmd, UITableView *tableView, NSIndexPath *indexPath) {
     id navVC = objc_getAssociatedObject(self, kAMMultiParentNavKey);
@@ -16886,7 +16887,7 @@ static void AMRot3DSyncUndoRedoOnMain(void) {
 
 // --- Camera-to-Null Auto-Linking & Universal AE Lens Layer Sync ---
 
-static NSMutableSet<NSNumber *> *gAMAutoLinkedCameraIds = nil;
+static NSMutableSet<NSNumber *> *gAMAutoLinkedCameraIds;
 static uint64_t gAMLinkCamId = 0;
 static uint64_t gAMLinkNullId = 0;
 
@@ -18945,6 +18946,7 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
         NSMutableDictionary *td = ld[@"tracks"][AMRot3DTrackKey(tr)];
         return [td[@"keyframes"] isKindOfClass:[NSMutableArray class]] ? td[@"keyframes"] : nil;
     };
+    __weak __typeof__(self) weakSelf = self;
     gvc.onPersistSave = ^(BOOL saveDisk) {
         if (saveDisk) {
             [[AMRot3DStore shared] save];
@@ -18953,7 +18955,6 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
             [[AMRot3DStore shared] syncAllToRuntime];
         }
     };
-    __weak __typeof__(self) weakSelf = self;
     gvc.onDidModify = ^{ [weakSelf refreshControls]; };
     gvc.onRequestSeekMs = ^(int64_t targetMs) {
         AMPuppetSeekHolderToTimeMs(weakSelf.holder, targetMs);
