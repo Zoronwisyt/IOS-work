@@ -23288,11 +23288,11 @@ static IMP gOrigExportPreviewVCViewWillAppear = NULL;
     if (@available(iOS 13.0, *)) {
         BGTaskScheduler *scheduler = [BGTaskScheduler sharedScheduler];
         if (!scheduler) return;
-        __weak typeof(self) weakSelf = self;
+        __weak AMBackgroundExportManager *weakSelf = self;
         [scheduler registerForTaskWithIdentifier:kAMBgExportTaskId
                                       usingQueue:dispatch_get_main_queue()
                                    launchHandler:^(BGTask *task) {
-            __strong typeof(weakSelf) strongSelf = weakSelf;
+            __strong AMBackgroundExportManager *strongSelf = weakSelf;
             if (!strongSelf) {
                 [task setTaskCompletedWithSuccess:NO];
                 return;
@@ -23371,9 +23371,9 @@ static IMP gOrigExportPreviewVCViewWillAppear = NULL;
 
 - (void)beginLegacyBackgroundTask {
     if (_bgTaskId != UIBackgroundTaskInvalid) return;
-    __weak typeof(self) weakSelf = self;
+    __weak AMBackgroundExportManager *weakSelf = self;
     _bgTaskId = [[UIApplication sharedApplication] beginBackgroundTaskWithName:@"AMBackgroundExport" expirationHandler:^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
+        __strong AMBackgroundExportManager *strongSelf = weakSelf;
         if (!strongSelf) return;
         if (strongSelf->_exporting && !strongSelf->_didComplete && !strongSelf->_hasContinuedTask) {
             [strongSelf bridgeUpdateProgress:strongSelf->_lastProgress etaSeconds:-1 status:@"Paused — Return to App"];
