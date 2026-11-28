@@ -15199,7 +15199,7 @@ static UIImage *AMAutoBeatsTabIcon(void) {
 static const int kAMRot3DMaxShaderSlots = 16; // Primary GPU shader slots 1..16
 static const int kAMRot3DExtraShaderStart = 33; // Extra GPU shader slots 33..48
 static const int kAMRot3DMaxSlots = 48;       // 1..16 visual, 17..32 Null controllers, 33..48 extra visual
-static const int kAMRot3DTrackCount = 6;      // 0=RotX, 1=RotY, 2=RotZ, 3=PivotX, 4=PivotY, 5=PivotZ
+static const int kAMRot3DTrackCount = 9;      // 0=RotX, 1=RotY, 2=RotZ, 3=PivotX, 4=PivotY, 5=PivotZ, 6=PosX, 7=PosY, 8=PosZ
 static const int kAMRot3DMaxKeyframesPerTrack = 64;
 static const float kAMRot3DDefaultFov = 32.0f; // After Effects 50mm cinema lens (non-stretchy)
 
@@ -15323,6 +15323,9 @@ static NSString *AMRot3DTrackName(int track) {
         case 3: return @"Pivot X";
         case 4: return @"Pivot Y";
         case 5: return @"Pivot Z";
+        case 6: return @"Pos X";
+        case 7: return @"Pos Y";
+        case 8: return @"Pos Z";
         default: return @"Axis";
     }
 }
@@ -15335,6 +15338,9 @@ static NSString *AMRot3DTrackKey(int track) {
         case 3: return @"pivotX";
         case 4: return @"pivotY";
         case 5: return @"pivotZ";
+        case 6: return @"posX";
+        case 7: return @"posY";
+        case 8: return @"posZ";
         default: return @"rotX";
     }
 }
@@ -15475,7 +15481,7 @@ static NSString *AMRot3DEffectIdForSlot(int slot) {
 static NSString *AMRot3DBuildSlotXML(int slot) {
     return [NSString stringWithFormat:
         @"<?xml version='1.0' encoding='UTF-8' ?>\n"
-        @"<effect id=\"com.alightcreative.effects.am_rot3d_slot_%d\" compat=\"acScreenNorm-y\" name=\"3D Rotate\" desc=\"Jex Motion 3D Layer Rotation.\" category=\"3d\" tags=\"3d,rotate,perspective\" thumb=\"thumb/flip.webp\" internal=\"true\" overdraw=\"true\" max-overdraw=\"1.5\" maxOverdraw=\"1.5\">\n"
+        @"<effect id=\"com.alightcreative.effects.am_rot3d_slot_%d\" compat=\"acScreenNorm-y\" name=\"3D Rotate\" desc=\"Jex Motion 3D Layer Rotation.\" category=\"3d\" tags=\"3d,rotate,perspective\" thumb=\"thumb/flip.webp\" internal=\"true\" overdraw=\"true\" max-overdraw=\"4.0\" maxOverdraw=\"4.0\">\n"
         @"    <params>\n"
         @"        <texture id=\"inputImg\" srcType=\"content\" />\n"
         @"        <float id=\"amRot3DMagic\" value=\"244853.75\" />\n"
@@ -15613,7 +15619,7 @@ static NSArray<NSURL *> *AMEnsureRot3DSlotXMLs(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSString *dir = AMRot3DSlotsDir();
-        NSString *verFile = [dir stringByAppendingPathComponent:@".rot3d_xml_v4"];
+        NSString *verFile = [dir stringByAppendingPathComponent:@".rot3d_xml_v5"];
         BOOL needsWrite = ![[NSFileManager defaultManager] fileExistsAtPath:verFile];
         NSMutableArray<NSURL *> *urls = [NSMutableArray arrayWithCapacity:32];
         for (int s = 1; s <= kAMRot3DMaxSlots; ++s) {
@@ -15714,6 +15720,9 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
         float px = AMRot3DEvalTrackAtMs(&rt->tracks[3], evalTimeMs);
         float py = AMRot3DEvalTrackAtMs(&rt->tracks[4], evalTimeMs);
         float pz = AMRot3DEvalTrackAtMs(&rt->tracks[5], evalTimeMs) / 500.0f;
+        float posX = AMRot3DEvalTrackAtMs(&rt->tracks[6], evalTimeMs) / 500.0f;
+        float posY = AMRot3DEvalTrackAtMs(&rt->tracks[7], evalTimeMs) / 500.0f;
+        float posZ = AMRot3DEvalTrackAtMs(&rt->tracks[8], evalTimeMs) / 500.0f;
         float fov = (rt->fov >= 12.0f && rt->fov <= 95.0f) ? rt->fov : kAMRot3DDefaultFov;
         if (fabsf(fov - kAMRot3DDefaultFov) < 0.5f && gAMRot3DSceneFov >= 12.0f && gAMRot3DSceneFov <= 95.0f) {
             fov = gAMRot3DSceneFov;
@@ -15725,6 +15734,7 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
 
         BOOL localHasRot = (fabsf(rx) >= 0.001f || fabsf(ry) >= 0.001f || fabsf(rz) >= 0.001f);
         BOOL anyActive = (localHasRot || fabsf(pz) >= 0.0005f || fabsf(zOff) >= 0.0005f ||
+                          fabsf(posX) >= 0.0005f || fabsf(posY) >= 0.0005f || fabsf(posZ) >= 0.0005f ||
                           fabsf(bendRad) >= 0.005f || lightAmt >= 0.001f);
 
         float asp = (tr->layerSize[1] > 1.0f) ? (tr->layerSize[0] / tr->layerSize[1]) : 1.0f;
@@ -15732,11 +15742,12 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
         float P0_plane[3] = { px * asp, py, 0.0f };
 
         // Exact 3D affine composition v_world = M * v_local + t across Child -> Null 2 -> Null 1 -> ...
+        // World-space Pos X/Y/Z is applied after rotation M so X=left/right, Y=up/down, Z=depth regardless of angles.
         float M[16];
         AMRot3DMat4Angles(M, rx, ry, rz);
-        float tx = P0[0] - (M[0] * P0[0] + M[4] * P0[1] + M[8]  * P0[2]);
-        float ty = P0[1] - (M[1] * P0[0] + M[5] * P0[1] + M[9]  * P0[2]);
-        float tz = P0[2] - (M[2] * P0[0] + M[6] * P0[1] + M[10] * P0[2]) + zOff;
+        float tx = P0[0] - (M[0] * P0[0] + M[4] * P0[1] + M[8]  * P0[2]) + posX;
+        float ty = P0[1] - (M[1] * P0[0] + M[5] * P0[1] + M[9]  * P0[2]) + posY;
+        float tz = P0[2] - (M[2] * P0[0] + M[6] * P0[1] + M[10] * P0[2]) + zOff + posZ;
 
         uint64_t curAnc = AMRot3DFindParentIdLocked(rt->elementId);
         uint64_t visited[8];
@@ -15757,11 +15768,15 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
                 float aPx = AMRot3DEvalTrackAtMs(&ancRt->tracks[3], evalTimeMs);
                 float aPy = AMRot3DEvalTrackAtMs(&ancRt->tracks[4], evalTimeMs);
                 float aPz = AMRot3DEvalTrackAtMs(&ancRt->tracks[5], evalTimeMs) / 500.0f;
+                float aPosX = AMRot3DEvalTrackAtMs(&ancRt->tracks[6], evalTimeMs) / 500.0f;
+                float aPosY = AMRot3DEvalTrackAtMs(&ancRt->tracks[7], evalTimeMs) / 500.0f;
+                float aPosZ = AMRot3DEvalTrackAtMs(&ancRt->tracks[8], evalTimeMs) / 500.0f;
                 float aZOff = ancRt->zOffset / 500.0f;
                 float aBend = ancRt->bend * (float)(M_PI / 180.0);
                 float aLight = fminf(fmaxf(ancRt->lighting, 0.0f), 1.0f);
                 BOOL ancHasRot = (fabsf(aRx) >= 0.001f || fabsf(aRy) >= 0.001f || fabsf(aRz) >= 0.001f);
                 BOOL ancActive = (ancHasRot || fabsf(aPz) >= 0.0005f || fabsf(aZOff) >= 0.0005f ||
+                                  fabsf(aPosX) >= 0.0005f || fabsf(aPosY) >= 0.0005f || fabsf(aPosZ) >= 0.0005f ||
                                   fabsf(aBend) >= 0.005f || aLight >= 0.001f);
                 if (ancActive) {
                     anyActive = YES;
@@ -15780,9 +15795,9 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
                     float rtx = Ranc[0] * tx + Ranc[4] * ty + Ranc[8]  * tz;
                     float rty = Ranc[1] * tx + Ranc[5] * ty + Ranc[9]  * tz;
                     float rtz = Ranc[2] * tx + Ranc[6] * ty + Ranc[10] * tz;
-                    tx = rtx + (Pk[0] - (Ranc[0] * Pk[0] + Ranc[4] * Pk[1] + Ranc[8]  * Pk[2]));
-                    ty = rty + (Pk[1] - (Ranc[1] * Pk[0] + Ranc[5] * Pk[1] + Ranc[9]  * Pk[2]));
-                    tz = rtz + (Pk[2] - (Ranc[2] * Pk[0] + Ranc[6] * Pk[1] + Ranc[10] * Pk[2])) + aZOff;
+                    tx = rtx + (Pk[0] - (Ranc[0] * Pk[0] + Ranc[4] * Pk[1] + Ranc[8]  * Pk[2])) + aPosX;
+                    ty = rty + (Pk[1] - (Ranc[1] * Pk[0] + Ranc[5] * Pk[1] + Ranc[9]  * Pk[2])) + aPosY;
+                    tz = rtz + (Pk[2] - (Ranc[2] * Pk[0] + Ranc[6] * Pk[1] + Ranc[10] * Pk[2])) + aZOff + aPosZ;
 
                     if (fabsf(bendRad) < 0.005f && fabsf(aBend) >= 0.005f) bendRad = aBend;
                     if (lightAmt < 0.001f && aLight >= 0.001f) lightAmt = aLight;
@@ -15821,9 +15836,13 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
                         float cPx = AMRot3DEvalTrackAtMs(&camRt->tracks[3], evalTimeMs);
                         float cPy = AMRot3DEvalTrackAtMs(&camRt->tracks[4], evalTimeMs);
                         float cPz = -AMRot3DEvalTrackAtMs(&camRt->tracks[5], evalTimeMs) / 500.0f;
+                        float cPosX = -AMRot3DEvalTrackAtMs(&camRt->tracks[6], evalTimeMs) / 500.0f;
+                        float cPosY = -AMRot3DEvalTrackAtMs(&camRt->tracks[7], evalTimeMs) / 500.0f;
+                        float cPosZ = -AMRot3DEvalTrackAtMs(&camRt->tracks[8], evalTimeMs) / 500.0f;
                         float cZOff = -camRt->zOffset / 500.0f;
                         if (fabsf(cRx) >= 0.001f || fabsf(cRy) >= 0.001f || fabsf(cRz) >= 0.001f ||
-                            fabsf(cPz) >= 0.0005f || fabsf(cZOff) >= 0.0005f) {
+                            fabsf(cPz) >= 0.0005f || fabsf(cZOff) >= 0.0005f ||
+                            fabsf(cPosX) >= 0.0005f || fabsf(cPosY) >= 0.0005f || fabsf(cPosZ) >= 0.0005f) {
                             anyActive = YES;
                             CGPoint camPivInChild = AMPuppetMulRowMat4(CGPointMake(cPx, cPy), tr->screenToLayer);
                             float Ck[3] = {
@@ -15838,9 +15857,9 @@ static void AMRot3DFillFragmentBuffer(int slot, int magicIdx, const float header
                             float rtx = Rcam[0] * tx + Rcam[4] * ty + Rcam[8]  * tz;
                             float rty = Rcam[1] * tx + Rcam[5] * ty + Rcam[9]  * tz;
                             float rtz = Rcam[2] * tx + Rcam[6] * ty + Rcam[10] * tz;
-                            tx = rtx + (Ck[0] - (Rcam[0] * Ck[0] + Rcam[4] * Ck[1] + Rcam[8]  * Ck[2]));
-                            ty = rty + (Ck[1] - (Rcam[1] * Ck[0] + Rcam[5] * Ck[1] + Rcam[9]  * Ck[2]));
-                            tz = rtz + (Ck[2] - (Rcam[2] * Ck[0] + Rcam[6] * Ck[1] + Rcam[10] * Ck[2])) + cZOff;
+                            tx = rtx + (Ck[0] - (Rcam[0] * Ck[0] + Rcam[4] * Ck[1] + Rcam[8]  * Ck[2])) + cPosX;
+                            ty = rty + (Ck[1] - (Rcam[1] * Ck[0] + Rcam[5] * Ck[1] + Rcam[9]  * Ck[2])) + cPosY;
+                            tz = rtz + (Ck[2] - (Rcam[2] * Ck[0] + Rcam[6] * Ck[1] + Rcam[10] * Ck[2])) + cZOff + cPosZ;
                             if (camRt->fov >= 12.0f && camRt->fov <= 95.0f && fabsf(camRt->fov - kAMRot3DDefaultFov) >= 0.5f) {
                                 fov = camRt->fov;
                             }
@@ -17233,17 +17252,17 @@ static UIImage *AMRot3DTabIcon(void) {
     return [self convertPoint:ptPV fromView:pv];
 }
 
-// Project a local 3D point (lx, ly, lz) in layer-aspect space through R + perspective into view coordinates
+// Project a local 3D point (lx, ly, lz) in layer-aspect space through R + world pos + perspective into view coordinates
 - (BOOL)projectLocal3D:(float)lx y:(float)ly z:(float)lz
                      R:(const float[16])R
                 pivotX:(float)px pivotY:(float)py
-               camDist:(float)cd zOffset:(float)zOff
+               camDist:(float)cd offX:(float)offX offY:(float)offY zOffset:(float)zOff
                 aspect:(float)asp
               snapshot:(const AMPuppetTransformSnapshot *)snap
                outView:(CGPoint *)outPt
                 outZ:(float *)outZ {
-    float wx = R[0] * lx + R[4] * ly + R[8]  * lz;
-    float wy = R[1] * lx + R[5] * ly + R[9]  * lz;
+    float wx = R[0] * lx + R[4] * ly + R[8]  * lz + offX;
+    float wy = R[1] * lx + R[5] * ly + R[9]  * lz + offY;
     float wz = R[2] * lx + R[6] * ly + R[10] * lz + zOff;
     float denom = cd - wz;
     if (denom < 0.05f) return NO;
@@ -17255,7 +17274,7 @@ static UIImage *AMRot3DTabIcon(void) {
     return YES;
 }
 
-- (void)evalCurrentState:(const AMRot3DSlotRuntime *)rt euler:(float[3])euler pivot:(float[3])pivot worldMat:(float[16])outMat {
+- (void)evalCurrentState:(const AMRot3DSlotRuntime *)rt euler:(float[3])euler pivot:(float[3])pivot pos:(float[3])pos worldMat:(float[16])outMat {
     int64_t tMs = self.currentTimeMs;
     euler[0] = AMRot3DEvalTrackAtMs(&rt->tracks[0], tMs);
     euler[1] = AMRot3DEvalTrackAtMs(&rt->tracks[1], tMs);
@@ -17263,6 +17282,11 @@ static UIImage *AMRot3DTabIcon(void) {
     pivot[0] = AMRot3DEvalTrackAtMs(&rt->tracks[3], tMs);
     pivot[1] = AMRot3DEvalTrackAtMs(&rt->tracks[4], tMs);
     pivot[2] = AMRot3DEvalTrackAtMs(&rt->tracks[5], tMs) / 500.0f;
+    if (pos) {
+        pos[0] = AMRot3DEvalTrackAtMs(&rt->tracks[6], tMs) / 500.0f;
+        pos[1] = AMRot3DEvalTrackAtMs(&rt->tracks[7], tMs) / 500.0f;
+        pos[2] = AMRot3DEvalTrackAtMs(&rt->tracks[8], tMs) / 500.0f;
+    }
     if (outMat) {
         AMRot3DMat4Angles(outMat, euler[0], euler[1], euler[2]);
         os_unfair_lock_lock(&gAMRot3DRuntimeLock);
@@ -17299,18 +17323,18 @@ static UIImage *AMRot3DTabIcon(void) {
     AMRot3DSlotRuntime rt;
     if (![self getSnapshot:&snap runtime:&rt] || !rt.active || !self.showGizmo) return -1;
 
-    float euler[3], piv[3], R[16];
-    [self evalCurrentState:&rt euler:euler pivot:piv worldMat:R];
+    float euler[3], piv[3], pos[3], R[16];
+    [self evalCurrentState:&rt euler:euler pivot:piv pos:pos worldMat:R];
     float asp = (snap.layerSize[1] > 1.0f) ? (snap.layerSize[0] / snap.layerSize[1]) : 1.0f;
     float fov = (rt.fov >= 12.0f && rt.fov <= 95.0f) ? rt.fov : kAMRot3DDefaultFov;
     float cd = AMRot3DComputeCameraDist(fov, snap.valid ? snap.layerToScreen : NULL, gAMRot3DHasActiveCamera);
-    float zOff = rt.zOffset / 500.0f;
+    float zOff = rt.zOffset / 500.0f + pos[2];
     float ringR = 0.36f * fminf(asp, 1.0f);
     if (ringR < 0.22f) ringR = 0.22f;
 
     CGPoint pivView = CGPointZero;
     float pivZ = 0.0f;
-    [self projectLocal3D:0 y:0 z:0 R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&pivView outZ:&pivZ];
+    [self projectLocal3D:0 y:0 z:0 R:R pivotX:piv[0] pivotY:piv[1] camDist:cd offX:pos[0] offY:pos[1] zOffset:zOff aspect:asp snapshot:&snap outView:&pivView outZ:&pivZ];
     if (outPivot) *outPivot = pivView;
 
     int bestAxis = -1;
@@ -17326,7 +17350,7 @@ static UIImage *AMRot3DTabIcon(void) {
             else { lx = ca; ly = sa; }
             CGPoint vp;
             float wz = 0.0f;
-            if (![self projectLocal3D:lx y:ly z:lz R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&vp outZ:&wz]) continue;
+            if (![self projectLocal3D:lx y:ly z:lz R:R pivotX:piv[0] pivotY:piv[1] camDist:cd offX:pos[0] offY:pos[1] zOffset:zOff aspect:asp snapshot:&snap outView:&vp outZ:&wz]) continue;
             CGFloat d = hypot(pt.x - vp.x, pt.y - vp.y);
             // Slightly prefer front-facing ring segments
             CGFloat score = d + ((wz < pivZ) ? 5.0 : 0.0);
@@ -17348,15 +17372,15 @@ static UIImage *AMRot3DTabIcon(void) {
     AMPuppetTransformSnapshot snap;
     AMRot3DSlotRuntime rt;
     if (![self getSnapshot:&snap runtime:&rt] || !rt.active) return NO;
-    float euler[3], piv[3], R[16];
-    [self evalCurrentState:&rt euler:euler pivot:piv worldMat:R];
+    float euler[3], piv[3], pos[3], R[16];
+    [self evalCurrentState:&rt euler:euler pivot:piv pos:pos worldMat:R];
     float asp = (snap.layerSize[1] > 1.0f) ? (snap.layerSize[0] / snap.layerSize[1]) : 1.0f;
     float fov = (rt.fov >= 12.0f && rt.fov <= 95.0f) ? rt.fov : kAMRot3DDefaultFov;
     float cd = AMRot3DComputeCameraDist(fov, snap.valid ? snap.layerToScreen : NULL, gAMRot3DHasActiveCamera);
-    float zOff = rt.zOffset / 500.0f;
+    float zOff = rt.zOffset / 500.0f + pos[2];
     if (self.isNullController && !snap.valid) {
         CGPoint pivPt = CGPointZero;
-        if ([self projectLocal3D:0 y:0 z:0 R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&pivPt outZ:NULL]) {
+        if ([self projectLocal3D:0 y:0 z:0 R:R pivotX:piv[0] pivotY:piv[1] camDist:cd offX:pos[0] offY:pos[1] zOffset:zOff aspect:asp snapshot:&snap outView:&pivPt outZ:NULL]) {
             return hypot(pt.x - pivPt.x, pt.y - pivPt.y) <= 95.0;
         }
         return NO;
@@ -17366,7 +17390,7 @@ static UIImage *AMRot3DTabIcon(void) {
     float qy[4] = { (0.0f - piv[1]),       (0.0f - piv[1]),       (1.0f - piv[1]),       (1.0f - piv[1]) };
     CGPoint quad[4];
     for (int i = 0; i < 4; ++i) {
-        if (![self projectLocal3D:qx[i] y:qy[i] z:-piv[2] R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&quad[i] outZ:NULL]) {
+        if (![self projectLocal3D:qx[i] y:qy[i] z:-piv[2] R:R pivotX:piv[0] pivotY:piv[1] camDist:cd offX:pos[0] offY:pos[1] zOffset:zOff aspect:asp snapshot:&snap outView:&quad[i] outZ:NULL]) {
             return NO;
         }
     }
@@ -17409,7 +17433,7 @@ static UIImage *AMRot3DTabIcon(void) {
     AMRot3DSlotRuntime rt;
     [self getSnapshot:NULL runtime:&rt];
     float piv[3];
-    [self evalCurrentState:&rt euler:_startEuler pivot:piv worldMat:NULL];
+    [self evalCurrentState:&rt euler:_startEuler pivot:piv pos:NULL worldMat:NULL];
     memcpy(_lastEuler, _startEuler, sizeof(_lastEuler));
     if (axis >= 0) {
         _dragAxis = axis;
@@ -17572,8 +17596,8 @@ static UIImage *AMRot3DTabIcon(void) {
     AMRot3DSlotRuntime rt;
     if (![self getSnapshot:&snap runtime:&rt] || !rt.active) return;
 
-    float euler[3], piv[3], R[16];
-    [self evalCurrentState:&rt euler:euler pivot:piv worldMat:R];
+    float euler[3], piv[3], pos[3], R[16];
+    [self evalCurrentState:&rt euler:euler pivot:piv pos:pos worldMat:R];
 
     // Always draw miniature Jex 3D ViewCube in top-right of preview
     [self drawViewCubeInContext:ctx rotationMatrix:R];
@@ -17583,7 +17607,7 @@ static UIImage *AMRot3DTabIcon(void) {
     float asp = (snap.layerSize[1] > 1.0f) ? (snap.layerSize[0] / snap.layerSize[1]) : 1.0f;
     float fov = (rt.fov >= 12.0f && rt.fov <= 95.0f) ? rt.fov : kAMRot3DDefaultFov;
     float cd = AMRot3DComputeCameraDist(fov, snap.valid ? snap.layerToScreen : NULL, gAMRot3DHasActiveCamera);
-    float zOff = rt.zOffset / 500.0f;
+    float zOff = rt.zOffset / 500.0f + pos[2];
 
     // 1. Projected 3D layer quad outline (skip full quad for virtual Null controller)
     BOOL quadOk = NO;
@@ -17593,7 +17617,7 @@ static UIImage *AMRot3DTabIcon(void) {
         float qy[4] = { (0.0f - piv[1]),       (0.0f - piv[1]),       (1.0f - piv[1]),       (1.0f - piv[1]) };
         quadOk = YES;
         for (int i = 0; i < 4; ++i) {
-            if (![self projectLocal3D:qx[i] y:qy[i] z:-piv[2] R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&quadPts[i] outZ:NULL]) {
+            if (![self projectLocal3D:qx[i] y:qy[i] z:-piv[2] R:R pivotX:piv[0] pivotY:piv[1] camDist:cd offX:pos[0] offY:pos[1] zOffset:zOff aspect:asp snapshot:&snap outView:&quadPts[i] outZ:NULL]) {
                 quadOk = NO;
                 break;
             }
@@ -17615,7 +17639,7 @@ static UIImage *AMRot3DTabIcon(void) {
     // 2. 3D Rotation Gizmo Rings (X=Red, Y=Green, Z=Blue) centered at 3D pivot
     CGPoint pivView = CGPointZero;
     float pivZ = 0.0f;
-    if (![self projectLocal3D:0 y:0 z:0 R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&pivView outZ:&pivZ]) return;
+    if (![self projectLocal3D:0 y:0 z:0 R:R pivotX:piv[0] pivotY:piv[1] camDist:cd offX:pos[0] offY:pos[1] zOffset:zOff aspect:asp snapshot:&snap outView:&pivView outZ:&pivZ]) return;
 
     float ringR = 0.36f * fminf(asp, 1.0f);
     if (ringR < 0.22f) ringR = 0.22f;
@@ -17645,7 +17669,7 @@ static UIImage *AMRot3DTabIcon(void) {
             else { lx = ca; ly = sa; }
             CGPoint vp;
             float wz = 0.0f;
-            if (![self projectLocal3D:lx y:ly z:lz R:R pivotX:piv[0] pivotY:piv[1] camDist:cd zOffset:zOff aspect:asp snapshot:&snap outView:&vp outZ:&wz]) {
+            if (![self projectLocal3D:lx y:ly z:lz R:R pivotX:piv[0] pivotY:piv[1] camDist:cd offX:pos[0] offY:pos[1] zOffset:zOff aspect:asp snapshot:&snap outView:&vp outZ:&wz]) {
                 hasPrev = NO;
                 continue;
             }
@@ -17924,7 +17948,8 @@ static BOOL gAMRot3DHasCopiedKf = NO;
     int _syncTickCounter;
     int64_t _startTimeMs;
     int64_t _endTimeMs;
-    int _activeTab;       // 0=RotX, 1=RotY, 2=RotZ, 3=Pivot, 4=Lens
+    int _activeTab;       // 0=RotX, 1=RotY, 2=RotZ, 3=Pos, 4=Pivot, 5=Lens
+    int _posSubAxis;      // 0=PosX(track6), 1=PosY(track7), 2=PosZ(track8)
     int _pivotSubAxis;    // 0=PivotX(track3), 1=PivotY(track4), 2=PivotZ(track5)
     BOOL _pushingGraph;
 
@@ -17936,7 +17961,7 @@ static BOOL gAMRot3DHasCopiedKf = NO;
     AMCompactKeyframeRailView *_rail;
 
     // Top chips + tools
-    UIButton *_tabBtns[5]; // X, Y, Z, Pivot, Lens
+    UIButton *_tabBtns[6]; // X, Y, Z, Pos, Pivot, Lens
     UIButton *_gizmoBtn;
     UIButton *_resetBtn;
 
@@ -17978,7 +18003,8 @@ static BOOL gAMRot3DHasCopiedKf = NO;
 
 - (int)activeTrackIndex {
     if (_activeTab <= 2) return _activeTab;
-    if (_activeTab == 3) return 3 + _pivotSubAxis;
+    if (_activeTab == 3) return 6 + _posSubAxis;
+    if (_activeTab == 4) return 3 + _pivotSubAxis;
     return 0;
 }
 
@@ -18030,6 +18056,7 @@ static BOOL gAMRot3DHasCopiedKf = NO;
     [super viewDidLoad];
     self.view.backgroundColor = AMBgColor();
     _activeTab = 0;
+    _posSubAxis = 0;
     _pivotSubAxis = 2; // Pivot Z highlighted quickly when opening Pivot tab
     _lastPolledTimeMs = -1;
 
@@ -18232,11 +18259,12 @@ static BOOL gAMRot3DHasCopiedKf = NO;
     content.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:content];
 
-    // Row 1: Axis tabs (X / Y / Z / Pivot / Lens) + Gizmo & Reset buttons
+    // Row 1: Axis tabs (X / Y / Z / Pos / Pivot / Lens) + Gizmo & Reset buttons
     NSMutableArray *tabViews = [NSMutableArray array];
-    NSArray<NSString *> *tabNames = @[@"X", @"Y", @"Z", @"Pivot", @"Lens"];
-    for (int i = 0; i < 5; ++i) {
+    NSArray<NSString *> *tabNames = @[@"X", @"Y", @"Z", @"Pos", @"Pivot", @"Lens"];
+    for (int i = 0; i < 6; ++i) {
         _tabBtns[i] = [self makeSmallPill:tabNames[i] sf:nil tag:i action:@selector(onSelectTab:)];
+        _tabBtns[i].contentEdgeInsets = UIEdgeInsetsMake(4.0, 5.0, 4.0, 5.0);
         [tabViews addObject:_tabBtns[i]];
     }
     UIStackView *tabStack = [[UIStackView alloc] initWithArrangedSubviews:tabViews];
@@ -18561,8 +18589,15 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
     float px = [self evalTrack:3 atMs:tMs];
     float py = [self evalTrack:4 atMs:tMs];
     float pz = [self evalTrack:5 atMs:tMs];
+    float posX = [self evalTrack:6 atMs:tMs];
+    float posY = [self evalTrack:7 atMs:tMs];
+    float posZ = [self evalTrack:8 atMs:tMs];
 
     if (_activeTab == 3) {
+        _padReadout.text = self.isNullLayer
+            ? [NSString stringWithFormat:@"Null(%d) X %.0f Y %.0f Z %.0f", _linkedChildCount, posX, posY, posZ]
+            : [NSString stringWithFormat:@"X %.0f  Y %.0f  Z %.0f", posX, posY, posZ];
+    } else if (_activeTab == 4) {
         _padReadout.text = self.isNullLayer
             ? [NSString stringWithFormat:@"Null(%d) P %.0f%% %.0f%% Z %.0f", _linkedChildCount, px * 100.0f, py * 100.0f, pz]
             : [NSString stringWithFormat:@"P %.0f%%  %.0f%%  Z %.0f", px * 100.0f, py * 100.0f, pz];
@@ -18576,10 +18611,12 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
     float cur = [self evalTrack:tr atMs:tMs];
     if (tr <= 2) {
         [_axisValueBtn setTitle:[NSString stringWithFormat:@"%@: %.1f°  ✎", AMRot3DTrackName(tr), cur] forState:UIControlStateNormal];
-    } else if (tr <= 4) {
+    } else if (tr == 3 || tr == 4) {
         [_axisValueBtn setTitle:[NSString stringWithFormat:@"%@: %.1f%%  ✎", AMRot3DTrackName(tr), cur * 100.0f] forState:UIControlStateNormal];
-    } else {
+    } else if (tr == 5) {
         [_axisValueBtn setTitle:[NSString stringWithFormat:@"Anchor Z: %.1f  ✎", cur] forState:UIControlStateNormal];
+    } else {
+        [_axisValueBtn setTitle:[NSString stringWithFormat:@"%@: %.1f  ✎", AMRot3DTrackName(tr), cur] forState:UIControlStateNormal];
     }
 }
 
@@ -18589,13 +18626,13 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
     int64_t tMs = [self currentTimeMs];
     NSDictionary *ld = [self layerDict];
 
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 6; ++i) {
         BOOL sel = (i == _activeTab);
         UIColor *accent = (i <= 2) ? AMRot3DAxisColor(i) : AMAccentGreenColor();
         _tabBtns[i].backgroundColor = sel ? accent : AMSurfaceColor();
         [_tabBtns[i] setTitleColor:(sel ? [UIColor colorWithRed:0.06 green:0.08 blue:0.12 alpha:1.0] : [UIColor whiteColor])
                           forState:UIControlStateNormal];
-        _tabBtns[i].titleLabel.font = AMThemeFont(10.5, sel ? UIFontWeightBold : UIFontWeightSemibold);
+        _tabBtns[i].titleLabel.font = AMThemeFont(10.0, sel ? UIFontWeightBold : UIFontWeightSemibold);
     }
 
     BOOL showG = (ld[@"showGizmo"] == nil) ? YES : [ld[@"showGizmo"] boolValue];
@@ -18603,21 +18640,36 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
     _gizmoBtn.layer.borderWidth = showG ? 1.0 : 0.0;
     _gizmoBtn.layer.borderColor = AMAccentGreenColor().CGColor;
 
-    BOOL isLens = (_activeTab == 4);
-    BOOL isPivot = (_activeTab == 3);
+    BOOL isLens = (_activeTab == 5);
+    BOOL isPos = (_activeTab == 3);
+    BOOL isPivot = (_activeTab == 4);
     _axisContainer.hidden = isLens;
     _lensContainer.hidden = !isLens;
-    _pivotSeg.hidden = !isPivot;
-    _snapRow.hidden = isPivot;
-    _touchPad.pivotMode = isPivot;
+    _pivotSeg.hidden = !(isPos || isPivot);
+    _snapRow.hidden = (isPos || isPivot);
+    _touchPad.pivotMode = (isPos || isPivot);
 
-    _tickRuler.accentColor = (tr <= 2) ? AMRot3DAxisColor(tr) : AMAccentGreenColor();
-    _tickRuler.sensitivity = (tr <= 2) ? 0.45f : ((tr <= 4) ? 0.0025f : 1.5f);
+    if (isPos) {
+        [_pivotSeg setTitle:@"Pos X" forSegmentAtIndex:0];
+        [_pivotSeg setTitle:@"Pos Y" forSegmentAtIndex:1];
+        [_pivotSeg setTitle:@"Pos Z" forSegmentAtIndex:2];
+        _pivotSeg.selectedSegmentIndex = _posSubAxis;
+    } else if (isPivot) {
+        [_pivotSeg setTitle:@"Anchor X" forSegmentAtIndex:0];
+        [_pivotSeg setTitle:@"Anchor Y" forSegmentAtIndex:1];
+        [_pivotSeg setTitle:@"Anchor Z" forSegmentAtIndex:2];
+        _pivotSeg.selectedSegmentIndex = _pivotSubAxis;
+    }
+
+    _tickRuler.accentColor = (tr <= 2) ? AMRot3DAxisColor(tr) : (isPos ? AMRot3DAxisColor(_posSubAxis) : AMAccentGreenColor());
+    _tickRuler.sensitivity = (tr <= 2) ? 0.45f : ((tr == 3 || tr == 4) ? 0.0025f : 1.5f);
     [_tickRuler setNeedsDisplay];
 
-    _padHint.text = isPivot
-        ? @"1 finger: Anchor X/Y\n2 fingers: Anchor Z"
-        : @"1 finger: Pitch X / Yaw Y\n2 fingers: Roll Z";
+    _padHint.text = isPos
+        ? @"1 finger: Move X / Y\n2 fingers: Depth Z"
+        : (isPivot
+           ? @"1 finger: Anchor X/Y\n2 fingers: Anchor Z"
+           : @"1 finger: Pitch X / Yaw Y\n2 fingers: Roll Z");
 
     _fovLbl.text = [NSString stringWithFormat:@"AE Lens: %.0fmm (%.0f°)%@", AMRot3DFocalLengthMM(_fovSlider.value), _fovSlider.value, gAMRot3DHasActiveCamera ? @" · Cam" : @""];
     _zDepthLbl.text = [NSString stringWithFormat:@"Depth Z: %.0f", _zDepthSlider.value];
@@ -18658,6 +18710,20 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
     int64_t tMs = [self currentTimeMs];
     if (_activeTab == 3) {
         if (twoZ) {
+            float pz = [self evalTrack:8 atMs:tMs] - dy * 1.6f;
+            pz = fminf(fmaxf(pz, -1500.0f), 1500.0f);
+            [self setTrack:8 value:pz ended:ended];
+        } else {
+            float posX = fminf(fmaxf([self evalTrack:6 atMs:tMs] + dx * 1.5f, -1500.0f), 1500.0f);
+            float posY = fminf(fmaxf([self evalTrack:7 atMs:tMs] - dy * 1.5f, -1500.0f), 1500.0f);
+            int trs[2] = { 6, 7 };
+            float vals[2] = { posX, posY };
+            [self setTracks:trs values:vals count:2 ended:ended];
+        }
+        return;
+    }
+    if (_activeTab == 4) {
+        if (twoZ) {
             float pz = [self evalTrack:5 atMs:tMs] - dy * 1.6f;
             pz = fminf(fmaxf(pz, -500.0f), 500.0f);
             [self setTrack:5 value:pz ended:ended];
@@ -18688,7 +18754,8 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
     float cur = [self evalTrack:tr atMs:[self currentTimeMs]];
     float next = cur + delta;
     if (tr == 3 || tr == 4) next = fminf(fmaxf(next, -0.5f), 1.5f);
-    if (tr == 5) next = fminf(fmaxf(next, -500.0f), 500.0f);
+    else if (tr == 5) next = fminf(fmaxf(next, -500.0f), 500.0f);
+    else if (tr >= 6 && tr <= 8) next = fminf(fmaxf(next, -1500.0f), 1500.0f);
     [self setTrack:tr value:next ended:ended];
 }
 
@@ -18727,7 +18794,8 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
 }
 
 - (void)onPivotAxisChanged:(UISegmentedControl *)seg {
-    _pivotSubAxis = (int)seg.selectedSegmentIndex;
+    if (_activeTab == 3) _posSubAxis = (int)seg.selectedSegmentIndex;
+    else _pivotSubAxis = (int)seg.selectedSegmentIndex;
     [self refreshControls];
     AMPuppetRedrawAllKeyframeViews();
 }
@@ -18742,7 +18810,7 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
 }
 
 - (void)onResetActive {
-    if (_activeTab == 4) {
+    if (_activeTab == 5) {
         NSMutableDictionary *ld = [self layerDict];
         ld[@"fov"] = @(kAMRot3DDefaultFov); ld[@"zOffset"] = @(0.0); ld[@"bend"] = @(0.0);
         ld[@"lighting"] = @(0.0); ld[@"backfaceMode"] = @(0);
@@ -18786,6 +18854,7 @@ static void AMRot3DFastUpdateTracksInRuntime(int slot, const int *tracks, const 
         if (!isfinite(v)) return;
         if (tr == 3 || tr == 4) v = fminf(fmaxf(v / 100.0f, -0.5f), 1.5f);
         else if (tr == 5) v = fminf(fmaxf(v, -500.0f), 500.0f);
+        else if (tr >= 6 && tr <= 8) v = fminf(fmaxf(v, -1500.0f), 1500.0f);
         [weakSelf setTrack:tr value:v ended:YES];
     }]];
     [self presentViewController:ac animated:YES completion:nil];
@@ -19951,6 +20020,7 @@ static void AMFetchYouTubePlayerJSON(NSString *videoID,
 
 static void AMResolveAndDownloadYouTube(NSString *videoID,
                                         BOOL audioOnly,
+                                        NSInteger qualityMode,
                                         NSInteger clientTier,
                                         void (^statusBlock)(NSString *status, float progress),
                                         void (^completion)(NSURL * _Nullable localURL, NSString * _Nullable title, NSError * _Nullable err)) {
@@ -19961,7 +20031,7 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
     AMFetchYouTubePlayerJSON(videoID, clientTier, ^(NSDictionary * _Nullable json, NSString *ua, NSError * _Nullable err) {
         if (err || !json) {
             if (clientTier < 2) {
-                AMResolveAndDownloadYouTube(videoID, audioOnly, clientTier + 1, statusBlock, completion);
+                AMResolveAndDownloadYouTube(videoID, audioOnly, qualityMode, clientTier + 1, statusBlock, completion);
             } else {
                 completion(nil, nil, err);
             }
@@ -19991,33 +20061,56 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
             }
         }
 
+        NSInteger maxHeight = (qualityMode == 2) ? 360 : ((qualityMode == 1) ? 480 : 1080);
+
         NSString *bestAdaptiveVideoURL = nil;
         NSInteger bestAdaptiveHeight = -1;
+        NSString *lowestAdaptiveURL = nil;
+        NSInteger lowestAdaptiveHeight = NSIntegerMax;
         for (id item in adaptive) {
             if (![item isKindOfClass:[NSDictionary class]]) continue;
             NSString *u = [item[@"url"] isKindOfClass:[NSString class]] ? item[@"url"] : nil;
             NSString *mime = [item[@"mimeType"] isKindOfClass:[NSString class]] ? item[@"mimeType"] : @"";
             if (!u.length || ![mime containsString:@"video/mp4"] || ![mime containsString:@"avc1"]) continue;
             NSInteger h = [item[@"height"] respondsToSelector:@selector(integerValue)] ? [item[@"height"] integerValue] : 0;
-            if (h > 1080) continue;
+            if (h > 0 && h < lowestAdaptiveHeight) {
+                lowestAdaptiveHeight = h;
+                lowestAdaptiveURL = u;
+            }
+            if (h > maxHeight) continue;
             if (h > bestAdaptiveHeight) {
                 bestAdaptiveHeight = h;
                 bestAdaptiveVideoURL = u;
             }
         }
+        if (!bestAdaptiveVideoURL && lowestAdaptiveURL) {
+            bestAdaptiveVideoURL = lowestAdaptiveURL;
+            bestAdaptiveHeight = lowestAdaptiveHeight;
+        }
 
         NSString *bestProgURL = nil;
         NSInteger bestProgHeight = -1;
+        NSString *lowestProgURL = nil;
+        NSInteger lowestProgHeight = NSIntegerMax;
         for (id item in formats) {
             if (![item isKindOfClass:[NSDictionary class]]) continue;
             NSString *u = [item[@"url"] isKindOfClass:[NSString class]] ? item[@"url"] : nil;
             NSString *mime = [item[@"mimeType"] isKindOfClass:[NSString class]] ? item[@"mimeType"] : @"";
             if (!u.length || ![mime containsString:@"video/mp4"]) continue;
             NSInteger h = [item[@"height"] respondsToSelector:@selector(integerValue)] ? [item[@"height"] integerValue] : 0;
+            if (h > 0 && h < lowestProgHeight) {
+                lowestProgHeight = h;
+                lowestProgURL = u;
+            }
+            if (h > maxHeight) continue;
             if (h > bestProgHeight) {
                 bestProgHeight = h;
                 bestProgURL = u;
             }
+        }
+        if (!bestProgURL && lowestProgURL) {
+            bestProgURL = lowestProgURL;
+            bestProgHeight = lowestProgHeight;
         }
 
         NSURL *mediaDir = AMRockMotionMediaDirectoryURL();
@@ -20031,7 +20124,7 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
                     if (outURL && !hlsErr) {
                         completion(outURL, title, nil);
                     } else if (clientTier < 2) {
-                        AMResolveAndDownloadYouTube(videoID, audioOnly, clientTier + 1, statusBlock, completion);
+                        AMResolveAndDownloadYouTube(videoID, audioOnly, qualityMode, clientTier + 1, statusBlock, completion);
                     } else {
                         completion(nil, nil, hlsErr ?: prevErr);
                     }
@@ -20039,7 +20132,7 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
                 return;
             }
             if (clientTier < 2) {
-                AMResolveAndDownloadYouTube(videoID, audioOnly, clientTier + 1, statusBlock, completion);
+                AMResolveAndDownloadYouTube(videoID, audioOnly, qualityMode, clientTier + 1, statusBlock, completion);
                 return;
             }
             NSString *reason = [playStatus[@"reason"] isKindOfClass:[NSString class]] ? playStatus[@"reason"] : nil;
@@ -20092,6 +20185,19 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
                 return;
             }
             tryNextTierOrHLS(nil);
+            return;
+        }
+
+        if (qualityMode == 2 && bestProgURL.length) {
+            if (statusBlock) statusBlock([NSString stringWithFormat:@"Downloading %ldp video...", (long)(bestProgHeight > 0 ? bestProgHeight : 360)], 0.50f);
+            NSURL *dest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@.mp4", uid]];
+            AMDownloadURLToLocalFile([NSURL URLWithString:bestProgURL], ua, nil, dest, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
+                if (localURL && !dlErr) {
+                    completion(localURL, title, nil);
+                } else {
+                    tryNextTierOrHLS(dlErr);
+                }
+            });
             return;
         }
 
@@ -20163,6 +20269,7 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
 
 static void AMResolveAndDownloadTikTok(NSString *urlString,
                                        BOOL audioOnly,
+                                       NSInteger qualityMode,
                                        void (^statusBlock)(NSString *status, float progress),
                                        void (^completion)(NSURL * _Nullable localURL, NSString * _Nullable title, NSError * _Nullable err)) {
     if (statusBlock) statusBlock(@"Resolving TikTok link...", 0.20f);
@@ -20207,9 +20314,19 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
         NSString *hd = normURL(d[@"hdplay"]);
         NSString *pl = normURL(d[@"play"]);
         NSString *wm = normURL(d[@"wmplay"]);
-        if (hd) [videoUrls addObject:hd];
-        if (pl) [videoUrls addObject:pl];
-        if (wm) [videoUrls addObject:wm];
+        if (qualityMode == 2) {
+            if (wm) [videoUrls addObject:wm];
+            if (pl) [videoUrls addObject:pl];
+            if (hd) [videoUrls addObject:hd];
+        } else if (qualityMode == 1) {
+            if (pl) [videoUrls addObject:pl];
+            if (hd) [videoUrls addObject:hd];
+            if (wm) [videoUrls addObject:wm];
+        } else {
+            if (hd) [videoUrls addObject:hd];
+            if (pl) [videoUrls addObject:pl];
+            if (wm) [videoUrls addObject:wm];
+        }
 
         NSURL *mediaDir = AMRockMotionMediaDirectoryURL();
         NSString *uid = [NSUUID UUID].UUIDString;
@@ -20257,7 +20374,8 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
             completion(nil, nil, [NSError errorWithDomain:@"AMLinkMedia" code:33 userInfo:@{NSLocalizedDescriptionKey: @"No downloadable TikTok stream found."}]);
             return;
         }
-        if (statusBlock) statusBlock(@"Downloading TikTok HD video...", 0.55f);
+        NSString *qLabel = (qualityMode == 2) ? @"Low" : ((qualityMode == 1) ? @"Medium" : @"HD");
+        if (statusBlock) statusBlock([NSString stringWithFormat:@"Downloading TikTok %@ video...", qLabel], 0.55f);
         NSURL *dest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"tt_%@.mp4", uid]];
         AMDownloadFirstWorkingURL(videoUrls, 0, ua, @"https://www.tikwm.com/", dest, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
             if (localURL && !dlErr) {
@@ -20277,6 +20395,7 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
 @interface AMLinkMediaImportVC : UIViewController <UITextFieldDelegate>
 @property (nonatomic, weak) UIViewController *libraryPanelVC;
 @property (nonatomic, strong) UISegmentedControl *modeControl;
+@property (nonatomic, strong) UISegmentedControl *qualityControl;
 @property (nonatomic, strong) UITextField *urlField;
 @property (nonatomic, strong) UIButton *importButton;
 @property (nonatomic, strong) UIButton *pasteButton;
@@ -20342,7 +20461,23 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
     [self.modeControl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithRed:0.06 green:0.08 blue:0.11 alpha:1.0],
                                                NSFontAttributeName: [UIFont systemFontOfSize:13.0 weight:UIFontWeightBold]}
                                     forState:UIControlStateSelected];
+    [self.modeControl addTarget:self action:@selector(onModeChanged:) forControlEvents:UIControlEventValueChanged];
     [card addSubview:self.modeControl];
+
+    self.qualityControl = [[UISegmentedControl alloc] initWithItems:@[@"High", @"Medium", @"Low"]];
+    self.qualityControl.translatesAutoresizingMaskIntoConstraints = NO;
+    self.qualityControl.selectedSegmentIndex = 0;
+    self.qualityControl.backgroundColor = [UIColor colorWithRed:0.15 green:0.165 blue:0.22 alpha:1.0];
+    if (@available(iOS 13.0, *)) {
+        self.qualityControl.selectedSegmentTintColor = AMNativeMintColor();
+    }
+    [self.qualityControl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:0.85 alpha:1.0],
+                                                  NSFontAttributeName: [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold]}
+                                       forState:UIControlStateNormal];
+    [self.qualityControl setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor colorWithRed:0.06 green:0.08 blue:0.11 alpha:1.0],
+                                                  NSFontAttributeName: [UIFont systemFontOfSize:12.5 weight:UIFontWeightBold]}
+                                       forState:UIControlStateSelected];
+    [card addSubview:self.qualityControl];
 
     UIView *inputRow = [[UIView alloc] init];
     inputRow.translatesAutoresizingMaskIntoConstraints = NO;
@@ -20426,7 +20561,12 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
         [self.modeControl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16.0],
         [self.modeControl.heightAnchor constraintEqualToConstant:34.0],
 
-        [inputRow.topAnchor constraintEqualToAnchor:self.modeControl.bottomAnchor constant:12.0],
+        [self.qualityControl.topAnchor constraintEqualToAnchor:self.modeControl.bottomAnchor constant:10.0],
+        [self.qualityControl.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16.0],
+        [self.qualityControl.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16.0],
+        [self.qualityControl.heightAnchor constraintEqualToConstant:30.0],
+
+        [inputRow.topAnchor constraintEqualToAnchor:self.qualityControl.bottomAnchor constant:12.0],
         [inputRow.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16.0],
         [inputRow.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16.0],
         [inputRow.heightAnchor constraintEqualToConstant:44.0],
@@ -20462,6 +20602,12 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
     }
 }
 
+- (void)onModeChanged:(UISegmentedControl *)seg {
+    BOOL isVideo = (seg.selectedSegmentIndex == 0);
+    self.qualityControl.enabled = isVideo && !self.isBusy;
+    self.qualityControl.alpha = isVideo ? 1.0 : 0.45;
+}
+
 - (void)onTapPaste {
     NSString *clip = [UIPasteboard generalPasteboard].string;
     if (clip.length) {
@@ -20486,6 +20632,7 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
         self.importButton.alpha = busy ? 0.55 : 1.0;
         self.urlField.enabled = !busy;
         self.modeControl.enabled = !busy;
+        self.qualityControl.enabled = !busy && (self.modeControl.selectedSegmentIndex == 0);
         self.pasteButton.enabled = !busy;
         self.progressView.hidden = !busy;
         if (busy) [self.progressView setProgress:progress animated:YES];
@@ -20513,6 +20660,7 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
     }
 
     BOOL audioOnly = (self.modeControl.selectedSegmentIndex == 1);
+    NSInteger qualityMode = self.qualityControl.selectedSegmentIndex;
     __weak AMLinkMediaImportVC *weakSelf = self;
 
     void (^statusCb)(NSString *, float) = ^(NSString *st, float p) {
@@ -20557,9 +20705,9 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
     };
 
     if (ytID) {
-        AMResolveAndDownloadYouTube(ytID, audioOnly, 0, statusCb, doneCb);
+        AMResolveAndDownloadYouTube(ytID, audioOnly, qualityMode, 0, statusCb, doneCb);
     } else {
-        AMResolveAndDownloadTikTok(raw, audioOnly, statusCb, doneCb);
+        AMResolveAndDownloadTikTok(raw, audioOnly, qualityMode, statusCb, doneCb);
     }
 }
 
@@ -21727,7 +21875,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-12";
+                static NSString *const kAMModBuildVersion = @"2026.11.27-13";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
