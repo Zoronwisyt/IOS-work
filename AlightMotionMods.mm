@@ -18997,8 +18997,28 @@ static BOOL AMIsTikTokURLString(NSString *urlString) {
     return [low containsString:@"tiktok.com/"] || [low containsString:@"vm.tiktok.com"] || [low containsString:@"vt.tiktok.com"];
 }
 
+static NSURLSession *AMLinkMediaURLSession(void) {
+    static NSURLSession *sSession = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        cfg.HTTPShouldSetCookies = NO;
+        cfg.HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyNever;
+        cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+        cfg.timeoutIntervalForRequest = 30.0;
+        cfg.timeoutIntervalForResource = 180.0;
+        cfg.HTTPAdditionalHeaders = @{
+            @"Accept": @"*/*",
+            @"Accept-Encoding": @"identity",
+        };
+        sSession = [NSURLSession sessionWithConfiguration:cfg];
+    });
+    return sSession;
+}
+
 static void AMDownloadURLToLocalFile(NSURL *remoteURL,
                                      NSString *userAgent,
+                                     NSString * _Nullable referer,
                                      NSURL *destURL,
                                      void (^progressBlock)(float p),
                                      void (^completion)(NSURL * _Nullable localURL, NSError * _Nullable err)) {
@@ -19012,13 +19032,20 @@ static void AMDownloadURLToLocalFile(NSURL *remoteURL,
     if (userAgent.length) {
         [req setValue:userAgent forHTTPHeaderField:@"User-Agent"];
     }
-    NSURLSessionDownloadTask *task = [[NSURLSession sharedSession] downloadTaskWithRequest:req
+    if (referer.length) {
+        [req setValue:referer forHTTPHeaderField:@"Referer"];
+    }
+    [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+    [req setValue:@"identity" forHTTPHeaderField:@"Accept-Encoding"];
+
+    NSURLSessionDownloadTask *task = [AMLinkMediaURLSession() downloadTaskWithRequest:req
         completionHandler:^(NSURL * _Nullable location, NSURLResponse * _Nullable response, NSError * _Nullable error) {
             NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
             if (error || !location || (http && (http.statusCode < 200 || http.statusCode >= 300))) {
+                NSString *host = remoteURL.host ?: @"host";
                 NSError *e = error ?: [NSError errorWithDomain:@"AMLinkMedia"
                                                           code:(http ? http.statusCode : 2)
-                                                      userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Download failed (HTTP %ld).", (long)(http ? http.statusCode : 0)]}];
+                                                      userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Download failed (HTTP %ld from %@).", (long)(http ? http.statusCode : 0), host]}];
                 completion(nil, e);
                 return;
             }
@@ -19033,6 +19060,65 @@ static void AMDownloadURLToLocalFile(NSURL *remoteURL,
             completion(destURL, nil);
         }];
     [task resume];
+}
+
+static void AMDownloadFirstWorkingURL(NSArray<NSString *> *urlStrings,
+                                      NSUInteger idx,
+                                      NSString *userAgent,
+                                      NSString * _Nullable referer,
+                                      NSURL *destURL,
+                                      NSError * _Nullable lastErr,
+                                      void (^completion)(NSURL * _Nullable localURL, NSError * _Nullable err)) {
+    if (idx >= urlStrings.count) {
+        completion(nil, lastErr ?: [NSError errorWithDomain:@"AMLinkMedia" code:4 userInfo:@{NSLocalizedDescriptionKey: @"All download mirrors failed."}]);
+        return;
+    }
+    NSString *s = urlStrings[idx];
+    NSURL *u = s.length ? [NSURL URLWithString:s] : nil;
+    if (!u) {
+        AMDownloadFirstWorkingURL(urlStrings, idx + 1, userAgent, referer, destURL, lastErr, completion);
+        return;
+    }
+    AMDownloadURLToLocalFile(u, userAgent, referer, destURL, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable err) {
+        if (localURL && !err) {
+            completion(localURL, nil);
+        } else {
+            AMDownloadFirstWorkingURL(urlStrings, idx + 1, userAgent, referer, destURL, err, completion);
+        }
+    });
+}
+
+static void AMExportRemoteOrLocalMedia(NSURL *sourceURL,
+                                       NSString * _Nullable userAgent,
+                                       BOOL audioOnly,
+                                       NSURL *outputURL,
+                                       void (^completion)(NSURL * _Nullable outURL, NSError * _Nullable err)) {
+    if (!sourceURL || !outputURL) {
+        completion(nil, [NSError errorWithDomain:@"AMLinkMedia" code:12 userInfo:@{NSLocalizedDescriptionKey: @"Invalid export source."}]);
+        return;
+    }
+    NSDictionary *opts = nil;
+    if (!sourceURL.isFileURL && userAgent.length) {
+        opts = @{@"AVURLAssetHTTPHeaderFieldsKey": @{@"User-Agent": userAgent}};
+    }
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:sourceURL options:opts];
+    [[NSFileManager defaultManager] removeItemAtURL:outputURL error:nil];
+    NSString *preset = audioOnly ? AVAssetExportPresetAppleM4A : AVAssetExportPresetHighestQuality;
+    AVAssetExportSession *exporter = [[AVAssetExportSession alloc] initWithAsset:asset presetName:preset];
+    if (!exporter) {
+        completion(nil, [NSError errorWithDomain:@"AMLinkMedia" code:13 userInfo:@{NSLocalizedDescriptionKey: @"Could not create AVAssetExportSession."}]);
+        return;
+    }
+    exporter.outputURL = outputURL;
+    exporter.outputFileType = audioOnly ? AVFileTypeAppleM4A : AVFileTypeMPEG4;
+    exporter.shouldOptimizeForNetworkUse = YES;
+    [exporter exportAsynchronouslyWithCompletionHandler:^{
+        if (exporter.status == AVAssetExportSessionStatusCompleted) {
+            completion(outputURL, nil);
+        } else {
+            completion(nil, exporter.error ?: [NSError errorWithDomain:@"AMLinkMedia" code:14 userInfo:@{NSLocalizedDescriptionKey: @"Failed to export stream."}]);
+        }
+    }];
 }
 
 static void AMMuxVideoAndAudioFiles(NSURL *videoURL,
@@ -19092,6 +19178,9 @@ static void AMFetchYouTubePlayerJSON(NSString *videoID,
         ? @"com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)"
         : @"com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
     [req setValue:ua forHTTPHeaderField:@"User-Agent"];
+    [req setValue:(useIOSFallback ? @"5" : @"28") forHTTPHeaderField:@"X-YouTube-Client-Name"];
+    [req setValue:(useIOSFallback ? @"20.10.4" : @"1.60.19") forHTTPHeaderField:@"X-YouTube-Client-Version"];
+    [req setValue:@"https://www.youtube.com" forHTTPHeaderField:@"Origin"];
 
     NSDictionary *clientDict = useIOSFallback
         ? @{@"clientName": @"IOS",
@@ -19115,7 +19204,7 @@ static void AMFetchYouTubePlayerJSON(NSString *videoID,
     NSDictionary *payload = @{@"context": @{@"client": clientDict}, @"videoId": videoID};
     req.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
 
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+    [[AMLinkMediaURLSession() dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         (void)resp;
         if (err || !data) {
             completion(nil, ua, err ?: [NSError errorWithDomain:@"AMLinkMedia" code:20 userInfo:@{NSLocalizedDescriptionKey: @"Network error contacting YouTube."}]);
@@ -19153,6 +19242,7 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
 
         NSArray *formats = [streamData[@"formats"] isKindOfClass:[NSArray class]] ? streamData[@"formats"] : @[];
         NSArray *adaptive = [streamData[@"adaptiveFormats"] isKindOfClass:[NSArray class]] ? streamData[@"adaptiveFormats"] : @[];
+        NSString *hlsURLStr = [streamData[@"hlsManifestUrl"] isKindOfClass:[NSString class]] ? streamData[@"hlsManifestUrl"] : nil;
 
         NSString *bestAudioURL = nil;
         NSInteger bestAudioBitrate = -1;
@@ -19160,7 +19250,7 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
             if (![item isKindOfClass:[NSDictionary class]]) continue;
             NSString *u = [item[@"url"] isKindOfClass:[NSString class]] ? item[@"url"] : nil;
             NSString *mime = [item[@"mimeType"] isKindOfClass:[NSString class]] ? item[@"mimeType"] : @"";
-            if (!u.length || ![mime containsString:@"audio/mp4"]) continue;
+            if (!u.length || ![mime containsString:@"audio/mp4"] || ![mime containsString:@"mp4a"]) continue;
             NSInteger br = [item[@"bitrate"] respondsToSelector:@selector(integerValue)] ? [item[@"bitrate"] integerValue] : 0;
             if (br > bestAudioBitrate) {
                 bestAudioBitrate = br;
@@ -19200,21 +19290,40 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
         NSURL *mediaDir = AMRockMotionMediaDirectoryURL();
         NSString *uid = [NSUUID UUID].UUIDString;
 
+        void (^tryFallbackOrHLS)(NSError * _Nullable) = ^(NSError * _Nullable prevErr) {
+            if (!isFallback) {
+                AMResolveAndDownloadYouTube(videoID, audioOnly, YES, statusBlock, completion);
+                return;
+            }
+            if (hlsURLStr.length) {
+                if (statusBlock) statusBlock(audioOnly ? @"Exporting YouTube HLS audio..." : @"Exporting YouTube HLS video...", 0.60f);
+                NSURL *hlsDest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"yt_hls_%@.%@", uid, audioOnly ? @"m4a" : @"mp4"]];
+                AMExportRemoteOrLocalMedia([NSURL URLWithString:hlsURLStr], ua, audioOnly, hlsDest, ^(NSURL * _Nullable outURL, NSError * _Nullable hlsErr) {
+                    completion(outURL, title, hlsErr);
+                });
+                return;
+            }
+            NSString *reason = [playStatus[@"reason"] isKindOfClass:[NSString class]] ? playStatus[@"reason"] : nil;
+            NSError *finalErr = prevErr ?: [NSError errorWithDomain:@"AMLinkMedia" code:23 userInfo:@{NSLocalizedDescriptionKey: (reason ?: @"No downloadable YouTube stream found.")}];
+            completion(nil, nil, finalErr);
+        };
+
         if (audioOnly) {
-            NSString *dl = bestAudioURL ?: bestProgURL;
-            if (!dl.length) {
-                if (!isFallback) {
-                    AMResolveAndDownloadYouTube(videoID, audioOnly, YES, statusBlock, completion);
-                } else {
-                    NSString *reason = [playStatus[@"reason"] isKindOfClass:[NSString class]] ? playStatus[@"reason"] : @"No direct audio stream available.";
-                    completion(nil, nil, [NSError errorWithDomain:@"AMLinkMedia" code:22 userInfo:@{NSLocalizedDescriptionKey: reason}]);
-                }
+            NSMutableArray<NSString *> *audioCandidates = [NSMutableArray array];
+            if (bestAudioURL.length) [audioCandidates addObject:bestAudioURL];
+            if (bestProgURL.length) [audioCandidates addObject:bestProgURL];
+            if (!audioCandidates.count) {
+                tryFallbackOrHLS(nil);
                 return;
             }
             if (statusBlock) statusBlock(@"Downloading YouTube audio...", 0.45f);
             NSURL *dest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@.m4a", uid]];
-            AMDownloadURLToLocalFile([NSURL URLWithString:dl], ua, dest, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
-                completion(localURL, title, dlErr);
+            AMDownloadFirstWorkingURL(audioCandidates, 0, ua, nil, dest, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
+                if (localURL && !dlErr) {
+                    completion(localURL, title, nil);
+                } else {
+                    tryFallbackOrHLS(dlErr);
+                }
             });
             return;
         }
@@ -19224,20 +19333,24 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
             NSURL *tmpV = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"yt_v_%@.mp4", uid]]];
             NSURL *tmpA = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"yt_a_%@.m4a", uid]]];
             NSURL *dest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@.mp4", uid]];
-            AMDownloadURLToLocalFile([NSURL URLWithString:bestAdaptiveVideoURL], ua, tmpV, nil, ^(NSURL * _Nullable vLocal, NSError * _Nullable vErr) {
+            AMDownloadURLToLocalFile([NSURL URLWithString:bestAdaptiveVideoURL], ua, nil, tmpV, nil, ^(NSURL * _Nullable vLocal, NSError * _Nullable vErr) {
                 if (vErr || !vLocal) {
                     if (bestProgURL.length) {
                         if (statusBlock) statusBlock(@"Downloading MP4 fallback...", 0.55f);
-                        AMDownloadURLToLocalFile([NSURL URLWithString:bestProgURL], ua, dest, nil, ^(NSURL * _Nullable pLocal, NSError * _Nullable pErr) {
-                            completion(pLocal, title, pErr);
+                        AMDownloadURLToLocalFile([NSURL URLWithString:bestProgURL], ua, nil, dest, nil, ^(NSURL * _Nullable pLocal, NSError * _Nullable pErr) {
+                            if (pLocal && !pErr) {
+                                completion(pLocal, title, nil);
+                            } else {
+                                tryFallbackOrHLS(pErr ?: vErr);
+                            }
                         });
                     } else {
-                        completion(nil, nil, vErr);
+                        tryFallbackOrHLS(vErr);
                     }
                     return;
                 }
                 if (statusBlock) statusBlock(@"Downloading audio track...", 0.65f);
-                AMDownloadURLToLocalFile([NSURL URLWithString:bestAudioURL], ua, tmpA, nil, ^(NSURL * _Nullable aLocal, NSError * _Nullable aErr) {
+                AMDownloadURLToLocalFile([NSURL URLWithString:bestAudioURL], ua, nil, tmpA, nil, ^(NSURL * _Nullable aLocal, NSError * _Nullable aErr) {
                     if (aErr || !aLocal) {
                         [[NSFileManager defaultManager] removeItemAtURL:dest error:nil];
                         [[NSFileManager defaultManager] moveItemAtURL:vLocal toURL:dest error:nil];
@@ -19251,11 +19364,12 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
                         if (muxedURL && !mErr) {
                             completion(muxedURL, title, nil);
                         } else if (bestProgURL.length) {
-                            AMDownloadURLToLocalFile([NSURL URLWithString:bestProgURL], ua, dest, nil, ^(NSURL * _Nullable pLocal, NSError * _Nullable pErr) {
-                                completion(pLocal, title, pErr);
+                            AMDownloadURLToLocalFile([NSURL URLWithString:bestProgURL], ua, nil, dest, nil, ^(NSURL * _Nullable pLocal, NSError * _Nullable pErr) {
+                                if (pLocal && !pErr) completion(pLocal, title, nil);
+                                else tryFallbackOrHLS(pErr ?: mErr);
                             });
                         } else {
-                            completion(nil, nil, mErr);
+                            tryFallbackOrHLS(mErr);
                         }
                     });
                 });
@@ -19266,18 +19380,17 @@ static void AMResolveAndDownloadYouTube(NSString *videoID,
         if (bestProgURL.length) {
             if (statusBlock) statusBlock(@"Downloading YouTube video...", 0.50f);
             NSURL *dest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"yt_%@.mp4", uid]];
-            AMDownloadURLToLocalFile([NSURL URLWithString:bestProgURL], ua, dest, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
-                completion(localURL, title, dlErr);
+            AMDownloadURLToLocalFile([NSURL URLWithString:bestProgURL], ua, nil, dest, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
+                if (localURL && !dlErr) {
+                    completion(localURL, title, nil);
+                } else {
+                    tryFallbackOrHLS(dlErr);
+                }
             });
             return;
         }
 
-        if (!isFallback) {
-            AMResolveAndDownloadYouTube(videoID, audioOnly, YES, statusBlock, completion);
-        } else {
-            NSString *reason = [playStatus[@"reason"] isKindOfClass:[NSString class]] ? playStatus[@"reason"] : @"No direct video stream available.";
-            completion(nil, nil, [NSError errorWithDomain:@"AMLinkMedia" code:23 userInfo:@{NSLocalizedDescriptionKey: reason}]);
-        }
+        tryFallbackOrHLS(nil);
     });
 }
 
@@ -19294,8 +19407,9 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
                                                    timeoutInterval:20.0];
     NSString *ua = @"Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1";
     [req setValue:ua forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"https://www.tikwm.com/" forHTTPHeaderField:@"Referer"];
 
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+    [[AMLinkMediaURLSession() dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         (void)resp;
         if (err || !data) {
             completion(nil, nil, err ?: [NSError errorWithDomain:@"AMLinkMedia" code:30 userInfo:@{NSLocalizedDescriptionKey: @"Network error contacting TikTok resolver."}]);
@@ -19314,31 +19428,79 @@ static void AMResolveAndDownloadTikTok(NSString *urlString,
             return;
         }
         NSString *title = AMSanitizeMediaFilenameTitle([d[@"title"] isKindOfClass:[NSString class]] ? d[@"title"] : nil, @"TikTok");
-        NSString *mediaStr = nil;
-        NSString *ext = audioOnly ? @"mp3" : @"mp4";
+        NSString *(^normURL)(id) = ^NSString *(id val) {
+            if (![val isKindOfClass:[NSString class]]) return nil;
+            NSString *s = (NSString *)val;
+            if (!s.length) return nil;
+            if ([s hasPrefix:@"/"]) return [@"https://www.tikwm.com" stringByAppendingString:s];
+            return s;
+        };
+
+        NSMutableArray<NSString *> *videoUrls = [NSMutableArray array];
+        NSString *hd = normURL(d[@"hdplay"]);
+        NSString *pl = normURL(d[@"play"]);
+        NSString *wm = normURL(d[@"wmplay"]);
+        if (hd) [videoUrls addObject:hd];
+        if (pl) [videoUrls addObject:pl];
+        if (wm) [videoUrls addObject:wm];
+
+        NSURL *mediaDir = AMRockMotionMediaDirectoryURL();
+        NSString *uid = [NSUUID UUID].UUIDString;
+
         if (audioOnly) {
-            NSString *m1 = [d[@"music"] isKindOfClass:[NSString class]] ? d[@"music"] : nil;
+            NSMutableArray<NSString *> *audioUrls = [NSMutableArray array];
+            NSString *m1 = normURL(d[@"music"]);
             NSDictionary *mi = [d[@"music_info"] isKindOfClass:[NSDictionary class]] ? d[@"music_info"] : nil;
-            NSString *m2 = [mi[@"play"] isKindOfClass:[NSString class]] ? mi[@"play"] : nil;
-            mediaStr = m1.length ? m1 : m2;
+            NSString *m2 = normURL(mi[@"play"]);
+            if (m1) [audioUrls addObject:m1];
+            if (m2) [audioUrls addObject:m2];
             NSString *mt = [mi[@"title"] isKindOfClass:[NSString class]] ? mi[@"title"] : nil;
             if (mt.length) title = AMSanitizeMediaFilenameTitle(mt, title);
-        } else {
-            NSString *v1 = [d[@"hdplay"] isKindOfClass:[NSString class]] ? d[@"hdplay"] : nil;
-            NSString *v2 = [d[@"play"] isKindOfClass:[NSString class]] ? d[@"play"] : nil;
-            mediaStr = v1.length ? v1 : v2;
+
+            if (statusBlock) statusBlock(@"Downloading TikTok audio...", 0.55f);
+            NSURL *destMp3 = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"tt_%@.mp3", uid]];
+            AMDownloadFirstWorkingURL(audioUrls, 0, ua, @"https://www.tikwm.com/", destMp3, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
+                if (localURL && !dlErr) {
+                    completion(localURL, title, nil);
+                    return;
+                }
+                // Fallback: download video and extract M4A audio natively on-device
+                if (!videoUrls.count) {
+                    completion(nil, nil, dlErr);
+                    return;
+                }
+                if (statusBlock) statusBlock(@"Extracting audio from TikTok video...", 0.70f);
+                NSURL *tmpVid = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"tt_v_%@.mp4", uid]]];
+                NSURL *destM4a = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"tt_%@.m4a", uid]];
+                AMDownloadFirstWorkingURL(videoUrls, 0, ua, @"https://www.tikwm.com/", tmpVid, dlErr, ^(NSURL * _Nullable vLocal, NSError * _Nullable vErr) {
+                    if (vErr || !vLocal) {
+                        completion(nil, nil, vErr ?: dlErr);
+                        return;
+                    }
+                    AMExportRemoteOrLocalMedia(vLocal, nil, YES, destM4a, ^(NSURL * _Nullable outURL, NSError * _Nullable expErr) {
+                        [[NSFileManager defaultManager] removeItemAtURL:tmpVid error:nil];
+                        completion(outURL, title, expErr);
+                    });
+                });
+            });
+            return;
         }
-        if (!mediaStr.length) {
+
+        if (!videoUrls.count) {
             completion(nil, nil, [NSError errorWithDomain:@"AMLinkMedia" code:33 userInfo:@{NSLocalizedDescriptionKey: @"No downloadable TikTok stream found."}]);
             return;
         }
-        if ([mediaStr hasPrefix:@"/"]) {
-            mediaStr = [@"https://www.tikwm.com" stringByAppendingString:mediaStr];
-        }
-        if (statusBlock) statusBlock(audioOnly ? @"Downloading TikTok audio..." : @"Downloading TikTok HD video...", 0.55f);
-        NSURL *dest = [AMRockMotionMediaDirectoryURL() URLByAppendingPathComponent:[NSString stringWithFormat:@"tt_%@.%@", [NSUUID UUID].UUIDString, ext]];
-        AMDownloadURLToLocalFile([NSURL URLWithString:mediaStr], ua, dest, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
-            completion(localURL, title, dlErr);
+        if (statusBlock) statusBlock(@"Downloading TikTok HD video...", 0.55f);
+        NSURL *dest = [mediaDir URLByAppendingPathComponent:[NSString stringWithFormat:@"tt_%@.mp4", uid]];
+        AMDownloadFirstWorkingURL(videoUrls, 0, ua, @"https://www.tikwm.com/", dest, nil, ^(NSURL * _Nullable localURL, NSError * _Nullable dlErr) {
+            if (localURL && !dlErr) {
+                completion(localURL, title, nil);
+            } else {
+                // Retry without Referer in case CDN rejects third-party Referer
+                AMDownloadFirstWorkingURL(videoUrls, 0, ua, nil, dest, dlErr, ^(NSURL * _Nullable localURL2, NSError * _Nullable dlErr2) {
+                    completion(localURL2, title, dlErr2);
+                });
+            }
         });
     }] resume];
 }
@@ -20788,7 +20950,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.27-9";
+                static NSString *const kAMModBuildVersion = @"2026.11.27-10";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
