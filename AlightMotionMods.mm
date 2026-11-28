@@ -16887,7 +16887,6 @@ static void AMRot3DSyncUndoRedoOnMain(void) {
 
 // --- Camera-to-Null Auto-Linking & Universal AE Lens Layer Sync ---
 
-static NSMutableSet<NSNumber *> *gAMAutoLinkedCameraIds;
 static uint64_t gAMLinkCamId = 0;
 static uint64_t gAMLinkNullId = 0;
 
