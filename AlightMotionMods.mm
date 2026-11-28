@@ -24,6 +24,8 @@
 #import <CoreVideo/CoreVideo.h>
 #import <Metal/Metal.h>
 #import <Accelerate/Accelerate.h>
+#import <BackgroundTasks/BackgroundTasks.h>
+#import <UserNotifications/UserNotifications.h>
 #import <os/lock.h>
 #import <os/proc.h>
 #import <os/signpost.h>
@@ -23137,6 +23139,549 @@ static void AMSwizzleMethod(NSString *className, NSString *selName, IMP replacem
     *outOrig = method_setImplementation(m, replacement);
 }
 
+// ============================================================================
+// Module 25: Background Project Export + Dynamic Island / Live Activity
+// ============================================================================
+
+static NSString *const kAMBgExportTaskId = @"com.alightcreative.motion.export";
+
+static IMP gOrigExportVCViewDidAppear = NULL;
+static IMP gOrigExportVCViewWillDisappear = NULL;
+static IMP gOrigExportVCOnTapCancel = NULL;
+static IMP gOrigExportSuccessVCViewDidAppear = NULL;
+static IMP gOrigExportPreviewVCViewWillAppear = NULL;
+
+@interface AMBackgroundExportManager : NSObject
++ (instancetype)shared;
+- (void)registerBackgroundTasks;
+- (void)exportDidBeginWithVC:(UIViewController *)exportVC;
+- (void)exportDidComplete;
+- (void)exportDidCancel;
+- (BOOL)isExporting;
+@end
+
+@implementation AMBackgroundExportManager {
+    BOOL _exporting;
+    BOOL _didComplete;
+    BOOL _didRegisterBG;
+    BOOL _bridgeLoaded;
+    BOOL _hasContinuedTask;
+    __weak UIViewController *_activeExportVC;
+    NSString *_projectTitle;
+    double _lastProgress;
+    double _emaRatePerSec;
+    CFTimeInterval _startTime;
+    CFTimeInterval _lastSampleTime;
+    double _lastSampleProgress;
+    UIBackgroundTaskIdentifier _bgTaskId;
+    BGTask *_continuedTask;
+    NSTimer *_pollTimer;
+}
+
++ (instancetype)shared {
+    static AMBackgroundExportManager *inst = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        inst = [[AMBackgroundExportManager alloc] init];
+    });
+    return inst;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _bgTaskId = UIBackgroundTaskInvalid;
+        _projectTitle = @"Alight Motion Project";
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(handleDidEnterBackground:)
+                                                     name:UIApplicationDidEnterBackgroundNotification
+                                                   object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(handleWillEnterForeground:)
+                                                     name:UIApplicationWillEnterForegroundNotification
+                                                   object:nil];
+    }
+    return self;
+}
+
+- (BOOL)isExporting {
+    return _exporting;
+}
+
+- (id)liveActivityBridge {
+    if (!_bridgeLoaded) {
+        _bridgeLoaded = YES;
+        NSString *frameworksPath = [NSBundle mainBundle].privateFrameworksPath;
+        if (frameworksPath.length > 0) {
+            NSString *bridgePath = [frameworksPath stringByAppendingPathComponent:@"AMLiveActivityBridge.dylib"];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:bridgePath]) {
+                dlopen(bridgePath.fileSystemRepresentation, RTLD_LAZY | RTLD_GLOBAL);
+            }
+        }
+    }
+    Class cls = NSClassFromString(@"AMLiveActivityBridge");
+    if (!cls) return nil;
+    SEL sharedSel = NSSelectorFromString(@"shared");
+    if (![cls respondsToSelector:sharedSel]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(cls, sharedSel);
+}
+
+- (void)bridgeStartWithTitle:(NSString *)title {
+    id bridge = [self liveActivityBridge];
+    if (!bridge) return;
+    SEL sel = NSSelectorFromString(@"startWithTitle:");
+    if ([bridge respondsToSelector:sel]) {
+        ((void (*)(id, SEL, NSString *))objc_msgSend)(bridge, sel, title ?: @"Alight Motion Project");
+    }
+}
+
+- (void)bridgeUpdateProgress:(double)progress etaSeconds:(NSInteger)etaSeconds status:(NSString *)status {
+    id bridge = [self liveActivityBridge];
+    if (!bridge) return;
+    SEL sel = NSSelectorFromString(@"updateWithProgress:etaSeconds:status:");
+    if ([bridge respondsToSelector:sel]) {
+        ((void (*)(id, SEL, double, NSInteger, NSString *))objc_msgSend)(bridge, sel, progress, etaSeconds, status ?: @"Exporting");
+    }
+}
+
+- (void)bridgeEndWithProgress:(double)progress status:(NSString *)status immediate:(BOOL)immediate {
+    id bridge = [self liveActivityBridge];
+    if (!bridge) return;
+    SEL sel = NSSelectorFromString(@"endWithProgress:status:immediate:");
+    if ([bridge respondsToSelector:sel]) {
+        ((void (*)(id, SEL, double, NSString *, BOOL))objc_msgSend)(bridge, sel, progress, status ?: @"Done", immediate);
+    }
+}
+
+- (void)requestNotificationPermissionIfNeeded {
+    if (@available(iOS 10.0, *)) {
+        UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+        [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
+            if (settings.authorizationStatus == UNAuthorizationStatusNotDetermined) {
+                [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge)
+                                      completionHandler:^(BOOL granted, NSError *error) {
+                    (void)granted;
+                    (void)error;
+                }];
+            }
+        }];
+    }
+}
+
+- (void)sendLocalNotificationTitle:(NSString *)title body:(NSString *)body identifier:(NSString *)identifier {
+    if (@available(iOS 10.0, *)) {
+        UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+        content.title = title ?: @"Alight Motion";
+        content.body = body ?: @"";
+        content.sound = [UNNotificationSound defaultSound];
+        UNTimeIntervalNotificationTrigger *trigger = [UNTimeIntervalNotificationTrigger triggerWithTimeInterval:0.2 repeats:NO];
+        UNNotificationRequest *req = [UNNotificationRequest requestWithIdentifier:(identifier ?: @"am.export.status")
+                                                                          content:content
+                                                                          trigger:trigger];
+        [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:req withCompletionHandler:nil];
+    }
+}
+
+- (void)registerBackgroundTasks {
+    if (_didRegisterBG) return;
+    _didRegisterBG = YES;
+    if (@available(iOS 13.0, *)) {
+        BGTaskScheduler *scheduler = [BGTaskScheduler sharedScheduler];
+        if (!scheduler) return;
+        __weak typeof(self) weakSelf = self;
+        [scheduler registerForTaskWithIdentifier:kAMBgExportTaskId
+                                      usingQueue:dispatch_get_main_queue()
+                                   launchHandler:^(BGTask *task) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) {
+                [task setTaskCompletedWithSuccess:NO];
+                return;
+            }
+            strongSelf->_continuedTask = task;
+            strongSelf->_hasContinuedTask = YES;
+            SEL progressSel = NSSelectorFromString(@"progress");
+            if ([task respondsToSelector:progressSel]) {
+                NSProgress *prog = ((id (*)(id, SEL))objc_msgSend)(task, progressSel);
+                if ([prog isKindOfClass:[NSProgress class]]) {
+                    prog.totalUnitCount = 100;
+                    prog.completedUnitCount = (int64_t)llround(strongSelf->_lastProgress * 100.0);
+                }
+            }
+            task.expirationHandler = ^{
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (strongSelf->_exporting && !strongSelf->_didComplete) {
+                        [strongSelf bridgeUpdateProgress:strongSelf->_lastProgress etaSeconds:-1 status:@"Paused — Return to App"];
+                        [strongSelf sendLocalNotificationTitle:@"Export Paused"
+                                                          body:[NSString stringWithFormat:@"%@ paused by iOS. Tap to return to Alight Motion and finish.", strongSelf->_projectTitle]
+                                                    identifier:@"am.export.paused"];
+                    }
+                    BGTask *t = strongSelf->_continuedTask;
+                    strongSelf->_continuedTask = nil;
+                    strongSelf->_hasContinuedTask = NO;
+                    [t setTaskCompletedWithSuccess:strongSelf->_didComplete];
+                });
+            };
+        }];
+    }
+}
+
+- (void)submitContinuedProcessingTaskIfSupported {
+    if (@available(iOS 13.0, *)) {
+        Class reqCls = NSClassFromString(@"BGContinuedProcessingTaskRequest");
+        if (!reqCls) return;
+        id req = nil;
+        SEL init3Sel = NSSelectorFromString(@"initWithIdentifier:title:subtitle:");
+        SEL init1Sel = NSSelectorFromString(@"initWithIdentifier:");
+        if ([reqCls instancesRespondToSelector:init3Sel]) {
+            req = ((id (*)(id, SEL, NSString *, NSString *, NSString *))objc_msgSend)(
+                [reqCls alloc],
+                init3Sel,
+                kAMBgExportTaskId,
+                [NSString stringWithFormat:@"Exporting %@", _projectTitle],
+                @"0% · Starting..."
+            );
+        } else if ([reqCls instancesRespondToSelector:init1Sel]) {
+            req = ((id (*)(id, SEL, NSString *))objc_msgSend)([reqCls alloc], init1Sel, kAMBgExportTaskId);
+        }
+        if (!req) return;
+
+        // Strategy = fail (0) so system starts immediately if permitted
+        SEL setStrategySel = NSSelectorFromString(@"setStrategy:");
+        if ([req respondsToSelector:setStrategySel]) {
+            ((void (*)(id, SEL, NSInteger))objc_msgSend)(req, setStrategySel, 0);
+        }
+
+        // Request GPU resource if device supports it (BGContinuedProcessingTaskRequestResourcesGPU = 1 << 0)
+        SEL supResSel = NSSelectorFromString(@"supportedResources");
+        SEL setReqResSel = NSSelectorFromString(@"setRequiredResources:");
+        if ([BGTaskScheduler respondsToSelector:supResSel] && [req respondsToSelector:setReqResSel]) {
+            NSUInteger supported = ((NSUInteger (*)(id, SEL))objc_msgSend)([BGTaskScheduler class], supResSel);
+            if ((supported & 1UL) != 0) {
+                ((void (*)(id, SEL, NSUInteger))objc_msgSend)(req, setReqResSel, 1UL);
+            }
+        }
+
+        NSError *err = nil;
+        [[BGTaskScheduler sharedScheduler] submitTaskRequest:(BGTaskRequest *)req error:&err];
+        if (err) {
+            NSLog(@"[AMBackgroundExport] BGContinuedProcessingTask submit error: %@", err.localizedDescription);
+        }
+    }
+}
+
+- (void)beginLegacyBackgroundTask {
+    if (_bgTaskId != UIBackgroundTaskInvalid) return;
+    __weak typeof(self) weakSelf = self;
+    _bgTaskId = [[UIApplication sharedApplication] beginBackgroundTaskWithName:@"AMBackgroundExport" expirationHandler:^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (strongSelf->_exporting && !strongSelf->_didComplete && !strongSelf->_hasContinuedTask) {
+            [strongSelf bridgeUpdateProgress:strongSelf->_lastProgress etaSeconds:-1 status:@"Paused — Return to App"];
+            [strongSelf sendLocalNotificationTitle:@"Export Needs Foreground"
+                                              body:[NSString stringWithFormat:@"Return to Alight Motion to finish exporting %@ (%d%%).",
+                                                    strongSelf->_projectTitle,
+                                                    (int)llround(strongSelf->_lastProgress * 100.0)]
+                                        identifier:@"am.export.return"];
+        }
+        if (strongSelf->_bgTaskId != UIBackgroundTaskInvalid) {
+            UIBackgroundTaskIdentifier tid = strongSelf->_bgTaskId;
+            strongSelf->_bgTaskId = UIBackgroundTaskInvalid;
+            [[UIApplication sharedApplication] endBackgroundTask:tid];
+        }
+    }];
+}
+
+- (void)endLegacyBackgroundTask {
+    if (_bgTaskId != UIBackgroundTaskInvalid) {
+        UIBackgroundTaskIdentifier tid = _bgTaskId;
+        _bgTaskId = UIBackgroundTaskInvalid;
+        [[UIApplication sharedApplication] endBackgroundTask:tid];
+    }
+}
+
+- (void)handleDidEnterBackground:(NSNotification *)note {
+    (void)note;
+    if (!_exporting) return;
+    [self beginLegacyBackgroundTask];
+    NSString *status = _hasContinuedTask ? @"Exporting in Background" : @"Finalizing in Background";
+    [self bridgeUpdateProgress:_lastProgress etaSeconds:-1 status:status];
+}
+
+- (void)handleWillEnterForeground:(NSNotification *)note {
+    (void)note;
+    if (!_exporting) return;
+    [self bridgeUpdateProgress:_lastProgress etaSeconds:-1 status:@"Exporting"];
+}
+
+- (NSString *)readProjectTitleFromVC:(UIViewController *)vc {
+    if (!vc) return @"Alight Motion Project";
+    SEL titleSel = NSSelectorFromString(@"exportTitle");
+    if ([vc respondsToSelector:titleSel]) {
+        id lbl = ((id (*)(id, SEL))objc_msgSend)(vc, titleSel);
+        if ([lbl isKindOfClass:[UILabel class]]) {
+            NSString *t = [((UILabel *)lbl).text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlinesCharacterSet]];
+            if (t.length > 0 && ![t.lowercaseString isEqualToString:@"exporting"] && ![t.lowercaseString isEqualToString:@"exporting..."]) {
+                return t;
+            }
+        }
+    }
+    return @"Alight Motion Project";
+}
+
+- (double)readProgressFromVC:(UIViewController *)vc {
+    if (!vc) return _lastProgress;
+    SEL rateSel = NSSelectorFromString(@"progressRateLabel");
+    if ([vc respondsToSelector:rateSel]) {
+        id lbl = ((id (*)(id, SEL))objc_msgSend)(vc, rateSel);
+        if ([lbl isKindOfClass:[UILabel class]]) {
+            NSString *txt = ((UILabel *)lbl).text;
+            if (txt.length > 0) {
+                NSCharacterSet *nonNum = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789."] invertedSet];
+                NSString *cleaned = [[txt componentsSeparatedByCharactersInSet:nonNum] componentsJoinedByString:@""];
+                if (cleaned.length > 0) {
+                    double val = cleaned.doubleValue;
+                    if (val >= 0.0 && val <= 100.0) {
+                        return val / 100.0;
+                    }
+                }
+            }
+        }
+    }
+    SEL pvSel = NSSelectorFromString(@"progressView");
+    if ([vc respondsToSelector:pvSel]) {
+        id pv = ((id (*)(id, SEL))objc_msgSend)(vc, pvSel);
+        if (pv && [pv respondsToSelector:@selector(progress)]) {
+            float p = ((float (*)(id, SEL))objc_msgSend)(pv, @selector(progress));
+            if (p >= 0.0f && p <= 1.0f) return (double)p;
+        }
+    }
+    return _lastProgress;
+}
+
+- (void)updateWarningLabelOnVC:(UIViewController *)vc {
+    if (!vc) return;
+    SEL warnSel = NSSelectorFromString(@"warningLabel");
+    if ([vc respondsToSelector:warnSel]) {
+        id lbl = ((id (*)(id, SEL))objc_msgSend)(vc, warnSel);
+        if ([lbl isKindOfClass:[UILabel class]]) {
+            BOOL hasIOS26BG = (NSClassFromString(@"BGContinuedProcessingTaskRequest") != nil);
+            ((UILabel *)lbl).text = hasIOS26BG
+                ? @"Background export enabled — you can switch apps."
+                : @"Live Activity active — background grace window enabled.";
+        }
+    }
+}
+
+- (void)exportDidBeginWithVC:(UIViewController *)exportVC {
+    _activeExportVC = exportVC;
+    _exporting = YES;
+    _didComplete = NO;
+    _lastProgress = 0.0;
+    _emaRatePerSec = 0.0;
+    _startTime = CACurrentMediaTime();
+    _lastSampleTime = _startTime;
+    _lastSampleProgress = 0.0;
+    _projectTitle = [self readProjectTitleFromVC:exportVC];
+
+    [UIApplication sharedApplication].idleTimerDisabled = YES;
+    [self requestNotificationPermissionIfNeeded];
+    [self updateWarningLabelOnVC:exportVC];
+    [self beginLegacyBackgroundTask];
+    [self submitContinuedProcessingTaskIfSupported];
+    [self bridgeStartWithTitle:_projectTitle];
+
+    [_pollTimer invalidate];
+    _pollTimer = [NSTimer timerWithTimeInterval:0.35
+                                         target:self
+                                       selector:@selector(pollExportProgress)
+                                       userInfo:nil
+                                        repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:_pollTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)pollExportProgress {
+    if (!_exporting) {
+        [_pollTimer invalidate];
+        _pollTimer = nil;
+        return;
+    }
+    UIViewController *vc = _activeExportVC;
+    if (!vc) {
+        [self exportDidComplete];
+        return;
+    }
+
+    NSString *title = [self readProjectTitleFromVC:vc];
+    if (title.length > 0 && ![title isEqualToString:@"Alight Motion Project"]) {
+        _projectTitle = title;
+    }
+
+    double p = [self readProgressFromVC:vc];
+    if (p < _lastProgress) p = _lastProgress;
+    if (p > 1.0) p = 1.0;
+
+    CFTimeInterval now = CACurrentMediaTime();
+    double dt = now - _lastSampleTime;
+    double dp = p - _lastSampleProgress;
+    if (dp > 0.001 && dt > 0.1) {
+        double instRate = dp / dt;
+        _emaRatePerSec = (_emaRatePerSec <= 0.0) ? instRate : (0.3 * instRate + 0.7 * _emaRatePerSec);
+        _lastSampleTime = now;
+        _lastSampleProgress = p;
+    }
+
+    NSInteger etaSec = -1;
+    if (p >= 0.999) {
+        etaSec = 0;
+    } else if (_emaRatePerSec > 0.0001) {
+        etaSec = (NSInteger)llround((1.0 - p) / _emaRatePerSec);
+        if (etaSec < 1) etaSec = 1;
+    } else if (p > 0.01 && (now - _startTime) > 1.0) {
+        double avgRate = p / (now - _startTime);
+        etaSec = (NSInteger)llround((1.0 - p) / avgRate);
+    }
+
+    _lastProgress = p;
+    BOOL isBg = ([UIApplication sharedApplication].applicationState != UIApplicationStateActive);
+    NSString *status = (p >= 0.995) ? @"Finalizing..." : (isBg ? @"Exporting in Background" : @"Exporting");
+
+    // Update iOS 26 BGContinuedProcessingTask progress & subtitle
+    if (_continuedTask) {
+        SEL progressSel = NSSelectorFromString(@"progress");
+        if ([_continuedTask respondsToSelector:progressSel]) {
+            NSProgress *prog = ((id (*)(id, SEL))objc_msgSend)(_continuedTask, progressSel);
+            if ([prog isKindOfClass:[NSProgress class]]) {
+                prog.totalUnitCount = 100;
+                prog.completedUnitCount = (int64_t)llround(p * 100.0);
+            }
+        }
+        SEL updateTitleSel = NSSelectorFromString(@"updateTitle:subtitle:");
+        if ([_continuedTask respondsToSelector:updateTitleSel]) {
+            NSString *etaStr = (etaSec > 0) ? [NSString stringWithFormat:@" · %lds left", (long)etaSec] : @"";
+            NSString *sub = [NSString stringWithFormat:@"%d%%%@ · %@", (int)llround(p * 100.0), etaStr, status];
+            ((void (*)(id, SEL, NSString *, NSString *))objc_msgSend)(
+                _continuedTask,
+                updateTitleSel,
+                [NSString stringWithFormat:@"Exporting %@", _projectTitle],
+                sub
+            );
+        }
+    }
+
+    [self bridgeUpdateProgress:p etaSeconds:etaSec status:status];
+}
+
+- (void)finishExportWithSuccess:(BOOL)success status:(NSString *)status immediate:(BOOL)immediate {
+    if (!_exporting) return;
+    _exporting = NO;
+    _didComplete = success;
+    _activeExportVC = nil;
+
+    [_pollTimer invalidate];
+    _pollTimer = nil;
+    [UIApplication sharedApplication].idleTimerDisabled = NO;
+
+    double finalProgress = success ? 1.0 : _lastProgress;
+    [self bridgeEndWithProgress:finalProgress status:status immediate:immediate];
+
+    if (_continuedTask) {
+        BGTask *t = _continuedTask;
+        _continuedTask = nil;
+        _hasContinuedTask = NO;
+        [t setTaskCompletedWithSuccess:success];
+    }
+    [self endLegacyBackgroundTask];
+
+    if (success && [UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+        [self sendLocalNotificationTitle:@"Export Complete"
+                                    body:[NSString stringWithFormat:@"%@ finished exporting and is ready to save or share.", _projectTitle]
+                              identifier:@"am.export.complete"];
+    }
+}
+
+- (void)exportDidComplete {
+    [self finishExportWithSuccess:YES status:@"Export Complete" immediate:NO];
+}
+
+- (void)exportDidCancel {
+    [self finishExportWithSuccess:NO status:@"Export Cancelled" immediate:YES];
+}
+
+@end
+
+static void AMHook_exportVCViewDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (gOrigExportVCViewDidAppear) {
+        ((void (*)(id, SEL, BOOL))gOrigExportVCViewDidAppear)(self, _cmd, animated);
+    }
+    if ([self isKindOfClass:[UIViewController class]]) {
+        [[AMBackgroundExportManager shared] exportDidBeginWithVC:(UIViewController *)self];
+    }
+}
+
+static void AMHook_exportVCViewWillDisappear(id self, SEL _cmd, BOOL animated) {
+    if (gOrigExportVCViewWillDisappear) {
+        ((void (*)(id, SEL, BOOL))gOrigExportVCViewWillDisappear)(self, _cmd, animated);
+    }
+    UIViewController *vc = [self isKindOfClass:[UIViewController class]] ? (UIViewController *)self : nil;
+    if (vc && (vc.isBeingDismissed || vc.isMovingFromParentViewController)) {
+        // Defer briefly so ExportSuccessVC / ExportPreviewVC can mark completion first
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if ([[AMBackgroundExportManager shared] isExporting]) {
+                [[AMBackgroundExportManager shared] exportDidComplete];
+            }
+        });
+    }
+}
+
+static void AMHook_exportVCOnTapCancel(id self, SEL _cmd, id sender) {
+    // Guard against automatic cancel fired when app moves to background
+    if (!sender && [UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+        return;
+    }
+    [[AMBackgroundExportManager shared] exportDidCancel];
+    if (gOrigExportVCOnTapCancel) {
+        ((void (*)(id, SEL, id))gOrigExportVCOnTapCancel)(self, _cmd, sender);
+    }
+}
+
+static void AMHook_exportSuccessVCViewDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (gOrigExportSuccessVCViewDidAppear) {
+        ((void (*)(id, SEL, BOOL))gOrigExportSuccessVCViewDidAppear)(self, _cmd, animated);
+    }
+    [[AMBackgroundExportManager shared] exportDidComplete];
+}
+
+static void AMHook_exportPreviewVCViewWillAppear(id self, SEL _cmd, BOOL animated) {
+    if (gOrigExportPreviewVCViewWillAppear) {
+        ((void (*)(id, SEL, BOOL))gOrigExportPreviewVCViewWillAppear)(self, _cmd, animated);
+    }
+    [[AMBackgroundExportManager shared] exportDidComplete];
+}
+
+static void AMInstallBackgroundExportModule(void) {
+    [[AMBackgroundExportManager shared] registerBackgroundTasks];
+    AMSwizzleMethod(@"_TtC12AlightMotion8ExportVC",
+                    @"viewDidAppear:",
+                    (IMP)AMHook_exportVCViewDidAppear,
+                    &gOrigExportVCViewDidAppear);
+    AMSwizzleMethod(@"_TtC12AlightMotion8ExportVC",
+                    @"viewWillDisappear:",
+                    (IMP)AMHook_exportVCViewWillDisappear,
+                    &gOrigExportVCViewWillDisappear);
+    AMSwizzleMethod(@"_TtC12AlightMotion8ExportVC",
+                    @"onTapCancel:",
+                    (IMP)AMHook_exportVCOnTapCancel,
+                    &gOrigExportVCOnTapCancel);
+    AMSwizzleMethod(@"_TtC12AlightMotion15ExportSuccessVC",
+                    @"viewDidAppear:",
+                    (IMP)AMHook_exportSuccessVCViewDidAppear,
+                    &gOrigExportSuccessVCViewDidAppear);
+    AMSwizzleMethod(@"_TtC12AlightMotion15ExportPreviewVC",
+                    @"viewWillAppear:",
+                    (IMP)AMHook_exportPreviewVCViewWillAppear,
+                    &gOrigExportPreviewVCViewWillAppear);
+}
+
 __attribute__((constructor))
 static void AlightMotionModsInit(void) {
     NSInteger saved = [[NSUserDefaults standardUserDefaults] integerForKey:kAMPreviewQualityKey];
@@ -23378,6 +23923,7 @@ static void AlightMotionModsInit(void) {
                     &gOrigAppAttestAttestKey);
     AMInstallSideStoreStabilityGuard();
     AMInstalliPhoneEnginePerformance();
+    AMInstallBackgroundExportModule();
 
     // Module 9B: Multi-Font & Files Paste/Import Crash Fix
     AMSwizzleMethod(@"NSFileManager",
@@ -23424,7 +23970,7 @@ static void AlightMotionModsInit(void) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                static NSString *const kAMModBuildVersion = @"2026.11.28-2";
+                static NSString *const kAMModBuildVersion = @"2026.11.28-3";
                 NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Zoronwisyt/Very-Good-IPA/main/version.json"];
                 NSURLRequest *req = [NSURLRequest requestWithURL:url
                                                      cachePolicy:NSURLRequestReloadIgnoringLocalCacheData

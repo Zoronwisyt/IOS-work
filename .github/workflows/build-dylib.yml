@@ -11,9 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compile ARM64 iOS dylib
+      - name: Compile ARM64 iOS dylib, Live Activity bridge, and Widget Extension
         run: |
+          set -euo pipefail
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+
+          # 1. Main tweak dylib
           xcrun --sdk iphoneos clang++ \
             -arch arm64 \
             -isysroot "$SDK_PATH" \
@@ -33,19 +36,66 @@ jobs:
             -framework CoreVideo \
             -framework Metal \
             -framework Accelerate \
+            -weak_framework BackgroundTasks \
+            -weak_framework UserNotifications \
             -o AlightMotionMods.dylib \
             AlightMotionMods.mm
+
+          # 2. Swift ActivityKit bridge dylib (same module name AMExportWidget for ActivityAttributes parity)
+          xcrun --sdk iphoneos swiftc \
+            -sdk "$SDK_PATH" \
+            -target arm64-apple-ios14.4 \
+            -module-name AMExportWidget \
+            -emit-library \
+            -O \
+            -Xlinker -install_name -Xlinker @rpath/AMLiveActivityBridge.dylib \
+            -Xlinker -weak_framework -Xlinker ActivityKit \
+            -framework Foundation \
+            -o AMLiveActivityBridge.dylib \
+            AMExportWidget/AMExportActivityAttributes.swift \
+            AMExportWidget/AMLiveActivityBridge.swift
+
+          # 3. Live Activity Widget Extension (.appex)
+          mkdir -p AMExportWidget.appex
+          xcrun --sdk iphoneos swiftc \
+            -sdk "$SDK_PATH" \
+            -target arm64-apple-ios16.1 \
+            -module-name AMExportWidget \
+            -application-extension \
+            -parse-as-library \
+            -O \
+            -Xlinker -e -Xlinker _NSExtensionMain \
+            -framework Foundation \
+            -framework SwiftUI \
+            -framework WidgetKit \
+            -framework ActivityKit \
+            -o AMExportWidget.appex/AMExportWidget \
+            AMExportWidget/AMExportActivityAttributes.swift \
+            AMExportWidget/AMExportWidgetBundle.swift
+          cp AMExportWidget/Info.plist AMExportWidget.appex/Info.plist
+
+          # Ad-hoc sign all binaries with ldid
           if command -v ldid >/dev/null 2>&1 || brew install ldid; then
-            codesign --remove-signature AlightMotionMods.dylib || true
-            ldid -S AlightMotionMods.dylib
+            for bin in AlightMotionMods.dylib AMLiveActivityBridge.dylib AMExportWidget.appex/AMExportWidget; do
+              codesign --remove-signature "$bin" || true
+              ldid -S "$bin"
+            done
           else
             codesign -f -s - -i AlightMotionMods.dylib AlightMotionMods.dylib
+            codesign -f -s - -i AMLiveActivityBridge.dylib AMLiveActivityBridge.dylib
+            codesign -f -s - -i com.alightcreative.motion.ExportWidget AMExportWidget.appex
           fi
-          file AlightMotionMods.dylib
-          otool -L AlightMotionMods.dylib
 
-      - name: Upload ARM64 dylib artifact
+          file AlightMotionMods.dylib AMLiveActivityBridge.dylib AMExportWidget.appex/AMExportWidget
+          otool -L AlightMotionMods.dylib
+          otool -L AMLiveActivityBridge.dylib
+          otool -L AMExportWidget.appex/AMExportWidget
+
+      - name: Upload ARM64 artifacts
         uses: actions/upload-artifact@v4
         with:
           name: AlightMotionMods-arm64
-          path: AlightMotionMods.dylib
+          path: |
+            AlightMotionMods.dylib
+            AMLiveActivityBridge.dylib
+            AMExportWidget.appex
